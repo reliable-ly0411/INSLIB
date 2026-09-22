@@ -1,0 +1,47 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # 可替换：cron 使用 UTC；当前为每月 1 日 04:20 UTC，即北京时间 12:20。
+    - cron: "20 4 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 同一时间只保留一个同步任务，避免手动运行与定时运行同时推送 main。
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream main
+        env:
+          # 可替换：上游仓库地址和目标分支；例如 jnz/INSLIB 与 main。
+          UPSTREAM_URL: https://github.com/jnz/INSLIB.git
+          TARGET_BRANCH: main
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream "$TARGET_BRANCH"
+          git checkout "$TARGET_BRANCH"
+
+          if git merge-base --is-ancestor "upstream/$TARGET_BRANCH" HEAD; then
+            echo "Fork is already up to date"
+            exit 0
+          fi
+
+          # 保留 fork 自有提交；代码冲突直接失败，留给人工审查和解决。
+          git merge --no-ff --no-edit "upstream/$TARGET_BRANCH"
+          git push origin "HEAD:$TARGET_BRANCH"
