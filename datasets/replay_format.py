@@ -10,7 +10,7 @@ both tools/replay.c and python/replay.py:
                two-level YAML subset -- the C harness parses only sections
                + scalar/inline-list values). An optional `inputs:` section
                overrides the CSV filenames below per stream (imu/ref/gnss/
-               mag/baro), each relative to config.yaml's directory -- unset
+               mag/baro/speed/heading), each relative to config.yaml's directory -- unset
                keeps the conventional <stream>.csv name, so one stream can
                be swapped (e.g. gnss: gnss_f9p.csv) with the rest shared.
   imu.csv      t_us, gyr_frd_xyz [rad/s], acc_frd_xyz [m/s^2], and
@@ -24,6 +24,18 @@ both tools/replay.c and python/replay.py:
   mag.csv      t_us, mag_frd_xyz [uT]                (optional)
   baro.csv     t_us, static pressure [Pa]            (optional)
   speed.csv    t_us, scalar ground speed [m/s]      (optional)
+  heading.csv  t_us, baseline azimuth [deg], its 1-sigma [deg], carr_soln
+               (0 none, 1 float, 2 fixed)             (optional)
+               The azimuth of the body-fixed antenna baseline as the
+               receiver measured it (u-blox moving base NAV-RELPOSNED
+               relPosHeading), NOT yet the vehicle yaw: the harnesses turn
+               it into one with config.yaml's heading: baseline_frd and
+               the current roll/pitch (REQ-NAV-087), so a remounted
+               antenna pair is a config edit, not a reconversion. A row
+               of the same epoch as a gnss.csv fix carries the identical
+               t_us, which is what links the two files. Trailing columns
+               (baseline length, receiver iTOW) are the producer's own
+               record, both harnesses read the first four only.
 
 Converters import these helpers so the format cannot drift apart.
 
@@ -55,6 +67,12 @@ BARO_HEADER = "# t_us, static pressure [Pa]\n"
 # columns: one place describes the dataset. A producer may keep further
 # columns of its own here, both harnesses read only the first two.
 SPEED_HEADER = "# t_us, speed_mps\n"
+# Unlike speed.csv the 1-sigma IS a column: a dual-antenna receiver reports
+# a heading accuracy per epoch that moves by an order of magnitude with the
+# satellite geometry, and a median would throw exactly that away. config.yaml
+# only scales and floors it.
+HEADING_HEADER = ("# t_us, heading_deg, stddev_deg, carr_soln,"
+                  " length_m, itow_ms\n")
 
 
 def gnss_row(t_us, lat_deg, lon_deg, h_m, cov_pos6, vel_ned, cov_vel6,

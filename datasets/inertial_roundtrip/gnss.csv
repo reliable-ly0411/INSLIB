@@ -1,0 +1,2 @@
+# t_us, lat_deg, lon_deg, h_m, cov_pos_ned nn,ne,nd,ee,ed,dd [m^2], vn, ve, vd [m/s], cov_vel_ned nn,ne,nd,ee,ed,dd [(m/s)^2], vel_ok
+# GNSS-only passthrough (NAV-PVT + NAV-COV), no RTKLIB post-processing -- see inslib_convert_ubx_to_csv.py

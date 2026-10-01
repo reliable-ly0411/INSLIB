@@ -27,6 +27,19 @@ Outputs (written to --outdir):
                   (0x01/0x07, 0x01/0x36) -- decoded with pyubx2 from
                   already checksum-verified frames. Only epochs with
                   fixType >= --min-fix-type are kept.
+  - heading.csv   dual-antenna heading from the receiver's NAV-RELPOSNED
+                  (0x01/0x3C) in u-blox moving base mode: the azimuth of
+                  the base-to-rover antenna baseline, its accHeading 1-sigma
+                  and carrSoln. Only epochs the receiver itself vouches for
+                  are kept (gnssFixOK, relPosValid, relPosHeadingValid) and
+                  only in moving base mode (isMoving): against a static RTK
+                  base the same field is the direction to that base station,
+                  not an attitude. Stamped with the t_us of the NAV-PVT of
+                  the same iTOW (plus the iTOW difference when the two
+                  belong to different epochs), so a heading row and the
+                  gnss.csv fix of its epoch carry the identical t_us.
+                  Written, and `heading: enable` set, only when the capture
+                  carries such epochs.
   - ref.csv       MVP placeholder: this tool has no independent ground
                   truth, so ref.csv is just the GNSS solution again (same
                   lat/lon/h/v_ned as gnss.csv) with roll/pitch/yaw
@@ -107,8 +120,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "..", "datasets"))
 from replay_format import (BARO_HEADER, GNSS_HEADER, IMU_HEADER_TEMP,    # noqa: E402
-                           MAG_HEADER, REF_HEADER, SPEED_HEADER, gnss_row,
-                           write_config)
+                           HEADING_HEADER, MAG_HEADER, REF_HEADER,
+                           SPEED_HEADER, gnss_row, write_config)
 
 from inslib_ubx import (BARO_FMT, ID_BARO, ID_IMU, ID_MAG,             # noqa: E402
                         ID_ODOMETRY, ID_STATUS, ID_TIMESYNC, IMU_FMT,
@@ -472,6 +485,40 @@ class UbxGnssDecoder:
         return None, None
 
 
+# NAV-RELPOSNED flags the heading is only usable with. relPosHeadingValid
+# alone is not enough: against a static RTK base the receiver reports a
+# perfectly valid heading of the rover-to-base vector, kilometres long,
+# which says nothing about how the vehicle is pointing. isMoving is what
+# separates the two.
+RELPOS_ITOW_MAX_DIFF_MS = 1000
+
+
+def relposned_reject_reason(msg):
+    """None if this NAV-RELPOSNED carries a usable moving base heading,
+    else the counter name saying why not."""
+    if getattr(msg, "version", 0) < 1 or not hasattr(msg, "relPosHeading"):
+        return "heading_old_version"      # M8P layout, no heading field
+    if not getattr(msg, "isMoving", 0):
+        return "heading_not_moving_base"
+    if not (getattr(msg, "gnssFixOK", 0) and getattr(msg, "relPosValid", 0)):
+        return "heading_no_rel_fix"
+    if not getattr(msg, "relPosHeadingValid", 0):
+        return "heading_invalid"
+    if not math.isfinite(getattr(msg, "relPosHeading", float("nan"))):
+        return "heading_invalid"
+    acc = getattr(msg, "accHeading", 0.0)
+    if not (math.isfinite(acc) and acc > 0.0):
+        return "heading_no_accuracy"
+    return None
+
+
+def itow_diff_ms(a, b):
+    """a - b [ms] between two GPS times of week, folded across the week
+    boundary."""
+    d = (a - b) % 604800000
+    return d - 604800000 if d > 302400000 else d
+
+
 # --------------------------------------------------------------------------
 # Conversion driver
 # --------------------------------------------------------------------------
@@ -494,6 +541,10 @@ def convert(ubx_path, outdir, min_fix_type=3, pos_rows=None, pos_max_q=2):
     last_imu_t_us = None
     status_last = None
     speed_rows = []
+    heading_rows = []
+    # (iTOW, t_us) of the latest NAV-PVT, fix or not: what a NAV-RELPOSNED
+    # of the same (or a neighbouring) epoch is placed on the MCU clock by.
+    last_pvt = None
 
     imu_f = open(os.path.join(outdir, "imu.csv"), "w", encoding="utf-8")
     baro_f = open(os.path.join(outdir, "baro.csv"), "w", encoding="utf-8")
@@ -542,7 +593,7 @@ def convert(ubx_path, outdir, min_fix_type=3, pos_rows=None, pos_max_q=2):
         return -60.0 <= as_f32 <= 150.0
 
     def handle_frame(cls, mid, payload, frame):
-        nonlocal first_imu_t_us, last_imu_t_us, status_last
+        nonlocal first_imu_t_us, last_imu_t_us, status_last, last_pvt
         if cls == CLASS_CUSTOM:
             if mid == ID_IMU:
                 s = decode_imu(payload)
@@ -649,7 +700,37 @@ def convert(ubx_path, outdir, min_fix_type=3, pos_rows=None, pos_max_q=2):
                 year = navpvt_decimal_year(msg)
                 if year is not None:
                     n["wmm_year"] = year
+            # Every NAV-PVT, including those the fix filter below drops:
+            # the heading has its own validity flags and does not need a
+            # 3D position fix of the same epoch to be worth keeping.
+            if last_imu_t_us is not None and getattr(msg, "iTOW", -1) >= 0:
+                last_pvt = (msg.iTOW, last_imu_t_us)
             # falls through: NAV-PVT is also the GNSS epoch source below
+
+        if msg.identity == "NAV-RELPOSNED":
+            n["relposned"] += 1
+            reason = relposned_reject_reason(msg)
+            if reason:
+                n[reason] += 1
+                return
+            if last_pvt is None:
+                n["heading_no_pvt_yet"] += 1
+                return
+            # Not the arrival-time stamp every other GNSS stream gets: in
+            # moving base mode the rover solves the baseline only once the
+            # base's RTCM for that epoch is in, so NAV-RELPOSNED can trail
+            # its NAV-PVT and be stamped with a later IMU sample. The iTOW
+            # is what both messages agree on.
+            dt_ms = itow_diff_ms(msg.iTOW, last_pvt[0])
+            if abs(dt_ms) > RELPOS_ITOW_MAX_DIFF_MS:
+                n["heading_itow_mismatch"] += 1
+                return
+            heading_rows.append((last_pvt[1] + dt_ms * 1000,
+                                 msg.relPosHeading, msg.accHeading,
+                                 getattr(msg, "carrSoln", 0),
+                                 getattr(msg, "relPosLength", 0.0) / 100.0,  # cm -> m
+                                 msg.iTOW))
+            return
 
         if msg.identity == "TIM-TP":
             # Not expected: the firmware consumes TIM-TP to build 0x40/0x05
@@ -810,6 +891,26 @@ def convert(ubx_path, outdir, min_fix_type=3, pos_rows=None, pos_max_q=2):
         n["speed_delay_ms"] = _median([o["delay_ms"] for o in speed_rows])
         n["speed_reverse"] = sum(1 for o in speed_rows if o["reverse"])
 
+    # heading.csv: same "only when there is something to put in it" rule.
+    # Sorted for the same reason as speed.csv, since a row can be placed a
+    # little before the one written ahead of it (see the NAV-RELPOSNED
+    # branch above).
+    if heading_rows:
+        heading_rows.sort(key=lambda r: r[0])
+        with open(os.path.join(outdir, "heading.csv"), "w",
+                  encoding="utf-8") as heading_f:
+            heading_f.write(HEADING_HEADER)
+            heading_f.write("# NAV-RELPOSNED moving base heading: azimuth of the"
+                            " base-to-rover antenna baseline, NOT yet the vehicle"
+                            " yaw (config.yaml heading: baseline_frd). t_us is"
+                            " the one of the gnss.csv fix with the same iTOW\n")
+            for r in heading_rows:
+                heading_f.write("%d,%.5f,%.5f,%d,%.4f,%d\n" % r)
+        n["heading"] = len(heading_rows)
+        n["heading_fixed"] = sum(1 for r in heading_rows if r[3] == 2)
+        n["heading_stddev_deg"] = _median([r[2] for r in heading_rows])
+        n["heading_length_m"] = _median([r[4] for r in heading_rows])
+
     return n, status_last, gnss_decoder.identities
 
 
@@ -898,7 +999,8 @@ AUTOMOTIVE_IMU = {
 def write_cfg(path_out, name, automotive_mode, leverarm_frd, from_pos=False,
               has_mag=False, wmm_year=0.0, has_speed=False,
               speed_stddev_mps=0.0, speed_delay_ms=0.0,
-              speed_scale=SPEED_SCALE_FIXME, automotive_mode_reason=None):
+              speed_scale=SPEED_SCALE_FIXME, automotive_mode_reason=None,
+              has_heading=False, heading_length_m=0.0):
     """Replay configuration for the converted dataset. IMU noise defaults
     are the library's generic MEMS fallback (src/sensor_defaults.h,
     src/ins.c INS_DEFAULT_ACC_*) -- replace with this board's actual IMU
@@ -1025,6 +1127,33 @@ def write_cfg(path_out, name, automotive_mode, leverarm_frd, from_pos=False,
                           if has_speed
                           else "how old a sample is at its timestamp"),
         }),
+        # Dual-antenna heading (REQ-NAV-010/REQ-NAV-087), from the capture's
+        # NAV-RELPOSNED. Enabled on the same fact as `mag`/`speed` above.
+        ("heading", {
+            "enable": (1 if has_heading else 0,
+                        "NAV-RELPOSNED moving base heading in the capture"
+                        if has_heading
+                        else "1 + a heading.csv next to this file to use it"),
+            # The receiver reports the azimuth of the vector from the
+            # moving base antenna to the rover antenna. [1, 0, 0] is the
+            # usual mounting, base behind rover on the vehicle's
+            # centreline, where that azimuth IS the yaw.
+            "baseline_frd": ([1.0, 0.0, 0.0],
+                              "FIXME: base -> rover antenna direction on THIS"
+                              " vehicle, body FRD"
+                              + (", receiver measured %.3f m apart"
+                                 % heading_length_m if has_heading else "")),
+            "require_fixed": (1, "1 -> only carrier-phase FIXED headings,"
+                                 " a float heading can be degrees off"),
+            "stddev_scale": (0.0, "multiplies the receiver's accHeading,"
+                                  " 0 -> 1.0"),
+            "stddev_min_deg": (0.0, "floor on the 1-sigma after scaling,"
+                                    " 0 -> none"),
+            # Same receiver, same epoch: whatever gnss: delay_ms turns out
+            # to be is the starting point here too. A moving base heading
+            # can trail by the base's RTCM transport on top.
+            "delay_ms": (0.0, "TUNE ME: start from gnss: delay_ms"),
+        }),
         ("score", {
             # The SAME lever arm as gnss.leverarm_frd above, and not
             # optional: ref.csv is the receiver's own solution, i.e. the
@@ -1135,7 +1264,9 @@ def main():
                   speed_stddev_mps=n["speed_stddev_mps"],
                   speed_delay_ms=n["speed_delay_ms"],
                   speed_scale=speed_scale,
-                  automotive_mode_reason=automotive_mode_reason)
+                  automotive_mode_reason=automotive_mode_reason,
+                  has_heading=n["heading"] > 0,
+                  heading_length_m=n["heading_length_m"])
 
     if pos_rows is None:
         print("imu.csv: %d samples, baro.csv: %d samples, gnss.csv/ref.csv: %d epochs"
@@ -1224,6 +1355,26 @@ def main():
             print("         %d sample(s) carry T_DEGRADED: the host/MCU"
                   " mapping behind their timestamp was stale or thin"
                   % n["odometry_t_degraded"])
+    if n["heading"]:
+        print("heading.csv: %d of %d NAV-RELPOSNED epoch(s), %d carrier-phase"
+              " fixed, median accHeading %.3f deg, median baseline %.3f m"
+              " (heading: enable: 1 -- check baseline_frd against the"
+              " antenna mounting)"
+              % (n["heading"], n["relposned"], n["heading_fixed"],
+                 n["heading_stddev_deg"], n["heading_length_m"]))
+    dropped_heading = [
+        (n["heading_not_moving_base"], "not in moving base mode (isMoving 0:"
+         " a heading towards a static base station, not an attitude)"),
+        (n["heading_no_rel_fix"], "no relative position fix"),
+        (n["heading_invalid"], "relPosHeadingValid not set"),
+        (n["heading_no_accuracy"], "no accHeading"),
+        (n["heading_old_version"], "message version 0, no heading field"),
+        (n["heading_no_pvt_yet"], "no NAV-PVT seen yet to place them on"
+         " the MCU clock"),
+        (n["heading_itow_mismatch"], "iTOW more than %d ms from the latest"
+         " NAV-PVT" % RELPOS_ITOW_MAX_DIFF_MS)]
+    for c, why in [(c, why) for c, why in dropped_heading if c]:
+        print("note: %d NAV-RELPOSNED epoch(s) dropped, %s" % (c, why))
     dropped_odo = [(n["odometry_no_t_us"], "never stamped with an MCU t_us by"
                     " the hub (nothing to place them on)"),
                    (n["odometry_other_kind"], "not a ground speed (kind != 0)"),
@@ -1238,7 +1389,8 @@ def main():
     if status_last is not None:
         print("last 0x40/0x04 status payload (%d bytes): %s"
               % (len(status_last), status_last.hex()))
-    other = {k: v for k, v in identities.items() if k not in ("NAV-PVT", "NAV-COV")}
+    other = {k: v for k, v in identities.items()
+             if k not in ("NAV-PVT", "NAV-COV", "NAV-RELPOSNED")}
     if other:
         print("other passthrough identities seen: "
               + ", ".join(f"{k}={v}" for k, v in sorted(other.items())))

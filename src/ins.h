@@ -104,6 +104,22 @@
 #define INS_AUTOINIT_SAMPLES_MAX 64
 #endif
 
+/** Range entries per epoch in ins_measurements_t.range[] (REQ-NAV-082). */
+#ifndef INS_RANGE_MAX
+#define INS_RANGE_MAX 4
+#endif
+
+/** Distance from the cached range reference point beyond which it is
+ *  recomputed exactly [m] (REQ-NAV-083). The geometry error inside it is
+ *  about radius^2 / R_earth. */
+#ifndef INS_RANGE_REF_RADIUS_M
+#define INS_RANGE_REF_RADIUS_M 100.0f
+#endif
+
+/** Predicted ranges below this are skipped, the line-of-sight vector is
+ *  undefined at the anchor itself [m] (REQ-NAV-084). */
+#define INS_RANGE_MIN_PRED_M 1.0f
+
 /** Min. Kalman epochs until ins_is_ready() returns true. */
 #define INS_MIN_KALMAN_EPOCHS_UNTIL_READY 4
 /** Min. runtime until ins_is_ready() returns true [ms]. */
@@ -229,6 +245,26 @@ typedef struct
     bool  is_valid;   /**< is this measurement usable? */
 } ins_meas_speed_t;
 
+/** @brief Range to an anchor at a known position (REQ-NAV-082).
+ *
+ *  A range measurement: the
+ *  distance between the platform's ranging antenna and the anchor/satellite.
+ *  The range is expected calibrated (hardware delay offset, oscillator offset, scale),
+ *  the filter only weights it with stddev_m and rejects chi2 outliers.
+ *
+ *  The anchor is stated in ECEF. */
+typedef struct
+{
+    double anchor_ecef[3]; /**< anchor position, ECEF [m] */
+    float  range_m;        /**< measured range [m], >= 0 */
+    float  stddev_m;       /**< 1-sigma range uncertainty [m], > 0 */
+    int    delay_ms;       /**< >0: this range is this many ms old
+                                (residual anchored in the history, like
+                                GNSS). 0 = now. */
+    uint16_t anchor_id;    /**< caller's anchor identifier, diagnostics only */
+    bool     is_valid;     /**< is this entry usable? */
+} ins_meas_range_t;
+
 /** @brief Optional external attitude/gyro-bias initial attitude for ins's own
  * auto-init bootstrap and re-acquisition (REQ-NAV-048), e.g. from a
  * continuously-running AHRS. */
@@ -332,6 +368,12 @@ typedef struct
     bool zero_velocity_update; /**< we know v == 0 */
     bool zero_rotation_update; /**< we know omega == 0 */
 
+    /* Range aiding (REQ-NAV-082): up to INS_RANGE_MAX anchors per epoch, each
+       entry with its own time of validity. Same "new sample only" contract as
+       the barometer: a latched is_valid re-fuses one reading every epoch. */
+    ins_meas_range_t range[INS_RANGE_MAX]; /**< range entries, any subset valid */
+    float            range_leverarm_b[3];  /**< ranging antenna lever arm,
+                                                body frame [m] */
 } ins_measurements_t;
 
 /** @brief Initial values supplied to ins_init(). */
@@ -896,6 +938,21 @@ typedef struct
      * 0 -> built-in default, negative -> no limit. */
     int gnss_min_delay_ms; /**< min. time between two fused GNSS epochs [ms]
                                 (0 -> default, < 0 -> no limit) */
+
+    /* Range aiding into the height under the barometric height source
+     * (REQ-NAV-082). While height_from_baro holds, ranges correct North/East
+     * only by default. */
+    bool range_height_with_baro; /**< fuse ranges into the height even under
+                                      barometric height */
+
+    /* Ranges as position aiding for the coasting window (REQ-NAV-085). An
+     * epoch that fused ranges counts as position aiding, like a GNSS fix,
+     * if afterwards the horizontal position 1-sigma in its WORST direction
+     * (major semi-axis of the North/East covariance) is at or below this
+     * limit. One anchor bounds one direction only: the covariance across its
+     * line of sight keeps growing, the ranges stop counting and the window
+     * expires as it would without them. */
+    float range_aiding_max_hpos_stddev_m; /**< [m] (0 -> default) */
 } ins_options_t;
 
 /** @brief Nominal state vector (float-only, local n-frame). */
@@ -1045,6 +1102,21 @@ typedef struct
         count is normal for a receiver running above opt.gnss_min_delay_ms, not
         a fault. */
     uint32_t n_gnss_rate_limited;
+
+    /* Range aiding (REQ-NAV-082, REQ-NAV-084). Every valid entry offered on a
+       live epoch is seen and ends in exactly one of used/rejected/skipped. */
+    uint32_t n_range_seen;         /**< valid range entries offered */
+    uint32_t n_range_used;         /**< range entries fused */
+    uint32_t n_range_rejected;     /**< range entries skipped by the chi2 gate */
+    uint32_t n_range_skipped;      /**< too close to the anchor, too old or
+                                        not found in the history */
+    uint32_t n_range_ref_updates;  /**< exact recomputations of the range
+                                        reference point (REQ-NAV-083) */
+    float last_range_residual_m;   /**< predicted minus measured range of the
+                                        last fused entry [m] */
+    uint16_t last_range_anchor_id; /**< anchor_id of the last fused entry */
+    uint32_t n_range_pos_aiding;   /**< epochs whose ranges counted as position
+                                        aiding (REQ-NAV-085) */
 } ins_diag_t;
 
 /** @brief Main filter instance.
@@ -1068,6 +1140,7 @@ typedef struct
     float chi2_thr_mag;   /**< magnetometer gate */
     float chi2_thr_local; /**< local-position gate */
     float chi2_thr_yaw;   /**< yaw-residual gate (incl. automotive course) */
+    float chi2_thr_range; /**< range gate (REQ-NAV-082) */
 
     /* Nominal state */
     ins_state_t state; /**< current nominal state */
@@ -1142,11 +1215,13 @@ typedef struct
         float gnss_vel_Qll_fuse[3 * 3];
         float gnss_pos_vel_Qll_fuse[3 * 3];
 
-        bool active;     /**< ins_correct_step() has work to do (history/health) */
-        bool run_fusion; /**< also run the ins_fuse_* calls (== no time jump) */
-        bool dr_frozen;  /**< restrict fusion to the position re-anchor channels */
-    } step_ctx;          /**< per-epoch scratch handed from ins_predict_step() to
-                              ins_correct_step() */
+        bool active;           /**< ins_correct_step() has work to do (history/health) */
+        bool run_fusion;       /**< also run the ins_fuse_* calls (== no time jump) */
+        bool dr_frozen;        /**< restrict fusion to the position re-anchor channels */
+        bool range_pos_aiding; /**< this epoch's ranges counted as position
+                                    aiding (REQ-NAV-085) */
+    } step_ctx;                /**< per-epoch scratch handed from ins_predict_step() to
+                                    ins_correct_step() */
 
     /* Timing / status */
     ins_time_us_t t_last_kalman_predict;  /**< last Kalman prediction step */
@@ -1469,6 +1544,18 @@ typedef struct
     ins_history_item_t history[INS_HISTORY_ITEMS_MAX]; /**< ring buffer, newest
                                                                  at history_index-1 */
     int history_index;                                 /**< next slot to write in history[] */
+
+    /* Cached reference point of the range geometry (REQ-NAV-083): the antenna
+       position in ECEF is formed as ecef + R_n_to_e * (offset from llh), so
+       only moving farther than INS_RANGE_REF_RADIUS_M costs a conversion. A
+       pure geometric relation, valid across filter resets. */
+    struct
+    {
+        bool   valid;       /**< false until the first range entry */
+        double llh[3];      /**< reference lat, lon [rad], height [m] */
+        double ecef[3];     /**< exact ECEF of llh [m] */
+        float  R_n_to_e[9]; /**< NED-to-ECEF rotation at llh (column-major) */
+    } range_ref;            /**< cached reference point for range-aiding geometry (REQ-NAV-083) */
 } ins_t;
 
 /******************************************************************************

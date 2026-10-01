@@ -75,8 +75,8 @@ score:
   # whole run moves far less than the exit transient it contains).
   # Reproducible to the millimetre across compilers and optimisation levels
   # (REQ-VER-031), retighten after an intentional improvement.
-  lim_pos_rms_m: 4.05           # observed 3.797
-  lim_ellipsoid_rms_m: 4.0      # observed 3.744
+  lim_pos_rms_m: 4.05           # observed 3.807
+  lim_ellipsoid_rms_m: 4.0      # observed 3.754
   # Report the coasting re-acquisition error (REQ-VER-029) but do not gate
   # it here. This dataset exists to drive the branch where the coasting
   # window expires and the 3D solution is given up, so the filter has no

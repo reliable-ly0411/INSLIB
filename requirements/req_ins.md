@@ -281,13 +281,22 @@ states.
 
 - **Status:** verified
 - **Parent:** REQ-SYS-001
-- **Verification:** Test: tests/test_ins_core.c:scenario_autoinit_gnss; Test: tests/test_ins_core.c:scenario_autoinit_local_pos; Test: tests/test_ins_core.c:scenario_autoinit_mag_yaw; Test: tests/test_ins_core.c:scenario_autoinit_yaw_priority; Test: tests/test_ins_core.c:scenario_autoinit_buffer_wraparound
+- **Verification:** Test: tests/test_ins_core.c:scenario_autoinit_gnss; Test: tests/test_ins_core.c:scenario_autoinit_local_pos; Test: tests/test_ins_core.c:scenario_autoinit_mag_yaw; Test: tests/test_ins_core.c:scenario_autoinit_yaw_priority; Test: tests/test_ins_core.c:scenario_autoinit_buffer_wraparound; Test: tests/test_ins_core.c:scenario_autoinit_gnss_leverarm
 
 When enabled, the filter shall bootstrap itself from the measurement
 stream: roll/pitch from accelerometer leveling over a window (median),
 yaw from an external yaw measurement, else the magnetometer, else left
 unknown with a correspondingly large covariance, position/velocity from
-the first usable fix. The leveling window does not need to be
+the first usable fix. A GNSS fix locates the antenna, so the initial
+position shall be the fix moved back along the GNSS lever arm, rotated
+with the bootstrap attitude, and only along its vertical component while
+the yaw is unknown (a horizontal lever arm rotated by an arbitrary yaw can
+land further off than not moving it at all). The initial velocity shall
+likewise be the fix's velocity minus R_b_to_n * (omega x lever arm), with
+omega the bootstrap epoch's gyro rate less the initial gyro bias, again
+only vertically while the yaw is unknown: on a turning platform with a
+long lever arm the antenna moves at metres per second the IMU does not.
+The n-frame origin stays the fix (REQ-NAV-080). The leveling window does not need to be
 quasi-static -- see REQ-NAV-047 for how the roll/pitch uncertainty
 reflects that. This is the baseline, standalone behavior: it is what a
 caller gets from ins.c alone, unless it explicitly supplies an
@@ -389,7 +398,8 @@ are disabled in this mode.
 - **Verification:** Test: tests/test_ins_core.c:scenario_deadreckoning_reacquire; Test: tests/test_ins_core.c:scenario_deadreckoning_freeze; Test: tests/test_ins_core.c:scenario_coasting_window_still_fuses
 
 The filter shall track the time since the last absolute position
-aiding (GNSS or local position fusion) and expose it via
+aiding (GNSS or local position fusion, or ranges that bound the
+horizontal position, REQ-NAV-085) and expose it via
 ins_deadreckoning_ms(). Once this time exceeds the configurable
 coasting window (max_deadreckoning_sec, default 10 s),
 ins_is_ready() shall return false -- the coasted position is no
@@ -405,12 +415,20 @@ allow_unlimited_deadreckoning.
 
 - **Status:** verified
 - **Parent:** REQ-SYS-010
-- **Verification:** Test: tests/test_ins_core.c:scenario_deadreckoning_reacquire; Test: tests/test_ins_core.c:scenario_deadreckoning_reacquire_far_from_origin; Test: tests/test_ins_core.c:scenario_deadreckoning_velocity_only_no_reacquire
+- **Verification:** Test: tests/test_ins_core.c:scenario_deadreckoning_reacquire; Test: tests/test_ins_core.c:scenario_deadreckoning_reacquire_far_from_origin; Test: tests/test_ins_core.c:scenario_deadreckoning_velocity_only_no_reacquire; Test: tests/test_ins_core.c:scenario_reacquire_leverarm_velocity
 
 The first usable position fix (GNSS or local position) after an
 expired coasting window shall re-anchor the filter instead of being
 fused as a residual: position (and velocity, if measured) are set
-from the measurement with covariance rebuilt from the measurement
+from the measurement, moved from the GNSS antenna to the IMU (position
+by R_b_to_n * lever arm, velocity by R_b_to_n * (omega_b_nb x lever
+arm), the same model the GNSS fusion predicts the antenna with). R_b_to_n
+is the attitude the filter holds once re-anchored (an attitude hint
+applied, REQ-NAV-048), not the one frozen at the start of the outage, and
+omega is this epoch's gyro rate less the bias, since the frozen filter
+computed none during the outage. While that attitude's yaw is unknown
+(REQ-NAV-059) only the vertical components are applied, as for the
+bootstrap (REQ-NAV-015). The covariance is rebuilt from the measurement
 noise -- except the vertical position under the barometric height
 source, which is re-anchored on the barometer instead (REQ-NAV-066) --
 while the frozen attitude and IMU bias estimates -- unchanged since the
@@ -1302,7 +1320,8 @@ aiding has failed a third, loosest threshold set
 continuously for longer than opt.gnss_stop_dwell_sec (each 0 -> a built-in
 default, REQ-NAV-043). An epoch fails the set when any channel it actually
 offers (position, velocity) exceeds its threshold; an epoch carrying
-local-position aiding never fails it. Only epochs that offer aiding shall
+local-position aiding, or one whose ranges counted as position aiding
+(REQ-NAV-085), never fails it. Only epochs that offer aiding shall
 be judged, so a plain outage remains governed by REQ-NAV-022
 (max_deadreckoning_sec) alone, and a run of bad fixes shall not be broken
 by the gaps between them.
@@ -2635,3 +2654,246 @@ is a position like any other.
 Rationale: the filter anchors geodetically (REQ-NAV-080) and mechanizes
 in NED, and that is also what callers hold.
 
+## REQ-NAV-082 — Range aiding to known anchors
+
+- **Status:** verified
+- **Parent:** REQ-SYS-001
+- **Verification:** Test: tests/test_ins_core.c:scenario_range_aiding; Test: tests/test_ins_core.c:scenario_range_leverarm_attitude; Test: tests/test_ins_core.c:scenario_range_delay; Test: tests/test_ins_core.c:scenario_range_baro_height
+
+ins_measurements_t shall accept up to INS_RANGE_MAX range measurements
+per epoch (range[]), each a measured distance from the platform's
+ranging antenna to an anchor at a known position: a two-way
+time-of-flight radio range (e.g. SX1280 LoRa ranging), and later a
+satellite in a tightly coupled GNSS solution. Each entry carries the
+anchor position in ECEF (double), the measured range [m], its 1-sigma
+[m], its own delay_ms and an anchor_id. One antenna lever arm
+(range_leverarm_b) applies to all entries.
+
+Each valid entry shall be fused as one scalar row of the error state:
+
+    h(x) = || a_e - (p_e + C_n^e * C_b^n * l_b) ||
+    u_n  = unit line-of-sight vector antenna -> anchor, n-frame
+    H    = [ -u_n^T | 0 | u_n^T [l_n]_x | 0 | 0 ]
+
+with the residual formed from the nonlinear h() on the NOMINAL state at
+the entry's time of validity, h(x_nominal) - range, like every other
+nonlinear reference (REQ-NAV-002). The lever arm enters through the
+attitude at the time of validity, exactly as for local position aiding
+(REQ-NAV-011), so H is the local-position Jacobian projected onto the
+line of sight.
+
+The fusion shall be split in two layers: a geometry layer that turns an
+entry into a line-of-sight vector, a residual and a variance, and a
+fusion kernel that takes only those three (the "unit vector plus range
+residual" interface). A pseudorange or a range difference between two
+anchors is then another geometry layer on the same kernel, plus a state
+column for a receiver clock where needed; the kernel does not change.
+
+**Delay.** delay_ms shall anchor the residual in the state history as
+gnss_delay_ms does (REQ-NAV-008). Per entry, not per epoch: radio
+ranging exchanges to different anchors run one after the other and an
+averaged burst of exchanges represents its midpoint, so the entries of
+one epoch generally have different times of validity. An entry whose
+state cannot be found in the history, or whose delay exceeds
+INS_MAX_DELAY_MS, shall be skipped.
+
+**Outliers** shall be skipped (not downweighted), with the same 1-DOF
+chi2 threshold as every other reference (REQ-NAV-046) and honouring
+chi2_disable (REQ-NAV-035). The dominant error of radio ranging is not
+noise but multipath: reflections make the measured range longer, by
+tens to hundreds of metres, not symmetric about the true one. Such a
+sample carries no usable information and partial fusion of it would
+bias the solution.
+
+**Barometric height.** While the filter runs on the barometric height
+source (height_from_baro, REQ-NAV-053), ranges shall by default correct
+North/East only: the Down component of the line of sight shall be removed
+from H (position and, through the lever arm, attitude columns), and the
+vertical position variance projected on the line of sight,
+u_D^2 * P_DD, shall be added to the range variance. The height is then
+never corrected by a range, and its uncertainty is accounted for as
+noise ("consider" state) rather than leaking into North/East through the
+residual. opt.range_height_with_baro shall switch this off and fuse all
+three axes. Without the barometric height source ranges shall always
+correct all three axes.
+
+Rationale: the anchors' ellipsoid heights and the barometric datum
+disagree (REQ-NAV-055 restricts GNSS position fusion to the horizontal
+under barometric height for the same reason), and a multipath-lengthened
+range over a steep line of sight would otherwise push a height the
+barometer determines better. The switch exists for installations where
+the ranges carry real vertical information, e.g. anchors well above and
+below the platform.
+
+**Scope.** Ranges shall only be fused on a live filter, outside the
+coasting-expired state (dr_frozen). They shall neither initialize nor
+re-acquire the filter (REQ-NAV-086 is the draft for that). Whether they
+count as position aiding for the coasting window is decided by the
+resulting covariance (REQ-NAV-085), not by the fact that a range was
+fused: one range bounds the position in one direction only. Sensor calibration
+(hardware delay offsets, oscillator offset, range scale) is the
+caller's job; the filter receives a calibrated range and its 1-sigma.
+
+Rationale for ECEF anchors although REQ-NAV-079 took ECEF out of the
+GNSS position interface: a ranging anchor gets its surveyed position
+from GNSS, a satellite position is computed in ECEF, and the range is a
+Euclidean distance that is naturally formed there. REQ-NAV-083 keeps
+the epoch path free of double precision trigonometry nevertheless.
+
+Known limitation: the vertical component of the filter's absolute
+position is what the range geometry is evaluated at. Under the
+barometric height source (REQ-NAV-053) that height carries the
+barometer's datum drift (REQ-NAV-055), which enters a range with the
+sine of the elevation angle towards the anchor.
+
+## REQ-NAV-083 — Range geometry without per-epoch trigonometry
+
+- **Status:** verified
+- **Parent:** REQ-NAV-082
+- **Verification:** Test: tests/test_ins_core.c:scenario_range_reference_point
+
+The antenna position in ECEF needed by REQ-NAV-082 shall be formed from a
+cached reference point (geodetic position, its exact ECEF position and
+its NED-to-ECEF rotation) plus the n-frame offset from that reference,
+so an epoch costs double precision additions only. The reference shall
+be recomputed exactly (one geodetic to ECEF conversion) only when the
+position at the time of validity is more than INS_RANGE_REF_RADIUS_M
+away from it. The anchor minus antenna difference shall be formed in
+double and only the result reduced to single precision.
+
+The approximation error is second order in the distance s from the
+reference, about s^2 / R_earth: below 2 mm inside the refresh radius, an
+order of magnitude under the best calibrated radio ranging noise. The
+range is rotation invariant, so using the reference's rotation instead
+of the current position's only tilts the line-of-sight vector by
+s / R_earth (about 3 arc seconds), irrelevant for a Jacobian.
+
+The number of exact recomputations shall be counted in
+ins_diag_t.n_range_ref_updates.
+
+The single precision norm limits the range resolution to about
+6e-8 relative (a few millimetres at tens of kilometres). That covers
+terrestrial anchors. Satellite distances need the norm in double and
+shall get it together with the tightly coupled GNSS geometry layer.
+
+## REQ-NAV-084 — Range input validation and gates
+
+- **Status:** verified
+- **Parent:** REQ-SYS-006
+- **Verification:** Test: tests/test_ins_core.c:scenario_range_input_validation
+
+A range entry with a non-finite anchor position, a non-finite or
+negative range, or a non-finite or non-positive 1-sigma shall be
+dropped at the API boundary and counted in ins_diag_t.n_invalid_input
+(REQ-NAV-018). A non-finite range lever arm shall be zeroed and counted
+likewise.
+
+An entry whose predicted range is below INS_RANGE_MIN_PRED_M shall be
+skipped: the line-of-sight vector is undefined at the anchor itself.
+
+Every valid entry offered on a live epoch shall be counted in
+ins_diag_t.n_range_seen and end in exactly one of n_range_used,
+n_range_rejected (chi2 gate) or n_range_skipped (geometry, delay or
+history). The residual and anchor_id of the last fused entry shall be
+kept in last_range_residual_m and last_range_anchor_id.
+
+
+## REQ-NAV-085 — Ranges that bound the position count as position aiding
+
+- **Status:** verified
+- **Parent:** REQ-NAV-082
+- **Verification:** Test: tests/test_ins_core.c:scenario_range_coasting; Test: tests/test_baro.c:scenario_suite_range_passthrough
+
+An epoch that fused at least one range (REQ-NAV-082) shall count as
+absolute position aiding -- resetting the coasting window of REQ-NAV-022
+exactly as a fused GNSS position does -- if, after the fusion, the
+horizontal position 1-sigma in its worst direction is at or below
+opt.range_aiding_max_hpos_stddev_m (0 -> default). The worst direction is
+the major semi-axis of the North/East block of the covariance, the square
+root of its larger eigenvalue, not the trace or a per-axis value.
+Such an epoch shall also keep the 3D solution from its GNSS quality-loss
+exit (REQ-NAV-052), like local position aiding does. The epochs that
+counted shall be counted in ins_diag_t.n_range_pos_aiding.
+
+Rationale: the coasting window is a time proxy for "the position is no
+longer bounded". For GNSS and local position aiding the proxy is exact,
+every such fix bounds all axes. For ranges it is not: one anchor bounds
+the position along its line of sight only and lets it drift across it,
+and a set of anchors bounds it only as well as their geometry allows.
+The covariance already carries exactly that geometry, so the criterion is
+evaluated on it rather than on a count of anchors or ranges. Consequences:
+
+- A single anchor, or a degenerate geometry, keeps the filter alive only
+  until the across-track uncertainty has grown past the limit; after that
+  the ranges stop counting and the window expires as it would without
+  them.
+- Anchors that keep the position bounded keep the filter ready for as long
+  as they do. The consumer reads the actual accuracy from the covariance
+  accessors.
+- IMU-only coasting behaves exactly as before: without fused ranges
+  nothing changes.
+- nav_suite needs no change: its FULL mode (REQ-SUITE-005) already follows
+  the coasting clock.
+
+The criterion is only as good as the covariance is honest. Radio ranging
+multipath is a positive bias, not noise; a caller that states too small a
+1-sigma makes the filter overconfident and keeps it ready on a biased
+solution. Conservative 1-sigmas and the rejection count
+(n_range_rejected) are the caller's safeguards until an anchor bias state
+exists.
+
+## REQ-NAV-086 — Initialization and re-acquisition from ranges
+
+- **Status:** draft
+- **Parent:** REQ-NAV-082
+- **Verification:** Open
+
+The filter should be able to start, and to re-acquire after an expired
+coasting window (REQ-NAV-023), from ranges alone when enough anchors with
+a usable geometry are in view, e.g. three anchors plus a barometric
+height.
+
+Open design question, to be decided before this becomes a requirement:
+
+- A dedicated initial solver (least-squares multilateration with a
+  geometry check and resolution of the mirror ambiguity of a poor
+  geometry) that hands a position fix to the existing re-acquisition
+  path, or
+- a degraded mode that starts from the last known (frozen) position with
+  the covariance inflated for the outage (REQ-NAV-065) and lets the range
+  fusion converge before the filter reports ready again. This covers a
+  re-acquisition after a short outage, not a cold start without any prior
+  position.
+
+## REQ-NAV-087 — Yaw from a body-fixed antenna baseline heading
+
+- **Status:** verified
+- **Parent:** REQ-NAV-010
+- **Verification:** Test: tests/test_ins_math.c:test_baseline_heading_to_yaw
+
+The library shall provide a conversion from the measured azimuth of a
+body-fixed baseline (a dual-antenna GNSS heading, e.g. u-blox moving base
+NAV-RELPOSNED relPosHeading) to the ZYX yaw that the absolute yaw aiding
+(REQ-NAV-010) consumes, given the baseline direction in the body frame and
+the current roll and pitch:
+
+    c   = Ry(pitch) * Rx(roll) * baseline_b
+    yaw = heading - atan2(c_y, c_x)          wrapped to [-pi, pi]
+
+The conversion shall be exact for any mounting and any tilt (the heading
+of R_b_to_n * baseline_b recovers the yaw it was built with to float
+precision), shall reduce to yaw = heading for a baseline along the body x
+axis independent of roll and pitch, and shall refuse (no output) on
+non-finite input, a zero baseline, or a baseline whose horizontal
+projection is shorter than a tenth of its length.
+
+Rationale: the receiver measures the direction of the vector between its
+two antennas, which is the vehicle yaw only when that vector happens to be
+the body x axis. A baseline across the vehicle or at an angle couples
+roll and pitch into the measured azimuth (a baseline along y at 20 deg
+roll and 10 deg pitch reads 3.6 deg off, a 45 deg diagonal one at 20 deg
+roll alone 1.8 deg), so feeding the raw heading as yaw
+biases the filter with every turn. One shared function keeps the firmware
+glue and both replay harnesses on the same geometry. The horizontal
+projection floor bounds the error amplification: below it the azimuth of
+the baseline is dominated by antenna phase noise, not by the yaw.

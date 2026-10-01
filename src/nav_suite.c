@@ -370,6 +370,23 @@ static bool nav_suite_local_ref(const nav_suite_t* s, float baro_stddev_m, nav_s
     return false;
 }
 
+/* Down component [m] of a body-frame lever arm rotated into NED with the
+ * suite's best attitude, level without one. Only roll and pitch enter. */
+static float nav_suite_leverarm_down(const nav_suite_t* s, const float la_b[3])
+{
+    if (!ins_vec3_finite(la_b)) return 0.0f;
+    float roll  = 0.0f;
+    float pitch = 0.0f;
+    float yaw   = 0.0f;
+    if (!nav_suite_get_rpy(s, &roll, &pitch, &yaw))
+    {
+        roll  = 0.0f;
+        pitch = 0.0f;
+    }
+    return -sinf(pitch) * la_b[0] + sinf(roll) * cosf(pitch) * la_b[1] +
+           cosf(roll) * cosf(pitch) * la_b[2];
+}
+
 /* Offset filter: feed it from every epoch carrying both a GNSS position and a
  * local height reference. No IMU sample is needed this epoch: the reference is
  * then one epoch stale, far below the offset filter's decimation interval. */
@@ -389,10 +406,14 @@ static void nav_suite_update_local_gnss(nav_suite_t* s, const ins_measurements_t
     ins_gnss_condition_pos_cov(&s->ins.opt, m->gnss_pos.Qll_ned, gnss_pos_Qll_fuse);
     const float var_v = gnss_pos_Qll_fuse[8];
     if (!(var_v > 0.0f) || !isfinite(var_v)) { return; }
-    /* The ellipsoidal height of the fix, as the caller stated it
-       (REQ-NAV-079). Nothing to convert and nothing to share with ins: both
-       consumers read the same number. */
-    const double h_ell = m->gnss_pos.llh[2];
+    /* The ellipsoidal height of the fix as the caller stated it (REQ-NAV-079),
+       moved from the antenna to the IMU point the local reference describes:
+       h_imu = h_antenna + down(R_b_to_n * leverarm). Without it the offset
+       absorbs the lever arm and the absolute height jumps by it whenever
+       nav_suite_get_height_ellipsoid() switches between ins and
+       reference plus offset. */
+    const double h_ell =
+        m->gnss_pos.llh[2] + (double)nav_suite_leverarm_down(s, m->gnss_leverarm_b);
 
     /* If the GNSS measurement is delayed, evaluate the local height at
        the GNSS time of validity using the reference's climb rate: both
@@ -490,6 +511,9 @@ static const ins_measurements_t* nav_suite_apply_local_datum(nav_suite_t*       
         s->local_pos_offset_valid  = true;
     }
 
+    /* Whole-struct copy: every other channel, the absolute range anchors
+       included, reaches ins unchanged. */
+    /* @satisfies REQ-SUITE-025 */
     *scratch = *m;
     scratch->local_pos.pos_ned[0] -= s->local_pos_offset_ned[0];
     scratch->local_pos.pos_ned[1] -= s->local_pos_offset_ned[1];

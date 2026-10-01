@@ -563,6 +563,106 @@ static void test_wrap_pi_bounded(void)
 /* ISA barometric conversion and the plausibility gate in front of it:
    a pressure that is out of range or not a number must be refused
    before it can turn into an altitude. */
+static void test_baseline_heading_to_yaw(void)
+{
+    /* Forward model: rotate the body baseline into NED with the full
+       attitude and take its azimuth, which is what a moving-base receiver
+       reports. The function must recover the yaw from that azimuth for
+       every mounting and every tilt, not only for the level case. */
+    static const float baselines[][3] = {
+        {1.0f, 0.0f, 0.0f},  /* along x: azimuth IS the yaw */
+        {0.0f, 1.0f, 0.0f},  /* across the vehicle */
+        {-1.2f, 0.0f, 0.0f}, /* pointing backwards, not unit length */
+        {0.7f, -0.7f, 0.1f}, /* diagonal, antennas at different heights */
+        {-0.3f, 0.9f, -0.4f},
+    };
+    static const float rp_deg[]  = {-35.0f, -10.0f, 0.0f, 12.5f, 40.0f};
+    static const float yaw_deg[] = {-179.0f, -90.0f, -3.0f, 0.0f, 45.0f, 135.0f, 180.0f};
+    double             worst     = 0.0;
+    int                n_fail    = 0;
+    for (size_t ib = 0; ib < sizeof baselines / sizeof baselines[0]; ++ib)
+    {
+        for (size_t ir = 0; ir < sizeof rp_deg / sizeof rp_deg[0]; ++ir)
+        {
+            for (size_t ip = 0; ip < sizeof rp_deg / sizeof rp_deg[0]; ++ip)
+            {
+                for (size_t iy = 0; iy < sizeof yaw_deg / sizeof yaw_deg[0]; ++iy)
+                {
+                    const float  roll  = rp_deg[ir] * (float)M_PI / 180.0f;
+                    const float  pitch = rp_deg[ip] * (float)M_PI / 180.0f;
+                    const float  yaw   = yaw_deg[iy] * (float)M_PI / 180.0f;
+                    const float* b     = baselines[ib];
+                    float        q[4], R[9], bn[3];
+                    ins_quat_from_rpy(roll, pitch, yaw, q);
+                    ins_quat_to_rotmat(q, R);
+                    for (int r = 0; r < 3; ++r)
+                    {
+                        bn[r] = R[r] * b[0] + R[r + 3] * b[1] + R[r + 6] * b[2];
+                    }
+                    const float heading = atan2f(bn[1], bn[0]);
+                    float       out     = 1000.0f;
+                    if (!ins_yaw_from_baseline_heading(heading, roll, pitch, b, &out))
+                    {
+                        n_fail++;
+                        continue;
+                    }
+                    const double err = fabs((double)ins_angle_diff(out, yaw));
+                    if (err > worst) worst = err;
+                }
+            }
+        }
+    }
+    CHECK_TRUE(n_fail == 0, "baseline_yaw_all_geometries_accepted");
+    CHECK_NEAR(worst, 0.0, 1e-5, "baseline_yaw_roundtrip_worst");
+
+    /* Along x the tilt must not matter at all: same heading in, same yaw
+       out, whatever roll and pitch are passed. */
+    {
+        const float bx[3] = {0.5f, 0.0f, 0.0f};
+        float       y0 = 0.0f, y1 = 0.0f;
+        CHECK_TRUE(ins_yaw_from_baseline_heading(0.8f, 0.0f, 0.0f, bx, &y0) &&
+                       ins_yaw_from_baseline_heading(0.8f, 0.6f, -0.5f, bx, &y1),
+                   "baseline_yaw_x_axis_accepted");
+        CHECK_NEAR(y0, 0.8f, 1e-6, "baseline_yaw_x_axis_level");
+        CHECK_NEAR(y1, 0.8f, 1e-6, "baseline_yaw_x_axis_tilted");
+    }
+
+    /* Result wrapped to [-pi, pi] even when heading and mounting add up
+       beyond it. */
+    {
+        const float back[3] = {-1.0f, 0.0f, 0.0f};
+        float       y       = 0.0f;
+        CHECK_TRUE(ins_yaw_from_baseline_heading(-3.0f, 0.0f, 0.0f, back, &y),
+                   "baseline_yaw_wrap_accepted");
+        CHECK_TRUE(y >= -(float)M_PI && y <= (float)M_PI, "baseline_yaw_wrap_range");
+        CHECK_NEAR(ins_angle_diff(y, -3.0f + (float)M_PI), 0.0, 1e-6, "baseline_yaw_wrap_value");
+    }
+
+    /* Refusals leave the output untouched. */
+    {
+        const float vertical[3] = {0.0f, 0.0f, 1.0f};
+        const float zero[3]     = {0.0f, 0.0f, 0.0f};
+        const float nan_b[3]    = {1.0f, NAN, 0.0f};
+        const float bx[3]       = {1.0f, 0.0f, 0.0f};
+        float       y           = 42.0f;
+        CHECK_TRUE(!ins_yaw_from_baseline_heading(0.1f, 0.0f, 0.0f, vertical, &y),
+                   "baseline_yaw_vertical_refused");
+        CHECK_TRUE(!ins_yaw_from_baseline_heading(0.1f, 0.0f, 0.0f, zero, &y),
+                   "baseline_yaw_zero_refused");
+        CHECK_TRUE(!ins_yaw_from_baseline_heading(0.1f, 0.0f, 0.0f, nan_b, &y),
+                   "baseline_yaw_nan_baseline_refused");
+        CHECK_TRUE(!ins_yaw_from_baseline_heading(NAN, 0.0f, 0.0f, bx, &y),
+                   "baseline_yaw_nan_heading_refused");
+        CHECK_TRUE(!ins_yaw_from_baseline_heading(0.1f, INFINITY, 0.0f, bx, &y),
+                   "baseline_yaw_inf_roll_refused");
+        /* x baseline pitched to 88 deg: horizontal projection cos(88 deg)
+           ~ 0.035 of its length, below the usable fraction. */
+        CHECK_TRUE(!ins_yaw_from_baseline_heading(0.1f, 0.0f, 88.0f * (float)M_PI / 180.0f, bx, &y),
+                   "baseline_yaw_near_vertical_refused");
+        CHECK_NEAR(y, 42.0f, 0.0, "baseline_yaw_untouched_on_refusal");
+    }
+}
+
 static void test_isa_pressure(void)
 {
     /* Sea level pressure is the datum, so it converts to 0 m. */
@@ -828,6 +928,7 @@ int main(void)
     test_quat_to_axis_angle();
     test_angle_diff();
     test_wrap_pi_bounded();
+    test_baseline_heading_to_yaw();
     test_isa_pressure();
     test_gravity();
     test_wmm_model();

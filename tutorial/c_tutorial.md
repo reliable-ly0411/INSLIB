@@ -291,7 +291,12 @@ have:
   `[0, 2*pi)`, the filter normalises it. A value beyond one full turn is
   taken as a unit or unwrapping mistake (degrees in a radian field, an
   accumulated course), dropped, and counted in `n_invalid_input`. If
-  the heading aiding does nothing, check that counter first.
+  the heading aiding does nothing, check that counter first. A
+  dual-antenna receiver measures the azimuth of its antenna baseline,
+  which is the yaw only for antennas lined up along the body x axis. For
+  any other mounting convert it first with
+  `ins_yaw_from_baseline_heading(heading, roll, pitch, baseline_b, &yaw)`
+  (`geodetic_toolbox.h`), using the attitude you currently have.
 * **`m.zero_velocity_update` / `m.zero_rotation_update`** - tell the
   filter you know you are standing still, it re-estimates its IMU biases.
   (An automatic detector does this by default.)

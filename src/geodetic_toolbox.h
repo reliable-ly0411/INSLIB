@@ -367,6 +367,34 @@ extern "C"
      *  @return a wrapped into [-pi, pi]. */
     float ins_wrap_pi_bounded(float a);
 
+    /** @brief Vehicle yaw from the measured azimuth of a body-fixed baseline.
+     *
+     *  A dual-antenna GNSS heading (u-blox moving base: NAV-RELPOSNED
+     *  relPosHeading) is the azimuth of the vector between the two antennas,
+     *  not the vehicle yaw. The two coincide only for a baseline along the
+     *  body x axis, whose azimuth equals the ZYX yaw at any roll and pitch.
+     *  For any other mounting this inverts the geometry exactly: with
+     *  c = Ry(pitch) * Rx(roll) * baseline_b the baseline's azimuth is
+     *  yaw + atan2(c_y, c_x), so yaw = heading - atan2(c_y, c_x).
+     *
+     *  Roll and pitch are the caller's current estimate. The result is only
+     *  sensitive to them through the baseline's out-of-x-axis components,
+     *  i.e. not at all for a baseline along x.
+     *
+     *  @param[in] heading_rad Measured baseline azimuth [rad], from north
+     *             towards east, any finite value.
+     *  @param[in] roll_rad Roll [rad].
+     *  @param[in] pitch_rad Pitch [rad].
+     *  @param[in] baseline_b Baseline direction in the body frame (FRD),
+     *             from the antenna the azimuth is measured FROM to the one it
+     *             points TO. Any nonzero length.
+     *  @param[out] yaw_rad Yaw [rad] in [-pi, pi]. Untouched on failure.
+     *  @return false (no output) on non-finite input, a zero baseline, or a
+     *          baseline tilted so close to vertical that its horizontal
+     *          projection carries no usable azimuth. */
+    bool ins_yaw_from_baseline_heading(float heading_rad, float roll_rad, float pitch_rad,
+                                       const float baseline_b[3], float* yaw_rad);
+
     /** @brief True iff all three components are finite (not NaN/Inf).
      *  @param[in] v Input 3x1 vector.
      *  @return true if every component is finite, false otherwise. */

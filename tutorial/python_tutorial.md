@@ -124,6 +124,18 @@ unwrapping mistake, dropped, and counted in the filter's
 `n_invalid_input` diagnostic instead of being wrapped into a wrong
 heading.
 
+A dual-antenna receiver measures the azimuth of its antenna baseline,
+which is the yaw only when the antennas sit along the body x axis. For
+any other mounting convert it first:
+
+```python
+from INSLIB import yaw_from_baseline_heading
+roll, pitch, _ = nav.rpy() or (0.0, 0.0, 0.0)
+yaw = yaw_from_baseline_heading(heading_rad, roll, pitch, (0.0, 1.0, 0.0))
+if yaw is not None:                      # None: baseline near vertical
+    nav.yaw(yaw, stddev_rad, delay_ms=200)
+```
+
 ## Reading the `Solution`
 
 `nav.solution()` returns a `Solution` dataclass:

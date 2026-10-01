@@ -402,7 +402,13 @@ def plot_results(rec, name, warmup_sec, out_path=None, gnss_delay_curve=None,
     if not t:
         print("plot: no recorded samples (filter never initialized?)")
         return
-    has_ref = any(not math.isnan(row[0]) for row in rec["ref_pos"])
+    # A single reference epoch (e.g. a placeholder ref.csv) is forward-
+    # filled onto every later sample by replay.py/inspostgui.py, which
+    # would otherwise look like a real, flat "ground truth" trajectory
+    # here. rec["ref_epoch_count"] is the real, pre-forward-fill count;
+    # treat it as usable ground truth only from 2 distinct epochs on.
+    has_ref = (rec.get("ref_epoch_count", 2) >= 2
+              and any(not math.isnan(row[0]) for row in rec["ref_pos"]))
 
     # --- Figure 1: state history, 1-σ band, reference overlay ----------
     fig1, axes = plt.subplots(3, 3, figsize=(14, 9), sharex=True)
@@ -410,15 +416,18 @@ def plot_results(rec, name, warmup_sec, out_path=None, gnss_delay_curve=None,
     # The vertical channel is stored NED (D, down-positive) but plotted as
     # Up (-D) for readability; the σ band is a half-width, so negating
     # the center/reference is enough.
+    # Position at the reference point (score.leverarm_frd, REQ-VER-037), so
+    # a reference taken at an antenna does not show the lever arm as error.
+    pos_key = "pos_ref_pt" if rec.get("pos_ref_pt") else "pos"
     groups = (
-        ("pos", "pos_sigma", "ref_pos", ("N [m]", "E [m]", "Up [m]")),
+        (pos_key, "pos_sigma", "ref_pos", ("N [m]", "E [m]", "Up [m]")),
         ("vel", "vel_sigma", "ref_vel", ("vN [m/s]", "vE [m/s]", "vUp [m/s]")),
         ("rpy_deg", "rpy_sigma_deg", "ref_rpy_deg",
          ("roll [deg]", "pitch [deg]", "yaw [deg]")),
     )
     for row, (key, skey, rkey, labels) in enumerate(groups):
         is_yaw_row = key == "rpy_deg"
-        is_vert_ned = key in ("pos", "vel")  # D component shown as Up (-D)
+        is_vert_ned = key in (pos_key, "vel")  # D component shown as Up (-D)
         for i in range(3):
             ax = axes[row][i]
             center = _col(rec[key], i)
@@ -807,7 +816,11 @@ def _summary_page(rec, name, growth_rate=None, baro_growth_rate=None,
     t = rec["t"]
     if not t or len(t) < 2:
         return None
-    use_ref = any(row and row[0] == row[0] for row in rec["ref_vel"])
+    # See has_ref in plot_results() above: a single forward-filled
+    # reference epoch (e.g. a placeholder ref.csv) must not be scored as a
+    # flat, zero-speed ground-truth trajectory.
+    use_ref = (rec.get("ref_epoch_count", 2) >= 2
+              and any(row and row[0] == row[0] for row in rec["ref_vel"]))
     vel = rec["ref_vel"] if use_ref else rec["vel"]
     pos = rec["ref_pos"] if use_ref else rec["pos"]
     src = "ground truth" if use_ref else "filter estimate"
@@ -973,7 +986,13 @@ def _subfilter_page(rec, t, name, prefix, label):
         return None
     import matplotlib.pyplot as plt
 
-    has_ref = any(not math.isnan(row[0]) for row in rec["ref_pos"])
+    # A single reference epoch (e.g. a placeholder ref.csv) is forward-
+    # filled onto every later sample by replay.py/inspostgui.py, which
+    # would otherwise look like a real, flat "ground truth" trajectory
+    # here. rec["ref_epoch_count"] is the real, pre-forward-fill count;
+    # treat it as usable ground truth only from 2 distinct epochs on.
+    has_ref = (rec.get("ref_epoch_count", 2) >= 2
+              and any(not math.isnan(row[0]) for row in rec["ref_pos"]))
 
     fig, axes = plt.subplots(2, 3, figsize=(14, 7))
     fig.suptitle(f"{name}: {label}")
@@ -1126,12 +1145,18 @@ def _ne_page(rec, name):
         return None
     import matplotlib.pyplot as plt
 
-    has_ref = any(not math.isnan(row[0]) for row in rec["ref_pos"])
+    # A single reference epoch (e.g. a placeholder ref.csv) is forward-
+    # filled onto every later sample by replay.py/inspostgui.py, which
+    # would otherwise look like a real, flat "ground truth" trajectory
+    # here. rec["ref_epoch_count"] is the real, pre-forward-fill count;
+    # treat it as usable ground truth only from 2 distinct epochs on.
+    has_ref = (rec.get("ref_epoch_count", 2) >= 2
+              and any(not math.isnan(row[0]) for row in rec["ref_pos"]))
 
     fig, ax = plt.subplots(figsize=(9, 9))
     fig.suptitle(f"{name}: North-East position")
 
-    track = rec.get("track_ne") or rec["pos"]
+    track = rec.get("track_ne") or rec.get("pos_ref_pt") or rec["pos"]
     n, e = _thin_track(_col(track, 0), _col(track, 1))
     ax.plot(e, n, color=EST_COLOR, label="estimate")
     if has_ref:
@@ -1139,6 +1164,15 @@ def _ne_page(rec, name):
         rn, re = _thin_track(_col(ref_track, 0), _col(ref_track, 1))
         ax.plot(re, rn, "--", color=REF_COLOR, linewidth=1.2,
                label="ground truth")
+    # Start and end of the estimate: on a loop or an out-and-back drive the
+    # track alone does not say which way it was driven.
+    valid = [(row[0], row[1]) for row in track
+             if not (math.isnan(row[0]) or math.isnan(row[1]))]
+    if valid:
+        ax.plot(valid[0][1], valid[0][0], "o", markersize=10, markerfacecolor="white",
+                markeredgecolor="black", markeredgewidth=1.8, zorder=5, label="start")
+        ax.plot(valid[-1][1], valid[-1][0], "s", markersize=9, color="black",
+                zorder=5, label="end")
     ax.set_xlabel("East [m]")
     ax.set_ylabel("North [m]")
     ax.set_aspect("equal", adjustable="datalim")
@@ -1178,7 +1212,13 @@ def _altitude_page(rec, t, name):
         return None
     import matplotlib.pyplot as plt
 
-    has_ref = any(not math.isnan(row[0]) for row in rec["ref_pos"])
+    # A single reference epoch (e.g. a placeholder ref.csv) is forward-
+    # filled onto every later sample by replay.py/inspostgui.py, which
+    # would otherwise look like a real, flat "ground truth" trajectory
+    # here. rec["ref_epoch_count"] is the real, pre-forward-fill count;
+    # treat it as usable ground truth only from 2 distinct epochs on.
+    has_ref = (rec.get("ref_epoch_count", 2) >= 2
+              and any(not math.isnan(row[0]) for row in rec["ref_pos"]))
     has_gnss = any(v == v for v in rec["fix_pos_d"])
     raw_d = rec.get("baro_raw_d", [])
     has_raw = any(v == v for v in raw_d)
@@ -1187,11 +1227,13 @@ def _altitude_page(rec, t, name):
     has_corr = (any(v == v for v in gnss_offset_ts)
                and origin_h is not None and origin_h == origin_h)
 
+    up, shifted = _ref_pt_up(rec, len(t))
     fig, ax = plt.subplots(figsize=(12, 6))
-    fig.suptitle(f"{name}: altitude profile")
+    fig.suptitle(f"{name}: altitude profile"
+                 + (" (board curves at the reference point)" if shifted else ""))
 
     if has_ins:
-        alt = [-v for v in _col(rec["pos"], 2)]
+        alt = [-v + u for v, u in zip(_col(rec["pos"], 2), up)]
         _band(ax, t, alt, _col(rec["pos_sigma"], 2), "INSLIB", EST_COLOR)
         if has_corr:
             ins_corr = [a + o - origin_h if a == a and o == o else math.nan
@@ -1200,7 +1242,7 @@ def _altitude_page(rec, t, name):
             ax.plot(t_ic, alt_ic, "-.", color=EST_COLOR, linewidth=1.2,
                    label="INSLIB (offset-corrected)")
     if has_baro:
-        alt_b = [-v for v in rec["baro_h_d"]]
+        alt_b = [-v + u for v, u in zip(rec["baro_h_d"], up)]
         _band(ax, t, alt_b, rec["baro_h_sigma"], "baro_alt", BARO_COLOR)
         if has_corr:
             baro_corr = [a + o - origin_h if a == a and o == o else math.nan
@@ -1214,7 +1256,7 @@ def _altitude_page(rec, t, name):
         # only the SHAPE is meaningful here -- align it to baro_alt (or,
         # lacking that, INSLIB) at their first jointly-valid sample, purely
         # for a comparable overlay on the same axis (no filtering applied).
-        alt_raw_pu = [-v if v == v else v for v in raw_d]
+        alt_raw_pu = [-v + u if v == v else v for v, u in zip(raw_d, up)]
         anchor = alt_b if has_baro else (alt if has_ins else None)
         anchor_off = next((alt_raw_pu[i] - anchor[i] for i in range(len(alt_raw_pu))
                           if alt_raw_pu[i] == alt_raw_pu[i] and anchor is not None
@@ -1252,6 +1294,15 @@ def _altitude_page(rec, t, name):
     return fig
 
 
+def _ref_pt_up(rec, n):
+    """Per-sample up shift [m] from the sensor board (ins, baro_alt, the
+    barometer) to the reference point (score.leverarm_frd, REQ-VER-037), 0
+    where unknown, and whether it is anywhere nonzero."""
+    up = rec.get("ref_pt_up") or []
+    up = [u if u == u else 0.0 for u in up[:n]] + [0.0] * max(0, n - len(up))
+    return up, any(u != 0.0 for u in up)
+
+
 def _altitude_ellipsoid_page(rec, t, name):
     """Absolute-ellipsoid-height counterpart to _altitude_page (alt_plot_a):
     the same five curves -- full3d, baro_alt, baro raw, ground truth, gnss
@@ -1278,25 +1329,33 @@ def _altitude_ellipsoid_page(rec, t, name):
     has_baro = has_offset and any(v == v for v in rec["baro_h_d"])
     raw_d = rec.get("baro_raw_d", [])
     has_raw = has_offset and has_baro and any(v == v for v in raw_d)
-    has_ref = any(not math.isnan(row[0]) for row in rec["ref_pos"])
+    # A single reference epoch (e.g. a placeholder ref.csv) is forward-
+    # filled onto every later sample by replay.py/inspostgui.py, which
+    # would otherwise look like a real, flat "ground truth" trajectory
+    # here. rec["ref_epoch_count"] is the real, pre-forward-fill count;
+    # treat it as usable ground truth only from 2 distinct epochs on.
+    has_ref = (rec.get("ref_epoch_count", 2) >= 2
+              and any(not math.isnan(row[0]) for row in rec["ref_pos"]))
     has_gnss = any(v == v for v in rec["fix_pos_d"])
     if not (has_ins or has_baro or has_raw or has_ref or has_gnss):
         return None
     import matplotlib.pyplot as plt
 
     offset = rec["local_gnss_offset"]
+    up, shifted = _ref_pt_up(rec, len(t))
 
     fig, ax = plt.subplots(figsize=(12, 6))
-    fig.suptitle(f"{name}: altitude profile (ellipsoid height)")
+    fig.suptitle(f"{name}: altitude profile (ellipsoid height)"
+                 + (", board curves at the reference point" if shifted else ""))
 
     if has_ins:
-        ell = [-row[2] + o if row[2] == row[2] and o == o else math.nan
-              for row, o in zip(rec["pos"], offset)]
+        ell = [-row[2] + u + o if row[2] == row[2] and o == o else math.nan
+              for row, o, u in zip(rec["pos"], offset, up)]
         alt_i, ti = _thin(ell, t)
         ax.plot(ti, alt_i, color=EST_COLOR, label="INSLIB")
     baro_up = None
     if has_baro:
-        baro_up = [-h if h == h else math.nan for h in rec["baro_h_d"]]
+        baro_up = [-h + u if h == h else math.nan for h, u in zip(rec["baro_h_d"], up)]
         baro_ell = [b + o if b == b and o == o else math.nan
                    for b, o in zip(baro_up, offset)]
         alt_b, tb = _thin(baro_ell, t)
@@ -1307,7 +1366,7 @@ def _altitude_ellipsoid_page(rec, t, name):
         # datum, so it is shifted to coincide with baro_alt (alt_plot_a's
         # anchor) at their first jointly-valid sample before local_gnss_
         # offset -- which belongs to baro_alt's datum -- applies to it too.
-        alt_raw_pu = [-v if v == v else v for v in raw_d]
+        alt_raw_pu = [-v + u if v == v else v for v, u in zip(raw_d, up)]
         anchor_off = next((alt_raw_pu[i] - baro_up[i] for i in range(len(alt_raw_pu))
                           if alt_raw_pu[i] == alt_raw_pu[i] and baro_up[i] == baro_up[i]),
                           0.0)

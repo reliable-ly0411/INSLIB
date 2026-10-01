@@ -22,7 +22,7 @@ exit code and human-readable output.
 
 - **Status:** implemented
 - **Parent:** REQ-VER-002
-- **Verification:** Inspection: datasets/replay_format.py defines the shared config.yaml + imu/ref/gnss/mag/baro/speed.csv contract (schema documented in doc/INSLIB_manual.tex section "config.yaml", dataset specifics confined to the convert_*.py converters)
+- **Verification:** Inspection: datasets/replay_format.py defines the shared config.yaml + imu/ref/gnss/mag/baro/speed/heading.csv contract (schema documented in doc/INSLIB_manual.tex section "config.yaml", dataset specifics confined to the convert_*.py converters)
 
 A single replay harness (one binary, `tools/replay.c`; mirrored by
 `python/replay.py`) shall consume a dataset-neutral input format: a
@@ -37,7 +37,9 @@ measurements with the full NED position and velocity covariance;
 unknown entries zero), mag.csv (calibrated body-frame field [uT]),
 baro.csv (static pressure [Pa]) and speed.csv (scalar ground speed
 [m/s], REQ-NAV-068 -- its per-sample uncertainty and delay come from
-config.yaml as constants, not from further columns). Dataset specifics (axis conventions,
+config.yaml as constants, not from further columns) and heading.csv
+(dual-antenna baseline azimuth [deg] with its per-row 1-sigma [deg] and
+carrier-phase solution, REQ-VER-035). Dataset specifics (axis conventions,
 units, lever arms, sensor calibration, noise, gates) shall be confined
 to the per-dataset converters, so new datasets only add a converter
 and a Makefile sub-target.
@@ -674,8 +676,9 @@ very start, and the auto-ZUPTs there are load-bearing: cutting the recording to
 300 s or 200 s before the tunnel removes all 194 of them and takes the exit
 error from 36.1 m to 42.8 m and 43.4 m. Those three figures were measured
 while the metric of REQ-VER-029 still sampled after the returning fix had
-been fused. Sampled ahead of it, the untrimmed recording exits at 91.7 m, and
-at 285.5 m with the lateral constraint disabled.
+been fused. Sampled ahead of it, and at the antenna the reference describes
+(score: leverarm_frd, REQ-VER-037), the untrimmed recording exits at 91.5 m,
+and at 285.9 m with the lateral constraint disabled.
 
 ## REQ-VER-032 — Odometry tunnel dataset
 
@@ -693,15 +696,15 @@ re-acquisition error of REQ-VER-029 in `make datasets` and `make test`.
 It is the only real-data check of the speed aiding, which is otherwise
 verified in a synthetic scenario only. The gate shall therefore be tight
 enough to fail when the odometry stops contributing, not only when the
-coasting breaks: the exit error is 22.7 m with the speed aiding and 29.2 m
-with it disabled. Like REQ-VER-031 the limit sits 1 m above the observed
-value (23.7 m).
+coasting breaks: the exit error, at the antenna the reference describes
+(REQ-VER-037), is 22.2 m with the speed aiding and 29.5 m with it disabled.
+Like REQ-VER-031 the limit sits 1 m above the observed value (23.2 m).
 
 The speed scale shall be calibrated in the dataset's config, and that
 calibration shall not use the scored outage. OBD2 speed on this car reads
 about 1.8 percent low against the GNSS horizontal speed, estimated on the
 stretch before the tunnel alone. Left at 1.0 the same aiding lands the exit at
-55.4 m, worse than no odometry at all, which is a failure the tight gate also
+54.9 m, worse than no odometry at all, which is a failure the tight gate also
 catches.
 
 The tunnel is the Wattkopf tunnel again, driven in the direction of
@@ -766,3 +769,163 @@ Not covered: link time optimization, and a user log sink beyond the figure
 assumed for it. Function pointer targets are listed by hand in the configs,
 as globs where the runtime choice is not visible to the compiler, which
 yields an upper bound.
+
+## REQ-VER-034 — Free-inertial round-trip dataset as a scored metric
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: tools/replay.c:main
+
+The suite shall carry a committed, hand-carried, pure-inertial recording
+(`datasets/inertial_roundtrip/`, no GNSS, no magnetometer, no barometer,
+160.7 s, block-averaged from 797 Hz to 100 Hz IMU data to save repository
+storage space) whose unit starts and ends on the same physical mark/socket,
+and shall gate the filter's position AND yaw error at the end of the run
+against that fact in `make datasets` and `make test`.
+
+A free-inertial run has no ground truth to score against while it moves --
+that is the point of running it free-inertial. This dataset carries none
+in between, only two declared truth points in `ref.csv`: the start pose,
+which doubles as the auto-init anchor (`free_inertial_start`, position
+only), and the end pose, identical to the start because the operator put
+the unit back where it began. `score: warmup_sec` is set to fall shortly
+before the end epoch's timestamp, so the start row is excluded from
+scoring (it is the anchor, not a truth to compare against) and the end row
+is the only epoch ever scored. The resulting `ins pos rms [m]` and
+`ins |yaw bias| [deg]` are therefore not accuracy claims against some
+absolute reference frame -- the dataset does not know true north or a
+surveyed coordinate any better than the filter does -- they are the
+round-trip drift itself: whatever the filter reports at the end that is
+not zero is a real error, by construction, without needing a reference
+trajectory for the 160 s in between.
+
+Yaw is scored, not just position, because the mount is not rotationally
+free: the socket fixes heading as well as position, so a true return
+means the same yaw too, not only the same place. Roll and pitch are left
+ungated (`lim_att_bias_deg`/`lim_att_std_deg: 999`, `score: attitude`
+does not offer a per-axis on/off switch): gravity continuously re-observes
+them for the whole run regardless of aiding, so they are not exercising
+anything a pure free-inertial regression needs a gate for, and gating them
+tightly would only add noise from the initial leveling accuracy to a
+dataset about drift.
+
+The limits are set on a single deterministic run (`build/replay.exe`) at
+roughly 15 to 25% above the observed round-trip error: `lim_pos_rms_m: 0.09`
+(observed 0.072 m) and `lim_yaw_bias_deg: 0.25` (observed 0.205 deg), so a
+change that costs the free-inertial solution a few centimetres or a
+fraction of a degree fails this. Retighten after an intentional
+improvement, the same rule as every other `lim_*` in this database.
+
+The committed rate (100 Hz) was picked by re-scoring the same capture
+block-averaged to 50, 100 and 200 Hz and keeping the slowest one that still
+passed both gates, not the coarsest rate that merely still ran: the scored
+yaw error is not monotonic in the rate (0.444 deg at 50 Hz, 0.205 deg at
+100 Hz, 0.306 deg at 200 Hz against the un-decimated 797 Hz capture's
+0.200 deg), because block-averaging changes the noise the auto-ZUPT window
+statistics see and therefore which stretches get zero-velocity/zero-rotation
+updated, which shifts the estimated gyro bias the free-inertial yaw drift is
+most sensitive to. A future re-tuning of this dataset shall re-check
+neighbouring rates rather than assume the error shrinks monotonically as
+the rate goes up.
+
+## REQ-VER-035 — Dual-antenna GNSS heading in the replay tooling
+
+- **Status:** verified
+- **Parent:** REQ-VER-003
+- **Verification:** Test: python/tests/test_heading_stream.py:test_heading_row_shares_t_us_with_its_gnss_fix; Test: python/tests/test_heading_stream.py:test_trailing_heading_is_placed_by_its_itow; Test: python/tests/test_heading_stream.py:test_unusable_relposned_epochs_are_dropped_and_counted; Test: python/tests/test_heading_stream.py:test_generated_config_section_is_accepted_by_the_replay; Test: python/tests/test_heading_stream.py:test_heading_measurement_gates_and_noise; Test: python/tests/test_heading_stream.py:test_heading_measurement_undoes_a_tilted_cross_baseline; Demonstration: tools/replay.c, python/replay.py and python/inspostgui.py --batch report identical heading counts and yaw error on profile_3_aircraft with heading.csv synthesized from ref.csv for a baseline along x and one across the vehicle
+
+**Conversion.** tools/inslib_convert_ubx_to_csv.py shall write heading.csv
+from u-blox NAV-RELPOSNED, keeping only epochs with gnssFixOK, relPosValid,
+relPosHeadingValid, a positive accHeading and isMoving set (a heading
+against a static RTK base is the direction to that base, not an attitude),
+and count every dropped epoch by reason. A row shall carry the t_us of the
+NAV-PVT with the same iTOW, and the latest NAV-PVT's t_us plus the iTOW
+difference when the message belongs to a neighbouring epoch (at most one
+second apart, else dropped), so the heading row and the gnss.csv fix of one
+epoch carry the identical t_us regardless of which IMU sample either
+message arrived after. heading.csv, and `heading: enable: 1` in a generated
+config.yaml, shall only exist when at least one epoch was kept.
+
+**Replay.** tools/replay.c, python/replay.py and python/inspostgui.py shall
+accept a `heading:` config section (enable, baseline_frd, require_fixed,
+stddev_scale, stddev_min_deg, delay_ms) and an `inputs: heading` filename
+override, and turn the newest heading.csv row of each IMU interval into an
+absolute yaw measurement (REQ-NAV-010) with that delay:
+
+- rows whose carr_soln is not 2 are skipped while require_fixed is set,
+- the row's 1-sigma is multiplied by stddev_scale (0 -> 1) and floored at
+  stddev_min_deg (0 -> no floor), a non-positive result is skipped,
+- the azimuth becomes a yaw through REQ-NAV-087 with baseline_frd and the
+  suite's current roll/pitch (level while the suite holds no attitude
+  yet), a refusal of that geometry is skipped.
+
+Each harness shall report how many rows were offered as yaw and how many
+were skipped for each of the three reasons. Rationale: the receiver's
+per-epoch accuracy is kept as a column because it moves by an order of
+magnitude with the satellite geometry, which a config constant would throw
+away, and the mounting stays in config.yaml because a remounted antenna
+pair must not need a reconversion.
+
+## REQ-VER-036 — IMU mounting angles in config.yaml
+
+- **Status:** verified
+- **Parent:** REQ-VER-003
+- **Verification:** Test: tests/test_yaml.c:scenario_imu_mount; Test: python/tests/test_mount_rotation.py:test_mount_composes_all_three_sensors; Test: python/tests/test_mount_rotation.py:test_zero_mount_is_a_noop; Test: python/tests/test_mount_rotation.py:test_mount_survives_a_config_roundtrip; Demonstration: with the imu.csv of datasets/kfgins rotated into a board mounted at roll 2, pitch -3, yaw -9 deg and imu: mount_rpy_deg: [2, -3, -9] in its config.yaml, tools/replay.c and python/replay.py reproduce the unrotated dataset's attitude and position scores exactly, while the same rotated data without the key misses the attitude gates by about the mounting angles
+
+tools/replay.c, tools/insrcv.c, python/replay.py and python/inspostgui.py
+shall accept `imu: mount_rpy_deg: [roll, pitch, yaw]` [deg], the attitude
+of the sensor board's axes in the vehicle body frame (ZYX, FRD), and
+compose it onto the accelerometer, gyroscope and magnetometer calibration
+matrices (REQ-NAV-037, all-zero read as identity) before the filter is
+configured:
+
+    M := R(roll, pitch, yaw) * M
+
+with R the rotation that takes a board-frame vector into the vehicle
+frame (built like R_b_to_n from a roll/pitch/yaw, the vehicle in place of
+NED), so the per-axis calibration the matrix already holds is applied
+first. The fixed biases stay in the raw sensor frame. A non-finite angle
+shall be refused. Missing or all-zero the key changes nothing. The two C
+harnesses share one implementation (tools/imu_mount.h), the library itself
+is not involved: it only ever sees the composed matrices. After it every
+other body-frame quantity of
+the config (lever arms, heading baseline_frd) and every attitude the
+harness reports refers to the vehicle axes. The composition shall never
+be written back into the configuration's own matrices, so a configuration
+that is loaded, edited and saved again (the inspostgui.py round trip) does
+not apply the mounting twice.
+
+Rationale: a mounting error measured in the field is an angle (e.g. the
+yaw offset between the IMU and a dual-antenna heading), and the
+misalignment matrices it would otherwise have to be folded into also carry
+the board's own per-axis calibration.
+
+## REQ-VER-037 — Estimate compared at the reference point everywhere
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: python/tests/test_score_leverarm.py:test_height_projection_matches_rotated_lever_arm; Test: python/tests/test_score_leverarm.py:test_zero_lever_arm_is_a_noop; Demonstration: with ref.csv of datasets/kfgins moved to a point 2.0 m behind, 0.1 m right and 1.3 m above the IMU and score: leverarm_frd set to that point, tools/replay.c and python/replay.py report the unmoved dataset's position and ellipsoid height errors, and the state history, North-East and altitude pages of python/replay.py --plot overlay estimate and reference without the 1.3 m height offset
+
+`score: leverarm_frd` names the point on the vehicle the reference refers
+to (a GNSS antenna when ref.csv is the receiver's own solution). Every
+place the replay harnesses put the estimate next to the reference shall
+compare that point, the IMU position plus R_b_to_n * leverarm_frd with the
+suite's current attitude, not the IMU position:
+
+- the position error (as before),
+- the ellipsoid height error of nav_suite_get_height_ellipsoid() in
+  tools/replay.c and python/replay.py, using the down component of the
+  rotated lever arm with the suite's best available roll and pitch
+  (nav_suite_get_rpy, level while the suite holds no attitude), because
+  the accessor also answers while ins is coasting or not ready,
+- the estimate drawn on the --plot state history (position), North-East
+  and altitude pages of python/replay.py and python/inspostgui.py.
+
+A zero lever arm shall change nothing.
+
+Rationale: a reference taken at an antenna 1.3 m above the IMU put a
+constant 1.3 m height offset on every page and on the ellipsoid height
+score that was not an error of the filter, while the position error next
+to it already projected the lever arm and showed none. Two numbers for the
+same run that disagree by the lever arm make the plot unusable for
+judging the vertical channel.

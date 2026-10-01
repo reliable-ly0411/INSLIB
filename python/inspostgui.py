@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """inspostgui -- INSLIB post-processing GUI.
 
-Interactive Qt front end for python/replay.py: pick a converted dataset
-(a directory with config.yaml + the dataset-neutral CSVs, contract:
-datasets/replay_format.py), inspect/edit/create its config.yaml, replay
-it through the ins filter (in-process, same INSLIB ctypes wrapper and the
-same feed order as replay.py's main loop) and evaluate the result:
+Interactive Qt front end for python/replay.py: open a config YAML of a
+converted dataset (the "project file": it sits in a directory with the
+dataset-neutral CSVs, contract: datasets/replay_format.py, and names them
+through its optional inputs: section, so one directory can carry e.g. a
+config.yaml next to a config_experimental.yaml), inspect/edit/create it,
+replay it through the ins filter (in-process, same INSLIB ctypes wrapper
+and the same feed order as replay.py's main loop) and evaluate the
+result:
 
 * live 3D trajectory view with a speed-colored trail, ground-truth
-  overlay, attitude-driven vehicle model / error ellipsoid and a
-  free-look fly mode (visualization lifted from znav3d),
+  overlay, GNSS fix dots, the previous run of the same dataset as a grey
+  ghost trail (all switchable) and an attitude-driven vehicle model /
+  error ellipsoid (visualization lifted from znav3d),
 * live attitude / position / altitude / acceleration panels,
 * post-run error plots (estimate vs. ground truth with the filter's own
   1-sigma band), a North-East map view, bias convergence and outlier
@@ -18,7 +22,9 @@ same feed order as replay.py's main loop) and evaluate the result:
   (tiles cached on disk and shared with tools/inslib_gui.py's Track tab),
 * the same accuracy / data-quality summary replay.py prints,
 * multi-page PDF export via ins_plots and Google Earth KML export via
-  ins_kml.
+  ins_kml,
+* a dark and a light colour theme (toolbar, or --theme), same palettes
+  as tools/inslib_gui.py, see ins_gui_theme.py.
 
 The config editor loads the dataset's config.yaml into a form (the
 replay.py/replay.c schema minus the score.lim_* regression gates, which
@@ -33,6 +39,8 @@ Usage:
     make pylib
     python3 python/inspostgui.py
     python3 python/inspostgui.py datasets/simulated/profile_1_car
+    python3 python/inspostgui.py datasets/fog/config_pyahrs.yaml
+    python3 python/inspostgui.py --theme light
     python3 python/inspostgui.py --batch datasets/simulated/profile_1_car
 
 --batch replays the dataset headless (no window) and prints the summary,
@@ -210,12 +218,32 @@ CONFIG_SECTIONS = [
          VEC, 9, "corrected = M*(raw - bias), all-zero -> identity"),
         (("imu", "gyr_misalignment"), "gyr misalignment (3x3 col-major)",
          VEC, 9, "corrected = M*(raw - bias), all-zero -> identity"),
+        (("imu", "mount_rpy_deg"), "Mounting roll/pitch/yaw [deg]", VEC, 3,
+         "Board axes vs. vehicle axes (ZYX), composed onto the acc/gyr/mag "
+         "matrices; lever arms and heading baseline then in vehicle axes"),
         (("imu", "acc_fixed_bias"), "acc fixed bias [m/s^2]", VEC, 3,
          "Removed permanently, never estimated"),
         (("imu", "gyr_fixed_bias"), "gyr fixed bias [rad/s]", VEC, 3,
          "Removed permanently, never estimated"),
     ]),
+    ("Free inertial start (IMU dead reckoning only)", [
+        (("free_inertial_start", "enable"), "Enable", BOOL, None,
+         "Offer the declared origin below as a position measurement until "
+         "ins has bootstrapped from it, then dead reckon. Also lifts the "
+         "dead-reckoning budget and the GNSS-quality 3D exit"),
+        (("free_inertial_start", "lat_deg"), "Latitude [deg]", FLOAT, None,
+         "Start position, REQUIRED when enabled"),
+        (("free_inertial_start", "lon_deg"), "Longitude [deg]", FLOAT, None,
+         "Start position, REQUIRED when enabled"),
+        (("free_inertial_start", "height_m"), "Height [m]", FLOAT, None,
+         "Ellipsoidal height of the start position"),
+        (("free_inertial_start", "stddev_m"), "Stddev [m]", FLOAT, None,
+         "1-sigma of the declared position, must pass the 3D entry gate"),
+    ]),
     ("GNSS", [
+        (("gnss", "enable"), "Fuse GNSS fixes", BOOL, None,
+         "0: gnss.csv is still read, counted and scored against, but no "
+         "fix aids the filter (inertial-only A/B on the same recording)"),
         (("gnss", "leverarm_frd"), "Lever arm FRD [m]", VEC, 3,
          "GNSS antenna vs. IMU, body FRD"),
         (("gnss", "pos_stddev_fallback_m"), "Pos stddev fallback "
@@ -349,6 +377,22 @@ CONFIG_SECTIONS = [
          "all-zero -> identity"),
         (("mag", "fixed_bias"), "Hard-iron fixed bias [uT]", VEC, 3, None),
     ]),
+    ("GNSS heading (dual antenna)", [
+        (("heading", "enable"), "Enable (needs heading.csv)", BOOL, None,
+         "Moving base baseline azimuth, e.g. NAV-RELPOSNED from "
+         "tools/inslib_convert_ubx_to_csv.py"),
+        (("heading", "baseline_frd"), "Baseline base -> rover (FRD)", VEC, 3,
+         "Direction from the moving base antenna to the rover antenna in "
+         "the body frame, any length. [1, 0, 0]: the azimuth is the yaw"),
+        (("heading", "require_fixed"), "Only carrier-phase fixed", BOOL,
+         None, "A float heading can be degrees off while claiming better"),
+        (("heading", "stddev_scale"), "1-sigma scale", FLOAT, None,
+         "Multiplies the receiver's per-row 1-sigma, 0 -> 1.0"),
+        (("heading", "stddev_min_deg"), "1-sigma floor [deg]", FLOAT, None,
+         "Applied after scaling, 0 -> no floor"),
+        (("heading", "delay_ms"), "Delay [ms]", INT, None,
+         "How old a row is at its timestamp, start from the GNSS delay"),
+    ]),
     ("Barometer", [
         (("baro", "enable"), "Enable (needs baro.csv)", BOOL, None, None),
         (("baro", "stddev_m"), "Stddev [m]", FLOAT, None,
@@ -356,6 +400,20 @@ CONFIG_SECTIONS = [
          "datum-offset cross-check, not just baro_alt's "
          "own filter - see the Baro_Alt group below for baro_alt's own "
          "process-noise tuning. 0 -> built-in"),
+    ]),
+    ("Absolute speed (REQ-NAV-068)", [
+        (("speed", "enable"), "Enable (needs speed.csv)", BOOL, None, None),
+        (("speed", "scale"), "Scale", FLOAT, None,
+         "Speed sensor scale correction; 0 -> 1.0"),
+        (("speed", "stddev_mps"), "Stddev [m/s]", FLOAT, None,
+         "Per-sample 1-sigma; 0 -> library default"),
+        (("speed", "stddev_rel"), "Relative stddev", FLOAT, None,
+         "Speed-proportional 1-sigma; 0 -> library default"),
+        (("speed", "min_speed_mps"), "Min speed [m/s]", FLOAT, None,
+         "Below this filtered speed a sample is skipped; 0 -> library "
+         "default"),
+        (("speed", "delay_ms"), "Delay [ms]", FLOAT, None,
+         "How old a sample is at its timestamp"),
     ]),
     ("Baro_Alt (process noise, optional, 0 = baro_alt.c default)", [
         (("baro", "acc_noise_mps2_sqrthz"), "acc_noise [m/s^2/sqrt(Hz)]",
@@ -417,6 +475,9 @@ CONFIG_SECTIONS = [
          "Scoring starts this long after the first fix"),
         (("score", "ahrs"), "Score the attitude filters too", BOOL, None,
          "1: also score the ARS/AHRS and their regression gates"),
+        (("score", "attitude"), "Score attitude", BOOL, None,
+         "0: ref.csv has no attitude (placeholder zeros), the roll/pitch/yaw "
+         "error is not reported"),
         (("score", "min_epochs"), "Min scored epochs", INT, None,
          "Minimum number of scored epochs a run must produce; 0 -> not "
          "gated"),
@@ -450,6 +511,10 @@ CONFIG_SECTIONS = [
          "blank -> mag.csv"),
         (("inputs", "baro"), "Barometer CSV", STR, None,
          "blank -> baro.csv"),
+        (("inputs", "heading"), "GNSS heading CSV", STR, None,
+         "blank -> heading.csv"),
+        (("inputs", "speed"), "Speed CSV", STR, None,
+         "blank -> speed.csv"),
     ]),
 ]
 
@@ -517,13 +582,20 @@ def validate_spec(spec, data_dir):
     if not spec["imu"].get("gyr_psd") or not spec["imu"].get("acc_psd"):
         errors.append("imu: gyr_psd/acc_psd missing or zero (required "
                       "noise model)")
+    fi = spec["free_inertial_start"]
+    if int(fi["enable"]) and (fi["lat_deg"] is None
+                              or fi["lon_deg"] is None):
+        errors.append("free_inertial_start needs lat_deg and lon_deg: the "
+                      "whole point is the origin you supply")
     for stream in ("imu", "ref"):
         path = replay.input_path(data_dir, spec, stream)
         if not os.path.exists(path):
             errors.append(f"{os.path.basename(path)} missing in {data_dir}")
     need = {"gnss": spec["aiding"] == "gnss",
             "mag": bool(int(spec["mag"]["enable"])),
-            "baro": bool(int(spec["baro"]["enable"]))}
+            "baro": bool(int(spec["baro"]["enable"])),
+            "heading": bool(int(spec["heading"]["enable"])),
+            "speed": bool(int(spec["speed"]["enable"]))}
     for stream, needed in need.items():
         path = replay.input_path(data_dir, spec, stream)
         if needed and not os.path.exists(path):
@@ -531,8 +603,21 @@ def validate_spec(spec, data_dir):
     return errors
 
 
+def is_config_file(name):
+    return name.lower().endswith((".yaml", ".yml"))
+
+
+def config_label(cfg_path, base=None):
+    """Combo box label: the dataset directory, plus the file name unless it
+    is the conventional config.yaml."""
+    d, name = os.path.split(os.path.abspath(cfg_path))
+    label = os.path.relpath(d, base) if base else d
+    return label if name == "config.yaml" else f"{label}  [{name}]"
+
+
 def discover_datasets():
-    """(label, dir) for every config.yaml anywhere under datasets/."""
+    """(label, config path) for every config YAML of every dataset directory
+    (one with a config.yaml) under datasets/, config.yaml first."""
     found = []
     base = os.path.join(REPO_ROOT, "datasets")
     if not os.path.isdir(base):
@@ -540,7 +625,10 @@ def discover_datasets():
     for root, dirs, files in os.walk(base):
         dirs[:] = sorted(d for d in dirs if d != "raw")
         if "config.yaml" in files:
-            found.append((os.path.relpath(root, base), root))
+            names = sorted((f for f in files if is_config_file(f)),
+                           key=lambda f: (f != "config.yaml", f))
+            found.extend((config_label(os.path.join(root, f), base),
+                          os.path.join(root, f)) for f in names)
             dirs[:] = []  # a dataset dir has no nested datasets
     return sorted(found)
 
@@ -560,7 +648,10 @@ REC_KEYS = (
     "ahrs_rpy_deg", "ahrs_rpy_sigma_deg", "ahrs_gyr_bias", "ahrs_gyr_bias_sigma",
     "baro_h_d", "baro_raw_d", "baro_h_sigma", "baro_acc_bias", "baro_acc_bias_sigma",
     "fix_pos_d", "local_gnss_offset", "local_gnss_offset_sigma",
-    "zupt_active",
+    "pos_ref_pt", "ref_pt_up",
+    "mag_heading_deg", "gnss_course_deg", "nav_height_ellipsoid_d",
+    "zupt_active", "auto_zupt_active", "vertical_zupt_active",
+    "ars_zaru_applied", "ahrs_zaru_applied",
     "dw_full3d", "dw_ars", "dw_ahrs", "dw_baro_alt", "dw_local_gnss",
 )
 
@@ -568,8 +659,10 @@ from PyQt6 import QtCore, QtGui, QtWidgets  # noqa: E402
 import numpy as np  # noqa: E402
 import pyqtgraph as pg  # noqa: E402
 import pyqtgraph.opengl as gl  # noqa: E402
+from OpenGL import GL  # noqa: E402  (pyqtgraph.opengl's own dependency)
 
 from ins_map_view import MapView  # noqa: E402
+import ins_gui_theme as theme  # noqa: E402
 
 # The window icon. It lives with the documentation rather than with the
 # tools, so the path is taken relative to THIS FILE and not to the working
@@ -631,6 +724,12 @@ class ReplayWorker(QtCore.QThread):
         self.rec_hz = rec_hz
         self.lock = threading.Lock()
         self.rec = {k: [] for k in REC_KEYS}
+        # Every fix of the aiding stream in the local NED frame, one entry
+        # per epoch (rec only samples the last one at rec_hz).
+        self.fix_ned = []
+        # ins's local NED origin once known (ECEF), for the UI to move the
+        # previous run's ghost trail into this run's frame.
+        self.origin_ecef = None
         self.live = {}
         self._stop = threading.Event()
         self._pause = threading.Event()
@@ -657,6 +756,21 @@ class ReplayWorker(QtCore.QThread):
         ref = replay.load_ref(replay.input_path(data_dir, spec, "ref"))
         if not ref:
             raise RuntimeError("no reference epochs in ref.csv")
+        # Move every reference row onto its own time of validity
+        # (REQ-VER-030), same shift as replay.py's main() and tools/replay.c,
+        # so one config.yaml scores the same in every harness.
+        ref_delay_ms = float(spec["score"].get("ref_delay_ms", 0.0))
+        if ref_delay_ms:
+            if spec["aiding"] == "ref":
+                raise RuntimeError("score: ref_delay_ms cannot be used with "
+                                   "aiding: ref")
+            shift_us = int(ref_delay_ms * 1000.0)
+            for r in ref:
+                r["t_us"] -= shift_us
+        # See replay.py's rec["ref_epoch_count"]: a single forward-filled
+        # reference epoch (e.g. a placeholder ref.csv) must not be treated
+        # by ins_plots.py as a real ground-truth trajectory.
+        self.rec["ref_epoch_count"] = len(ref)
 
         gnss_cfg = spec["gnss"]
         gnss_delay_ms = int(gnss_cfg.get("delay_ms", 0.0))
@@ -701,6 +815,11 @@ class ReplayWorker(QtCore.QThread):
                 raise RuntimeError("mag: enable but no usable mag.csv")
         mag_sd = float(mag_cfg["stddev_ut"])  # 0 -> library default
         mag_var = (mag_sd ** 2,) * 3
+        # The fixed calibration the filter applies, for the heading and
+        # |B| plot traces (same as replay.py's main()).
+        mag_misalign = replay.mounted_calibration(spec)[2]
+        mag_bias_cfg = tuple(float(v) for v in mag_cfg["fixed_bias"])
+        mag_cal_active = any(mag_misalign) or any(mag_bias_cfg)
 
         baro_cfg = spec["baro"]
         baros = []
@@ -708,6 +827,26 @@ class ReplayWorker(QtCore.QThread):
             baros = replay.load_baro(replay.input_path(data_dir, spec, "baro"))
             if not baros:
                 raise RuntimeError("baro: enable but no usable baro.csv")
+
+        heading_cfg = spec["heading"]
+        headings = []
+        if int(heading_cfg["enable"]):
+            headings = replay.load_heading(
+                replay.input_path(data_dir, spec, "heading"))
+            if not headings:
+                raise RuntimeError("heading: enable but no usable heading.csv")
+        heading_delay = int(round(float(heading_cfg["delay_ms"])))
+        heading_reasons = {}
+
+        speed_cfg = spec["speed"]
+        speeds = []
+        if int(speed_cfg["enable"]):
+            speeds = replay.load_speed(
+                replay.input_path(data_dir, spec, "speed"))
+            if not speeds:
+                raise RuntimeError("speed: enable but no usable speed.csv")
+        speed_sd_cfg = float(speed_cfg["stddev_mps"])
+        speed_delay_cfg = int(round(float(speed_cfg["delay_ms"])))
 
         leverarm = tuple(gnss_cfg["leverarm_frd"])
         score_la = tuple(spec["score"].get("leverarm_frd") or (0.0,) * 3)
@@ -752,6 +891,8 @@ class ReplayWorker(QtCore.QThread):
         nav.set_ahrs_gyr_noise(float(ahrs_cfg.get("gyr_noise_psd", 0.0)))
         nav.set_ahrs_acc_noise(float(ahrs_cfg.get("acc_noise_mps2", 0.0)))
         nav.set_ahrs_gyr_bias_rw(float(ahrs_cfg.get("gyr_bias_rw", 0.0)))
+        nav.set_ahrs_gyr_bias_init_stddev(math.radians(
+            float(ahrs_cfg.get("gyr_bias_init_stddev_rps_deg", 0.0))))
         init_hint = spec["init_hint"]
         nav.set_init_att_hint(
             math.radians(init_hint["roll_deg"]), math.radians(init_hint["pitch_deg"]),
@@ -790,12 +931,18 @@ class ReplayWorker(QtCore.QThread):
                              f"({n_imu_total} IMU samples) ...")
 
         rec = self.rec
-        iref = ifix = imag = ibaro = 0
+        iref = ifix = imag = ibaro = iheading = ispeed = 0
+        n_speed_fused = 0
         t_prev = None
         n_imu = 0
-        last_ref = last_fix = last_baro = None
+        last_ref = last_fix = last_baro = last_mag = None
         origin_ecef = None
-        origin_lat = origin_lon = 0.0
+        origin_lat = origin_lon = origin_h = 0.0
+        # North-East map page track, recorded faster than rec (replay.py's
+        # --plot-track-hz default).
+        track_est, track_ref = [], []
+        last_track_us = None
+        track_period_us = US_PER_SEC / 50.0
         t0_us = None
         last_rec_us = None
         rec_period_us = US_PER_SEC / max(self.rec_hz, 1e-3)
@@ -809,6 +956,7 @@ class ReplayWorker(QtCore.QThread):
                         + int(spec["score"]["warmup_sec"] * US_PER_SEC))
         Stat = replay.Stat
         e_roll, e_pitch, e_yaw, e_pos = Stat(), Stat(), Stat(), Stat()
+        e_height_ell = Stat()  # nav.height_ellipsoid() vs ref_now["h_m"]
         n_static = 0
         gyr_noise_stat = [Stat(), Stat(), Stat()]
         acc_noise_stat = [Stat(), Stat(), Stat()]
@@ -831,6 +979,22 @@ class ReplayWorker(QtCore.QThread):
             nominal_sec = ((fixes[-1]["t_us"] - fixes[0]["t_us"]) / US_PER_SEC
                           / (len(fixes) - 1))
             gnss_grace_us = int(max(2.0, 3.0 * nominal_sec) * US_PER_SEC)
+
+        # free_inertial_start / gnss: enable, prepared once exactly like
+        # replay.py's main(): the ECEF of the declared point and the
+        # covariance of that statement. gnss: enable 0 keeps the fixes
+        # loaded and counted, they just never reach the filter.
+        gnss_enable = bool(gnss_cfg["enable"])
+        fi_spec = spec["free_inertial_start"]
+        fi_llh = fi_cov = None
+        fi_next_t_us = 0
+        n_fi_offers = 0
+        if fi_spec["enable"]:
+            fi_llh = (math.radians(fi_spec["lat_deg"]),
+                      math.radians(fi_spec["lon_deg"]),
+                      float(fi_spec["height_m"]))
+            fi_var = float(fi_spec["stddev_m"]) ** 2
+            fi_cov = [fi_var, 0.0, 0.0, 0.0, fi_var, 0.0, 0.0, 0.0, fi_var]
 
         for t, g, a in replay.iter_imu(imu_path):
             if self._stop.is_set():
@@ -855,7 +1019,16 @@ class ReplayWorker(QtCore.QThread):
             while ifix < len(fixes) and fixes[ifix]["t_us"] <= t:
                 fix_now = fixes[ifix]
                 ifix += 1
-            if fix_now is not None and fix_now["cov_pos"] is not None:
+            # free_inertial_start: the declared origin, offered until ins
+            # has bootstrapped from it and not one epoch longer, never in
+            # an epoch that already carries a real fix (mirrors replay.py).
+            if (fi_llh is not None and fix_now is None
+                    and nav.deadreckoning_ms() < 0 and t >= fi_next_t_us):
+                fi_next_t_us = t + US_PER_SEC // 2   # 2 Hz: entry dwell wants >= 1
+                nav.gnss_pos_llh(fi_llh, fi_cov)
+                n_fi_offers += 1
+            if (gnss_enable and fix_now is not None
+                    and fix_now["cov_pos"] is not None):
                 nav.gnss_pos_llh((fix_now["lat_rad"], fix_now["lon_rad"],
                                   fix_now["h_m"]),
                                  fix_now["cov_pos"], delay_ms=gnss_delay_ms)
@@ -871,6 +1044,7 @@ class ReplayWorker(QtCore.QThread):
                 imag += 1
             if mag_now is not None:
                 nav.mag(mag_now[1], mag_var)
+                last_mag = mag_now
             baro_now = None
             while ibaro < len(baros) and baros[ibaro][0] <= t:
                 baro_now = baros[ibaro]
@@ -878,6 +1052,26 @@ class ReplayWorker(QtCore.QThread):
             if baro_now is not None:
                 nav.baro(baro_now[1], float(baro_cfg["stddev_m"]))
                 last_baro = baro_now
+            # Absolute speed (REQ-NAV-068), only the newest sample of the
+            # interval, like replay.py's main().
+            speed_now = None
+            while ispeed < len(speeds) and speeds[ispeed][0] <= t:
+                speed_now = speeds[ispeed]
+                ispeed += 1
+            if speed_now is not None:
+                nav.speed(speed_now[1], speed_sd_cfg, speed_delay_cfg)
+                n_speed_fused += 1
+
+            heading_now = None
+            while iheading < len(headings) and headings[iheading][0] <= t:
+                heading_now = headings[iheading]
+                iheading += 1
+            if heading_now is not None:
+                why, yaw_meas, sd_meas = replay.heading_measurement(
+                    heading_cfg, heading_now, nav.rpy())
+                heading_reasons[why] = heading_reasons.get(why, 0) + 1
+                if why == replay.HEADING_OK:
+                    nav.yaw(yaw_meas, sd_meas, heading_delay)
 
             nav.update()
 
@@ -900,7 +1094,14 @@ class ReplayWorker(QtCore.QThread):
             if origin_ecef is None:
                 origin_ecef = nav.origin_ecef()
                 if origin_ecef is not None:
-                    origin_lat, origin_lon, _ = ecef_to_llh(*origin_ecef)
+                    origin_lat, origin_lon, origin_h = ecef_to_llh(
+                        *origin_ecef)
+                    self.origin_ecef = tuple(origin_ecef)
+            if fix_now is not None and origin_ecef is not None:
+                p_fix = replay.ref_to_local_ned(fix_now, origin_ecef,
+                                                origin_lat, origin_lon)
+                with self.lock:
+                    self.fix_ned.append(p_fix)
 
             # Dr. INS findings inputs (see init above, mirrors replay.py's
             # main() loop verbatim): GNSS/baro/mag standstill phases and the
@@ -968,7 +1169,27 @@ class ReplayWorker(QtCore.QThread):
                 last_rec_us = t
                 self._record(rec, nav, t, t0_us, last_ref, last_fix,
                              last_baro, origin_ecef, origin_lat, origin_lon,
-                             score_la)
+                             score_la, last_mag=last_mag,
+                             mag_cal=(mag_misalign, mag_bias_cfg),
+                             origin_h=origin_h,
+                             min_course_speed=max(
+                                 spec["automotive_min_speed_mps"], 2.0))
+
+            # North-East map page recorder, like replay.py's: a NaN pair
+            # breaks the line while ins has nothing, repeated reference
+            # points are dropped.
+            if last_track_us is None or (t - last_track_us) >= track_period_us:
+                last_track_us = t
+                track_pos = nav.position_local()
+                track_la = replay.ref_point_offset_ned(nav, score_la)
+                track_est.append(
+                    (track_pos[0] + track_la[0], track_pos[1] + track_la[1])
+                    if track_pos is not None else (math.nan, math.nan))
+                if last_ref is not None and origin_ecef is not None:
+                    r = replay.ref_to_local_ned(last_ref, origin_ecef,
+                                                origin_lat, origin_lon)
+                    if not track_ref or (r[0], r[1]) != track_ref[-1]:
+                        track_ref.append((r[0], r[1]))
 
             if last_live_us is None or (t - last_live_us) >= live_period_us:
                 last_live_us = t
@@ -1013,6 +1234,13 @@ class ReplayWorker(QtCore.QThread):
                         rpy[1] - ref_now["pitch_rad"])))
                     e_yaw.add(math.degrees(replay.wrap_pi(
                         rpy[2] - ref_now["yaw_rad"])))
+            # Not gated on is_ready(), like replay.py: the accessor still
+            # answers during COASTING/ATTITUDE_ONLY, the case worth scoring.
+            if ref_now is not None and t >= t_warmup_end:
+                h_ell = nav.height_ellipsoid()
+                if h_ell is not None:
+                    e_height_ell.add(h_ell - replay.ref_point_offset_ned(nav, score_la)[2]
+                                     - ref_now["h_m"])
 
             if self.realtime:
                 target = wall0 + (t - t0_us) / US_PER_SEC / self.speed
@@ -1038,6 +1266,7 @@ class ReplayWorker(QtCore.QThread):
                      f"{', automotive' if spec['automotive_mode'] else ''}"
                      f"{', mag' if mags else ''}"
                      f"{', baro' if baros else ''}"
+                     f"{', speed' if speeds else ''}"
                      f"{f', gnss delay {gnss_delay_ms} ms' if gnss_delay_ms else ''}")
         lines.append(
             f"initial gyro bias: "
@@ -1050,7 +1279,28 @@ class ReplayWorker(QtCore.QThread):
         lines.append(f"replayed {n_imu} IMU samples, {len(fixes)} fixes, "
                      f"{len(ref)} reference epochs"
                      f"{f', {len(mags)} mag' if mags else ''}"
-                     f"{f', {len(baros)} baro' if baros else ''}")
+                     f"{f', {len(baros)} baro' if baros else ''}"
+                     f"{f', {len(speeds)} speed' if speeds else ''}")
+        if ref_delay_ms:
+            lines.append(f"reference time of validity: {ref_delay_ms:.0f} ms "
+                         f"earlier than its timestamps (score: ref_delay_ms)")
+        if not gnss_enable:
+            lines.append("gnss: enable 0 - the fixes are read and counted, "
+                         "but none of them aids the filter")
+        if n_fi_offers:
+            lines.append(f"free-inertial start: {n_fi_offers} declaration(s) "
+                         f"offered at {fi_spec['lat_deg']:.7f} "
+                         f"{fi_spec['lon_deg']:.7f} "
+                         f"h={fi_spec['height_m']:.1f} m "
+                         f"+-{fi_spec['stddev_m']:g} m, "
+                         f"then the filter is on its own")
+        if speeds:
+            lines.append(f"speed aiding: {n_speed_fused} samples offered, "
+                         f"{diag.get('n_speed_used', 0)} fused, "
+                         f"{diag.get('n_speed_skipped', 0)} skipped below "
+                         f"the speed gate, last residual "
+                         f"{diag.get('last_speed_residual_mps', 0.0):+.3f} "
+                         f"m/s")
         lines.append(f"ins: {diag['n_predict']} predicts, "
                      f"{diag['n_gnss_used']} gnss fusions "
                      f"({diag['n_gnss_seen']} seen), "
@@ -1116,11 +1366,26 @@ class ReplayWorker(QtCore.QThread):
         if e_pos.n:
             lines.append(f"ins vs ground truth (n={e_pos.n}, after "
                          f"{spec['score']['warmup_sec']:g} s warmup):")
-            for nm, s in (("roll", e_roll), ("pitch", e_pitch),
-                          ("yaw", e_yaw)):
-                lines.append(f"  {nm:5s} error: mean {s.mean():+7.3f}  "
-                             f"std {s.std():6.3f} deg")
-            lines.append(f"  pos rms: {e_pos.rms():.3f} m")
+            # score.attitude = 0: ref.csv carries no attitude (placeholder
+            # zeros), an error against it is not a filter error.
+            if spec["score"]["attitude"]:
+                for nm, s in (("roll", e_roll), ("pitch", e_pitch),
+                              ("yaw", e_yaw)):
+                    lines.append(f"  {nm:5s} error: mean {s.mean():+7.3f}  "
+                                 f"std {s.std():6.3f}  "
+                                 f"max |{s.max_abs:6.3f}| deg")
+            else:
+                lines.append("  attitude error: n/a (score.attitude = 0, "
+                             "no attitude reference in this dataset)")
+            lines.append(f"  pos rms: {e_pos.rms():.3f} m  "
+                         f"max {e_pos.max_abs:.3f} m")
+        if e_height_ell.n:
+            lines.append(f"nav_suite_get_height_ellipsoid() vs ground truth "
+                         f"(absolute, n={e_height_ell.n}):")
+            lines.append(f"  height error: mean {e_height_ell.mean():+.3f}  "
+                         f"std {e_height_ell.std():.3f}  "
+                         f"rms {e_height_ell.rms():.3f}  "
+                         f"max |{e_height_ell.max_abs:.3f}| m")
         lines.append(f"final nav_suite mode: {nav.mode_name()}")
 
         lines.append("")
@@ -1141,6 +1406,18 @@ class ReplayWorker(QtCore.QThread):
             lines.append(_stream_line("mag ", [m[0] for m in mags]))
         if baros:
             lines.append(_stream_line("baro", [b[0] for b in baros]))
+        if headings:
+            lines.append(_stream_line("hdg ", [h[0] for h in headings]))
+            lines.append(f"  heading: {heading_reasons.get(replay.HEADING_OK, 0)}"
+                         f" of {len(headings)} rows offered as yaw, "
+                         f"{heading_reasons.get(replay.HEADING_NOT_FIXED, 0)}"
+                         f" not fixed, "
+                         f"{heading_reasons.get(replay.HEADING_BAD_STDDEV, 0)}"
+                         f" bad 1-sigma, "
+                         f"{heading_reasons.get(replay.HEADING_BAD_GEOMETRY, 0)}"
+                         f" refused by the baseline geometry")
+        if speeds:
+            lines.append(_stream_line("speed", [v[0] for v in speeds]))
         if n_static:
             frac = 100.0 * n_static / n_imu_total if n_imu_total else 0.0
             lines.append(f"  stationary epochs: {n_static}/{n_imu_total} "
@@ -1206,6 +1483,13 @@ class ReplayWorker(QtCore.QThread):
             "health": {"n": health_n, "limits": replay.STDDEV_LIMITS,
                       "stats": health_stats},
             "overconfidence": oc,
+            "leverarm": {"gnss": leverarm, "score": score_la},
+            "baro_height": {
+                # Same as replay.py: ins latched the barometric height
+                # source at bootstrap (REQ-NAV-053/-054).
+                "active": diag["n_baro_height_used"] > 0,
+                "offset_span_m": replay._span(rec["local_gnss_offset"]),
+            },
             "diag": diag,
         })
         lines.append("")
@@ -1236,9 +1520,41 @@ class ReplayWorker(QtCore.QThread):
                              f"relative to baro_alt (which has its own "
                              f"group delay)")
 
+        # Whole-run inputs of the map, magnetometer and ellipsoid altitude
+        # pages, the same as replay.py's --plot block.
+        extra = {
+            "track_ne": track_est,
+            "track_ref_ne": track_ref,
+            "mag_raw": [tuple(m[1]) for m in mags],
+            "mag_fixed_bias": mag_bias_cfg if any(mag_bias_cfg) else None,
+            "wmm_field_uT": None,
+            "mag_field_t": [],
+            "mag_field_mag": [],
+            "mag_field_mag_raw": [],
+            "origin_ellipsoid_h_m": (origin_h if origin_ecef is not None
+                                     else math.nan),
+        }
+        if mags and float(mag_cfg["wmm_year"]) > 0 and t0_us is not None:
+            from INSLIB import wmm_field_ned
+            b_ned = wmm_field_ned(math.degrees(ref[0]["lat_rad"]),
+                                  math.degrees(ref[0]["lon_rad"]),
+                                  float(mag_cfg["wmm_year"]))
+            extra["wmm_field_uT"] = math.sqrt(sum(c * c for c in b_ned))
+            extra["mag_field_t"] = [(m[0] - t0_us) / US_PER_SEC for m in mags]
+            extra["mag_field_mag"] = [
+                math.sqrt(sum(c * c for c in replay.mag_calibrate(
+                    m[1], mag_misalign, mag_bias_cfg)))
+                for m in mags]
+            if mag_cal_active:
+                extra["mag_field_mag_raw"] = [
+                    math.sqrt(sum(c * c for c in m[1])) for m in mags]
+        with self.lock:
+            rec.update(extra)
+
         return {
             "text": "\n".join(lines),
             "rec": rec,
+            "gnss_delay_ms": gnss_delay_ms,
             "sensor_rate": sensor_rate,
             "gnss_delay_curve": gnss_delay_curve,
             "findings": insdoctor,
@@ -1251,8 +1567,13 @@ class ReplayWorker(QtCore.QThread):
             "warmup_end_sec": (t_warmup_end - t0_us) / US_PER_SEC
             if t0_us is not None else 0.0,
             "kml_est": kml_est,
+            "origin_ecef": (tuple(origin_ecef) if origin_ecef is not None
+                            else None),
             "kml_ref": kml_ref,
             "kml_fix": kml_fix,
+            "fix_latlon": [(math.degrees(fx["lat_rad"]),
+                            math.degrees(fx["lon_rad"]))
+                           for fx in fixes[:ifix]],
             "aborted": aborted,
             "mode": final_mode,
             "pos_rms_m": e_pos.rms(),
@@ -1261,14 +1582,25 @@ class ReplayWorker(QtCore.QThread):
 
     # ------------------------------------------------------------------
     def _record(self, rec, nav, t, t0_us, last_ref, last_fix, last_baro,
-                origin_ecef, origin_lat, origin_lon, score_la):
+                origin_ecef, origin_lat, origin_lon, score_la, last_mag=None,
+                mag_cal=((0.0,) * 9, (0.0,) * 3), origin_h=0.0,
+                min_course_speed=2.0):
         """One --plot-recorder tick, identical to replay.py's rec block
         (all lists stay the same length as rec['t'], NaN-padded per
         group's own availability)."""
         nan3 = [math.nan] * 3
         row = {}
         row["t"] = (t - t0_us) / US_PER_SEC
-        row["zupt_active"] = 1.0 if nav.auto_zupt_active() else 0.0
+        # Same as replay.py's recorder: the shading ORs in the vertical
+        # ZUPT so aiding: none still shows its stops, the ZUPT/ZARU page
+        # plots each detector on its own row.
+        auto_zupt = nav.auto_zupt_active()
+        vert_zupt = nav.vertical_zupt_active()
+        row["zupt_active"] = 1.0 if (auto_zupt or vert_zupt) else 0.0
+        row["auto_zupt_active"] = 1.0 if auto_zupt else 0.0
+        row["vertical_zupt_active"] = 1.0 if vert_zupt else 0.0
+        row["ars_zaru_applied"] = 1.0 if nav.ars_zaru_applied() else 0.0
+        row["ahrs_zaru_applied"] = 1.0 if nav.ahrs_zaru_applied() else 0.0
         dw_now = nav.downweight_counts()
         row["dw_full3d"] = float(nav.diag()["n_downweighted"])
         row["dw_ars"] = float(dw_now["ars"])
@@ -1315,6 +1647,10 @@ class ReplayWorker(QtCore.QThread):
                       "gyr_bias", "gyr_bias_sigma", "mag_bias",
                       "mag_bias_sigma"):
                 row[k] = nan3[:]
+        # REQ-VER-037, same as replay.py's recorder
+        la_n = replay.ref_point_offset_ned(nav, score_la)
+        row["pos_ref_pt"] = [p + d for p, d in zip(row["pos"], la_n)]
+        row["ref_pt_up"] = -la_n[2]
 
         for pfx, rpy_fn, rpy_sd_fn, bias_fn, sd_fn in (
                 ("ars", nav.rpy_ars, nav.rpy_stddev_ars, nav.bias_gyr_ars,
@@ -1333,6 +1669,27 @@ class ReplayWorker(QtCore.QThread):
             sub_sd = sd_fn()
             row[f"{pfx}_gyr_bias_sigma"] = (list(sub_sd) if sub_sd
                                             else nan3[:])
+
+        # Independent heading sources for the heading page, as replay.py:
+        # the calibrated compass leveled with the best roll/pitch, and the
+        # GNSS course over ground above walking speed.
+        level_rpy = rpy or nav.rpy_ahrs() or nav.rpy_ars()
+        if last_mag is not None and level_rpy is not None:
+            m_cal = replay.mag_calibrate(last_mag[1], mag_cal[0], mag_cal[1])
+            row["mag_heading_deg"] = math.degrees(
+                replay.mag_heading(m_cal, level_rpy[0], level_rpy[1]))
+        else:
+            row["mag_heading_deg"] = math.nan
+        row["gnss_course_deg"] = math.nan
+        if last_fix is not None and last_fix.get("vel_ok"):
+            v_n, v_e = last_fix["vel_ned"][0], last_fix["vel_ned"][1]
+            if math.hypot(v_n, v_e) >= min_course_speed:
+                row["gnss_course_deg"] = math.degrees(math.atan2(v_e, v_n))
+        nav_h_ell = nav.height_ellipsoid()
+        row["nav_height_ellipsoid_d"] = (
+            -(nav_h_ell - origin_h)
+            if nav_h_ell is not None and origin_ecef is not None
+            else math.nan)
 
         baro = nav.baro_alt()
         row["baro_h_d"] = -baro[0] if baro is not None else math.nan
@@ -1452,21 +1809,38 @@ class ReplayWorker(QtCore.QThread):
 # trail added)
 # ============================================================================
 
-COLOR_BG = (18, 20, 24)
-COLOR_GRID = (60, 65, 75)
-COLOR_POSITION = (255, 90, 90)
-COLOR_ELLIPSOID = (100, 200, 255, 40)
-COLOR_REF_TRAIL = (140, 240, 140, 140)
+# Colours come from ins_gui_theme. The GL lines/points blend by alpha
+# instead of pyqtgraph's default 'additive', which adds up to white on a
+# light background and makes them vanish. Like 'additive' (and unlike
+# 'translucent') without the depth test: the origin axes lie in the grid
+# plane and would z-fight with it, so draw order decides.
+GL_BLEND = {
+    GL.GL_DEPTH_TEST: False,
+    GL.GL_BLEND: True,
+    'glBlendFunc': (GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA),
+}
 TRAIL_MAX_POINTS = 100_000
-FLY_MOVE_SPEED = 8.0
-FLY_SPEED_BOOST = 4.0
-FLY_MOUSE_SENS = 0.15
-FLY_TICK_MS = 16
 ANTIALIAS = False
 
 
-def _speeds_to_rgba(speeds, scale):
-    """Vectorized speed [m/s] -> RGBA (blue = slow, red = fast)."""
+def _move_ned_origin(points_ned, origin_from, origin_to):
+    """NED points relative to ECEF origin_from -> relative to origin_to
+    (both tangent frames at their own origin)."""
+    if not points_ned:
+        return []
+    o1 = np.asarray(origin_from, dtype=float)
+    o2 = np.asarray(origin_to, dtype=float)
+    lat1, lon1, _ = ecef_to_llh(*o1)
+    lat2, lon2, _ = ecef_to_llh(*o2)
+    r1 = np.asarray(replay.ned_to_ecef_rot(lat1, lon1), dtype=float)
+    r2 = np.asarray(replay.ned_to_ecef_rot(lat2, lon2), dtype=float)
+    ecef = o1 + np.asarray(points_ned, dtype=float) @ r1.T
+    return [tuple(p) for p in (ecef - o2) @ r2]
+
+
+def _speeds_to_rgba(speeds, scale, value=1.0):
+    """Vectorized speed [m/s] -> RGBA (blue = slow, red = fast). `value`
+    darkens the hues (HSV value) for a light background."""
     v = np.clip(np.asarray(speeds, dtype=np.float32) / max(scale, 1e-6),
                 0.0, 1.0)
     h = 0.66 * (1.0 - v) * 6.0  # HSV hue sector, S=V=1
@@ -1480,7 +1854,8 @@ def _speeds_to_rgba(speeds, scale):
                       np.zeros_like(f), np.zeros_like(f)])
     b = np.choose(i, [np.zeros_like(f), np.zeros_like(f), tt,
                       np.ones_like(f), np.ones_like(f), q])
-    out[:, 0], out[:, 1], out[:, 2], out[:, 3] = r, g, b, 0.9
+    out[:, 0], out[:, 1], out[:, 2] = r * value, g * value, b * value
+    out[:, 3] = 0.9
     return out
 
 
@@ -1545,27 +1920,35 @@ def _rotate_ned_mesh(base_verts, R):
 
 
 class Position3DView(gl.GLViewWidget):
-    fly_exit_requested = QtCore.pyqtSignal()
     manual_pan_requested = QtCore.pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setBackgroundColor(*COLOR_BG)
         self.opts['distance'] = 50
         self.opts['elevation'] = 35
         self.opts['azimuth'] = 170
 
-        self.grid = gl.GLGridItem(color=(*COLOR_GRID, 150))
+        self.grid = gl.GLGridItem()
         self.grid.setSize(x=2000, y=2000)
         self.grid.setSpacing(x=50, y=50)
         self.addItem(self.grid)
         L = 20
-        self.addItem(gl.GLLinePlotItem(pos=np.array([[0, 0, 0], [L, 0, 0]]),
-                                       color=(1, 0.3, 0.3, 1), width=2))
-        self.addItem(gl.GLLinePlotItem(pos=np.array([[0, 0, 0], [0, -L, 0]]),
-                                       color=(0.3, 1, 0.3, 1), width=2))
-        self.addItem(gl.GLLinePlotItem(pos=np.array([[0, 0, 0], [0, 0, L]]),
-                                       color=(0.3, 0.6, 1, 1), width=2))
+        for end, col in (([L, 0, 0], (1, 0.3, 0.3, 1)),
+                         ([0, -L, 0], (0.3, 0.8, 0.3, 1)),
+                         ([0, 0, L], (0.3, 0.6, 1, 1))):
+            self.addItem(gl.GLLinePlotItem(
+                pos=np.array([[0, 0, 0], end]), color=col, width=2,
+                glOptions=GL_BLEND))
+
+        # The previous run's trail, drawn behind this one for an A/B look
+        # at a config change (display frame, 'lines' pairs like the trail).
+        self.ghost_item = gl.GLLinePlotItem(
+            pos=np.zeros((2, 3), dtype=np.float32), width=1.5,
+            antialias=ANTIALIAS, mode='lines', glOptions=GL_BLEND)
+        self.ghost_item.setVisible(False)
+        self.addItem(self.ghost_item)
+        self._ghost_wanted = True
+        self._ghost_has_data = False
 
         self.trail_points = []      # display frame (x, -y, -z)
         self.trail_speeds = []
@@ -1581,20 +1964,28 @@ class Position3DView(gl.GLViewWidget):
         self.trail_item = gl.GLLinePlotItem(
             pos=np.zeros((2, 3), dtype=np.float32),
             color=np.zeros((2, 4), dtype=np.float32),
-            width=1.5, antialias=ANTIALIAS, mode='lines')
+            width=1.5, antialias=ANTIALIAS, mode='lines', glOptions=GL_BLEND)
         self.addItem(self.trail_item)
 
         self.ref_points = []
         self.ref_item = gl.GLLinePlotItem(
             pos=np.zeros((2, 3), dtype=np.float32),
-            color=tuple(c / 255 for c in COLOR_REF_TRAIL),
-            width=1.0, antialias=ANTIALIAS, mode='line_strip')
+            width=1.0, antialias=ANTIALIAS, mode='line_strip',
+            glOptions=GL_BLEND)
         self.addItem(self.ref_item)
 
+        # The aiding fixes as dots: 1 Hz fixes joined by lines would draw
+        # chords the vehicle never drove.
+        self.fix_points = []
+        self.fix_item = gl.GLScatterPlotItem(
+            pos=np.zeros((1, 3), dtype=np.float32), size=4, pxMode=True,
+            glOptions=GL_BLEND)
+        self.fix_item.setVisible(False)
+        self.addItem(self.fix_item)
+        self._fix_wanted = True
+
         self.position_item = gl.GLScatterPlotItem(
-            pos=np.array([[0, 0, 0]]),
-            color=np.array([[*[c / 255 for c in COLOR_POSITION], 1.0]]),
-            size=10)
+            pos=np.array([[0, 0, 0]]), size=10, glOptions=GL_BLEND)
         self.addItem(self.position_item)
 
         self.ellipsoid_item = None
@@ -1610,19 +2001,20 @@ class Position3DView(gl.GLViewWidget):
                                           glOptions='opaque')
         self.vehicle_item.setVisible(False)
         self.addItem(self.vehicle_item)
+        theme.themed(self._restyle)
 
-        # --- fly / WASD free-look (znav3d) ---
-        self.fly_enabled = False
-        self.invert_mouse = False
-        self._fly_keys = set()
-        self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
-        self._fly_timer = QtCore.QTimer(self)
-        self._fly_timer.setInterval(FLY_TICK_MS)
-        self._fly_timer.timeout.connect(self._fly_step)
-        self._last_fly_time = None
-        self._last_mouse_pos = None
-        self._can_warp_cursor = (
-            QtGui.QGuiApplication.platformName() != "wayland")
+    def _restyle(self):
+        self.setBackgroundColor(theme.T["gl_bg"])
+        grid = pg.mkColor(theme.T["gl_grid"])
+        grid.setAlpha(150)
+        self.grid.setColor(grid)
+        self.ref_item.setData(color=theme.rgba("ref_trail", 0.6))
+        self.ghost_item.setData(color=theme.rgba("ghost", 0.8))
+        self.fix_item.setData(color=theme.rgba("fix", 0.9))
+        self.position_item.setData(color=np.array([theme.rgba("position")]))
+        if self.ellipsoid_item is not None:
+            self.ellipsoid_item.setColor(theme.rgba("ellipsoid", 0.16))
+        self._redraw_trail()
 
     @staticmethod
     def _make_sphere_mesh(rows, cols):
@@ -1665,9 +2057,13 @@ class Position3DView(gl.GLViewWidget):
         smax = max(self.trail_speeds[-len(points_ned):], default=0.0)
         if smax > self._speed_scale:
             self._speed_scale = smax * 1.2  # recolor everything below
+        self._redraw_trail()
+
+    def _redraw_trail(self):
         if len(self.trail_points) >= 2:
             pts = np.array(self.trail_points, dtype=np.float32)
-            col = _speeds_to_rgba(self.trail_speeds, self._speed_scale)
+            col = _speeds_to_rgba(self.trail_speeds, self._speed_scale,
+                                  theme.T["trail_value"])
             # One segment per consecutive pair that is not split by a break.
             end = np.nonzero(~np.array(self.trail_break[1:], dtype=bool))[0] + 1
             seg = np.empty((2 * len(end), 3), dtype=np.float32)
@@ -1684,6 +2080,50 @@ class Position3DView(gl.GLViewWidget):
         if len(self.ref_points) >= 2:
             self.ref_item.setData(
                 pos=np.array(self.ref_points, dtype=np.float32))
+
+    def append_fix(self, points_ned):
+        if not points_ned:
+            return
+        for p in points_ned:
+            self.fix_points.append((p[0], -p[1], -p[2]))
+        overflow = len(self.fix_points) - TRAIL_MAX_POINTS
+        if overflow > 0:
+            del self.fix_points[:overflow]
+        self.fix_item.setData(pos=np.array(self.fix_points, dtype=np.float32))
+        self.fix_item.setVisible(self._fix_wanted)
+
+    def set_ref_visible(self, on):
+        self.ref_item.setVisible(on)
+
+    def trail_snapshot(self):
+        """(NED points, breaks) of the trail drawn so far."""
+        return ([(x, -y, -z) for x, y, z in self.trail_points],
+                list(self.trail_break))
+
+    def set_ghost(self, points_ned, breaks):
+        """Draw a previous run's trail, NED points with the same break
+        flags as append_trail(). Empty clears it."""
+        seg = None
+        if len(points_ned) >= 2:
+            pts = np.array([(p[0], -p[1], -p[2]) for p in points_ned],
+                           dtype=np.float32)
+            end = np.nonzero(~np.array(breaks[1:], dtype=bool))[0] + 1
+            if len(end):
+                seg = np.empty((2 * len(end), 3), dtype=np.float32)
+                seg[0::2], seg[1::2] = pts[end - 1], pts[end]
+        self._ghost_has_data = seg is not None
+        if seg is not None:
+            self.ghost_item.setData(pos=seg, color=theme.rgba("ghost", 0.8))
+        self.ghost_item.setVisible(self._ghost_wanted and self._ghost_has_data)
+
+    def set_ghost_visible(self, on):
+        self._ghost_wanted = on
+        self.ghost_item.setVisible(on and self._ghost_has_data)
+
+    def set_fix_visible(self, on):
+        self._fix_wanted = on
+        # Stays hidden while empty: the placeholder point sits at the origin.
+        self.fix_item.setVisible(on and bool(self.fix_points))
 
     def set_pose(self, pos_ned, quat, sigma3, show_model, follow):
         dx, dy, dz = pos_ned[0], -pos_ned[1], -pos_ned[2]
@@ -1721,8 +2161,7 @@ class Position3DView(gl.GLViewWidget):
         if self.ellipsoid_item is None:
             self.ellipsoid_item = gl.GLMeshItem(
                 meshdata=mesh_data, smooth=True,
-                color=(*[c / 255 for c in COLOR_ELLIPSOID[:3]],
-                       COLOR_ELLIPSOID[3] / 255),
+                color=theme.rgba("ellipsoid", 0.16),
                 shader='shaded', glOptions='translucent')
             self.addItem(self.ellipsoid_item)
         else:
@@ -1734,7 +2173,7 @@ class Position3DView(gl.GLViewWidget):
         self.setCameraPosition(pos=pg.Vector(x, y, z), distance=40)
 
     def fit_trail(self):
-        pts = self.trail_points or self.ref_points
+        pts = self.trail_points or self.ref_points or self.fix_points
         if not pts:
             return
         arr = np.array(pts, dtype=np.float32)
@@ -1749,145 +2188,35 @@ class Position3DView(gl.GLViewWidget):
         self.trail_speeds.clear()
         self.trail_break.clear()
         self.ref_points.clear()
+        self.fix_points.clear()
+        self.fix_item.setVisible(False)
         self._speed_scale = 5.0
         z2 = np.zeros((2, 3), dtype=np.float32)
         self.trail_item.setData(pos=z2,
                                 color=np.zeros((2, 4), dtype=np.float32))
         self.ref_item.setData(pos=z2)
 
-    # --- fly mode (verbatim from znav3d) ------------------------------
-    def set_fly_enabled(self, enabled):
-        self.fly_enabled = enabled
-        self.setMouseTracking(enabled)
-        self._fly_keys.clear()
-        if enabled:
-            self.setFocus()
-            self.setCursor(QtCore.Qt.CursorShape.BlankCursor)
-            self._last_fly_time = None
-            self._last_mouse_pos = None
-            self._recenter_cursor()
-            self._fly_timer.start()
-        else:
-            self._fly_timer.stop()
-            self._last_mouse_pos = None
-            self.unsetCursor()
-
-    def _recenter_cursor(self):
-        if not self._can_warp_cursor:
-            return
-        center = self.rect().center()
-        QtGui.QCursor.setPos(self.mapToGlobal(center))
-        self._last_mouse_pos = center
-
-    def keyPressEvent(self, ev):
-        if self.fly_enabled:
-            if ev.key() == QtCore.Qt.Key.Key_Escape:
-                self.fly_exit_requested.emit()
-                ev.accept()
-                return
-            if not ev.isAutoRepeat():
-                self._fly_keys.add(ev.key())
-            ev.accept()
-            return
-        super().keyPressEvent(ev)
-
-    def keyReleaseEvent(self, ev):
-        if self.fly_enabled:
-            if not ev.isAutoRepeat():
-                self._fly_keys.discard(ev.key())
-            ev.accept()
-            return
-        super().keyReleaseEvent(ev)
-
     def mousePressEvent(self, ev):
         # Middle-button drag is GLViewWidget's own pan gesture: honour the
         # user's manual pan instead of snapping the camera back to the
         # followed object on the next update tick.
-        if (not self.fly_enabled
-                and ev.button() == QtCore.Qt.MouseButton.MiddleButton):
+        if ev.button() == QtCore.Qt.MouseButton.MiddleButton:
             self.manual_pan_requested.emit()
         super().mousePressEvent(ev)
-
-    def mouseMoveEvent(self, ev):
-        if not self.fly_enabled:
-            super().mouseMoveEvent(ev)
-            return
-        pos = ev.position().toPoint()
-        if self._last_mouse_pos is None:
-            self._last_mouse_pos = pos
-            ev.accept()
-            return
-        dx = pos.x() - self._last_mouse_pos.x()
-        dy = pos.y() - self._last_mouse_pos.y()
-        self._last_mouse_pos = pos
-        if dx or dy:
-            self.opts['azimuth'] = (self.opts['azimuth']
-                                    + dx * FLY_MOUSE_SENS) % 360
-            pitch = dy if self.invert_mouse else -dy
-            elev = self.opts['elevation'] + pitch * FLY_MOUSE_SENS
-            self.opts['elevation'] = max(-89.9, min(89.9, elev))
-            self.update()
-            rect = self.rect()
-            margin = 0.25
-            if (pos.x() < rect.width() * margin
-                    or pos.x() > rect.width() * (1 - margin)
-                    or pos.y() < rect.height() * margin
-                    or pos.y() > rect.height() * (1 - margin)):
-                self._recenter_cursor()
-        ev.accept()
-
-    def _fly_step(self):
-        now = time.perf_counter()
-        dt = (now - self._last_fly_time) if self._last_fly_time else 0.0
-        self._last_fly_time = now
-        if not self._fly_keys or dt <= 0.0:
-            return
-        K = QtCore.Qt.Key
-        az = math.radians(self.opts['azimuth'])
-        fwd = np.array([-math.cos(az), -math.sin(az), 0.0])
-        right = np.array([-math.sin(az), math.cos(az), 0.0])
-        up = np.array([0.0, 0.0, 1.0])
-        move = np.zeros(3)
-        if K.Key_W in self._fly_keys:
-            move += fwd
-        if K.Key_S in self._fly_keys:
-            move -= fwd
-        if K.Key_D in self._fly_keys:
-            move += right
-        if K.Key_A in self._fly_keys:
-            move -= right
-        if K.Key_E in self._fly_keys or K.Key_Space in self._fly_keys:
-            move += up
-        if K.Key_Q in self._fly_keys:
-            move -= up
-        norm = np.linalg.norm(move)
-        if norm == 0.0:
-            return
-        speed = FLY_MOVE_SPEED * (FLY_SPEED_BOOST
-                                  if K.Key_Shift in self._fly_keys else 1.0)
-        delta = move / norm * speed * dt
-        c = self.opts['center']
-        self.opts['center'] = pg.Vector(c.x() + delta[0], c.y() + delta[1],
-                                        c.z() + delta[2])
-        self.update()
-
 
 class AttitudeView(gl.GLViewWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setBackgroundColor(*COLOR_BG)
+        theme.themed(lambda: self.setBackgroundColor(theme.T["gl_bg"]))
         self.opts['distance'] = 4
         self.opts['elevation'] = 25
         self.opts['azimuth'] = 170
-        self.addItem(gl.GLLinePlotItem(
-            pos=np.array([[0, 0, 0], [1.5, 0, 0]]),
-            color=(1, 0.3, 0.3, 1), width=2))
-        self.addItem(gl.GLLinePlotItem(
-            pos=np.array([[0, 0, 0], [0, -1.5, 0]]),
-            color=(0.3, 1, 0.3, 1), width=2))
-        self.addItem(gl.GLLinePlotItem(
-            pos=np.array([[0, 0, 0], [0, 0, 1.5]]),
-            color=(0.3, 0.6, 1, 1), width=2))
+        for end, col in (([1.5, 0, 0], (1, 0.3, 0.3, 1)),
+                         ([0, -1.5, 0], (0.3, 0.8, 0.3, 1)),
+                         ([0, 0, 1.5], (0.3, 0.6, 1, 1))):
+            self.addItem(gl.GLLinePlotItem(
+                pos=np.array([[0, 0, 0], end]), color=col, width=2,
+                glOptions=GL_BLEND))
         verts, faces, colors = _load_vehicle_mesh(scale=20.0) \
             if os.path.exists("vehicle.stl") else _make_box_mesh()
         self._base_verts = verts.copy()
@@ -1913,6 +2242,7 @@ class GBubbleWidget(QtWidgets.QWidget):
         self.acc_x = 0.0
         self.acc_y = 0.0
         self.scale_g = 1.5
+        theme.themed(self.update)
 
     def set_acceleration(self, ax_g, ay_g):
         a = self.FILTER_ALPHA
@@ -1926,15 +2256,17 @@ class GBubbleWidget(QtWidgets.QWidget):
         w, h = self.width(), self.height()
         cx, cy = w / 2, h / 2
         r = (min(w, h) / 2 - 4) * 0.95
-        p.setPen(QtGui.QPen(QtGui.QColor(80, 90, 100), 1))
+        p.setPen(QtGui.QPen(QtGui.QColor(theme.T["bubble_ring"]), 1))
         for frac in (0.33, 0.66, 1.0):
             p.drawEllipse(QtCore.QPointF(cx, cy), r * frac, r * frac)
         p.drawLine(QtCore.QPointF(cx - r, cy), QtCore.QPointF(cx + r, cy))
         p.drawLine(QtCore.QPointF(cx, cy - r), QtCore.QPointF(cx, cy + r))
         bx = cx + max(-1, min(1, self.acc_y / self.scale_g)) * r
         by = cy - max(-1, min(1, self.acc_x / self.scale_g)) * r
-        p.setPen(QtGui.QPen(QtGui.QColor(255, 220, 100), 2))
-        p.setBrush(QtGui.QBrush(QtGui.QColor(255, 180, 60, 180)))
+        p.setPen(QtGui.QPen(QtGui.QColor(theme.T["bubble_edge"]), 2))
+        fill = QtGui.QColor(theme.T["bubble_fill"])
+        fill.setAlpha(180)
+        p.setBrush(QtGui.QBrush(fill))
         p.drawEllipse(QtCore.QPointF(bx, by), 5, 5)
 
 
@@ -2057,17 +2389,16 @@ class ConfigEditor(QtWidgets.QScrollArea):
 # Post-run plots
 # ============================================================================
 
-PEN_N = pg.mkPen('#ff6a6a', width=1.5)
-PEN_E = pg.mkPen('#5af08a', width=1.5)
-PEN_D = pg.mkPen('#54aaff', width=1.5)
-PEN_REF = pg.mkPen('#e8e8e8', width=1.5, style=QtCore.Qt.PenStyle.DashLine)
-PEN_SIG = pg.mkPen('#b0b0b0', width=1.0, style=QtCore.Qt.PenStyle.DotLine)
-PEN_WARM = pg.mkPen('#ffb454', width=1.0, style=QtCore.Qt.PenStyle.DashLine)
-
-
 def populate_plots(glw, rec, warmup_end_sec):
-    """Fill a GraphicsLayoutWidget with the post-run evaluation plots."""
+    """Fill a GraphicsLayoutWidget with the post-run evaluation plots, in
+    the current theme's colours (a theme switch calls it again)."""
     glw.clear()
+    glw.setBackground(theme.T["bg"])
+    PEN_N, PEN_E, PEN_D = (theme.pen("trace", 1.5, index=i) for i in range(3))
+    PEN_REF = theme.pen("ref", 1.5, theme.DASH)
+    PEN_SIG = theme.pen("sigma", 1.0, theme.DOT)
+    PEN_WARM = theme.pen("warm", 1.0, theme.DASH)
+    PEN_EXTRA = theme.pen("extra", 1.5)
     t = np.asarray(rec["t"], dtype=float)
     if t.size == 0:
         glw.addLabel("no recorded samples (filter never initialized?)")
@@ -2142,7 +2473,7 @@ def populate_plots(glw, rec, warmup_end_sec):
         alt.plot(t, -baro_h, pen=PEN_E, connect="finite", name="baro_alt")
     fix_d = arr("fix_pos_d")
     if np.isfinite(fix_d).any():
-        alt.plot(t, -fix_d, pen=pg.mkPen('#c080ff', width=1.0),
+        alt.plot(t, -fix_d, pen=theme.pen("extra", 1.0),
                  connect="finite", name="gnss")
 
     dwp = add_time_plot("chi2 downweight counters", "count")
@@ -2150,8 +2481,7 @@ def populate_plots(glw, rec, warmup_end_sec):
     for key, pen, name in (("dw_full3d", PEN_N, "ins"),
                            ("dw_ars", PEN_E, "ars"),
                            ("dw_ahrs", PEN_D, "ahrs"),
-                           ("dw_baro_alt",
-                            pg.mkPen('#c080ff', width=1.5), "baro_alt")):
+                           ("dw_baro_alt", PEN_EXTRA, "baro_alt")):
         dwp.plot(t, arr(key), pen=pen, connect="finite", name=name)
     glw.nextRow()
 
@@ -2194,28 +2524,6 @@ def populate_plots(glw, rec, warmup_end_sec):
 UI_UPDATE_HZ = 30
 GRAVITY = 9.80665
 
-STYLESHEET = (
-    "QMainWindow, QWidget { background: #0f1216; color: #d8dee6; } "
-    "QFrame#panel { background: #171b21; border: 1px solid #252c35; "
-    "border-radius: 6px; } "
-    "QGroupBox { border: 1px solid #252c35; border-radius: 6px; "
-    "margin-top: 8px; padding-top: 12px; } "
-    "QGroupBox::title { color: #8fa0b4; left: 8px; } "
-    "QPushButton { background: #1f2832; border: 1px solid #2b3642; "
-    "border-radius: 4px; padding: 6px 12px; color: #d8dee6; } "
-    "QPushButton:hover { background: #283441; } "
-    "QPushButton:disabled { color: #5a6470; } "
-    "QLineEdit, QComboBox, QDoubleSpinBox, QPlainTextEdit { "
-    "background: #12151a; border: 1px solid #2b3642; padding: 3px; "
-    "color: #d8dee6; } "
-    "QCheckBox::indicator { width: 13px; height: 13px; border: 1px solid "
-    "#3a4654; border-radius: 3px; background: #12151a; } "
-    "QCheckBox::indicator:checked { background: #54aaff; } "
-    "QTabWidget::pane { border: 1px solid #252c35; } "
-    "QTabBar::tab { background: #171b21; padding: 6px 14px; } "
-    "QTabBar::tab:selected { background: #283441; }"
-)
-
 MONO = "font-family: Consolas, 'DejaVu Sans Mono', monospace; font-size: 12px;"
 
 
@@ -2224,19 +2532,28 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("inspostgui — INSLIB post-processing")
         self.resize(1700, 980)
-        self.setStyleSheet(STYLESHEET)
         pg.setConfigOptions(antialias=ANTIALIAS)
 
         self.settings = QtCore.QSettings("zwiener", "inspostgui")
+        # Before anything is built: every widget takes its colours from the
+        # palette in force when it registers with theme.themed().
+        theme.set_theme(self.settings.value("theme", "dark"))
+        theme.themed(lambda: self.setStyleSheet(theme.stylesheet()))
         self.data_dir = None
         self.cfg_path = None
         self.worker = None
         self.results = None
         self._drained = 0
+        self._fix_drained = 0
         self._alt_t, self._alt_est, self._alt_ref = [], [], []
         self._alt_has_finite = False
         self._trail_gap = False
         self._smooth_quat = None
+        # The previous run, kept as a ghost for the next one (see _on_run).
+        self._ghost = None
+        self._ghost_placed = False
+        self._run_dir = None
+        self._run_cfg = None
 
         self._build_toolbar()
         self._build_central()
@@ -2280,13 +2597,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_realtime.setToolTip("Pace the replay to wall-clock time "
                                      "(x speed factor); off = full speed")
         tb.addWidget(self.chk_realtime)
-        self.speed_spin = QtWidgets.QDoubleSpinBox()
-        self.speed_spin.setRange(0.1, 100.0)
-        self.speed_spin.setValue(1.0)
-        self.speed_spin.setSingleStep(0.5)
-        self.speed_spin.setPrefix("x")
-        self.speed_spin.setMaximumWidth(80)
-        tb.addWidget(self.speed_spin)
+        # Fixed factors in a combo box: the stylesheet's frame on a spin box
+        # drops the native up/down buttons, which then overlap the value.
+        self.speed_combo = QtWidgets.QComboBox()
+        self.speed_combo.setToolTip("Realtime speed factor")
+        for f in (0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0):
+            self.speed_combo.addItem(f"x{f:g}", f)
+        self.speed_combo.setCurrentIndex(self.speed_combo.findData(1.0))
+        self.speed_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.speed_combo.setEnabled(False)
+        self.chk_realtime.toggled.connect(self.speed_combo.setEnabled)
+        tb.addWidget(self.speed_combo)
         tb.addSeparator()
 
         self.pdf_btn = QtWidgets.QPushButton("Export PDF")
@@ -2310,6 +2632,16 @@ class MainWindow(QtWidgets.QMainWindow):
                                   "config.yaml (needs numpy)")
         self.allan_btn.clicked.connect(self._on_estimate_bias_rw)
         tb.addWidget(self.allan_btn)
+        tb.addSeparator()
+
+        tb.addWidget(QtWidgets.QLabel(" Theme: "))
+        self.theme_combo = QtWidgets.QComboBox()
+        for name in ("dark", "light"):
+            self.theme_combo.addItem(name.capitalize(), name)
+        self.theme_combo.setCurrentIndex(
+            self.theme_combo.findData(theme.name()))
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+        tb.addWidget(self.theme_combo)
 
     def _build_central(self):
         self.tabs = QtWidgets.QTabWidget()
@@ -2328,19 +2660,33 @@ class MainWindow(QtWidgets.QMainWindow):
         bottom.addWidget(self.chk_follow)
         self.chk_model = QtWidgets.QCheckBox("Show 3D model")
         bottom.addWidget(self.chk_model)
-        self.chk_fly = QtWidgets.QCheckBox("Fly (WASD)")
-        self.chk_fly.setToolTip("WASD = move, Q/E or Space = down/up, "
-                                "mouse = look, Shift = faster, Esc = exit")
-        self.chk_fly.toggled.connect(self._on_fly_toggled)
-        self.pos_view.fly_exit_requested.connect(
-            lambda: self.chk_fly.setChecked(False))
         self.pos_view.manual_pan_requested.connect(
             lambda: self.chk_follow.setChecked(False))
-        bottom.addWidget(self.chk_fly)
-        self.chk_invert = QtWidgets.QCheckBox("Invert mouse")
-        self.chk_invert.toggled.connect(
-            lambda c: setattr(self.pos_view, "invert_mouse", c))
-        bottom.addWidget(self.chk_invert)
+        self.chk_ref = QtWidgets.QCheckBox("Reference")
+        self.chk_ref.setToolTip("ref.csv (or inputs: ref) as the green "
+                                "line: the ground truth the score uses")
+        self.chk_ghost = QtWidgets.QCheckBox("Previous run")
+        self.chk_ghost.setToolTip("The previous run of this dataset as a "
+                                  "grey trail, to compare a config change "
+                                  "against")
+        self.chk_fix = QtWidgets.QCheckBox("GNSS fixes")
+        self.chk_fix.setToolTip("gnss.csv (or inputs: gnss) as yellow dots, "
+                                "one per fix, whether the filter fused it "
+                                "or not. With aiding: ref these are the "
+                                "fixes synthesized from the reference.")
+        for chk, key, apply in ((self.chk_ref, "show_ref",
+                                 self.pos_view.set_ref_visible),
+                                (self.chk_fix, "show_fix",
+                                 self.pos_view.set_fix_visible),
+                                (self.chk_ghost, "show_ghost",
+                                 self._set_ghost_visible)):
+            on = self.settings.value(key, True, type=bool)
+            chk.setChecked(on)
+            apply(on)
+            chk.toggled.connect(apply)
+            chk.toggled.connect(
+                lambda c, k=key: self.settings.setValue(k, c))
+            bottom.addWidget(chk)
         bottom.addStretch()
         fit_btn = QtWidgets.QPushButton("Fit trail")
         fit_btn.clicked.connect(self.pos_view.fit_trail)
@@ -2358,7 +2704,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg_lay = QtWidgets.QVBoxLayout(cfg_w)
         row = QtWidgets.QHBoxLayout()
         self.cfg_label = QtWidgets.QLabel("no config loaded")
-        self.cfg_label.setStyleSheet("color: #8fa0b4;")
+        theme.themed(lambda: self.cfg_label.setStyleSheet(theme.dim()))
         row.addWidget(self.cfg_label, 1)
         for text, slot in (("Reload", self._on_cfg_reload),
                            ("New…", self._on_cfg_new),
@@ -2369,7 +2715,8 @@ class MainWindow(QtWidgets.QMainWindow):
             row.addWidget(b)
         cfg_lay.addLayout(row)
         self.files_label = QtWidgets.QLabel("")
-        self.files_label.setStyleSheet("color: #8fa0b4; " + MONO)
+        theme.themed(lambda: self.files_label.setStyleSheet(
+            theme.dim() + " " + MONO))
         cfg_lay.addWidget(self.files_label)
         self.editor = ConfigEditor()
         cfg_lay.addWidget(self.editor, 1)
@@ -2379,13 +2726,15 @@ class MainWindow(QtWidgets.QMainWindow):
         plots_scroll = QtWidgets.QScrollArea()
         plots_scroll.setWidgetResizable(True)
         self.plots_widget = pg.GraphicsLayoutWidget()
-        self.plots_widget.setBackground(QtGui.QColor(*COLOR_BG))
+        theme.themed(
+            lambda: self.plots_widget.setBackground(theme.T["bg"]))
         self.plots_widget.setMinimumHeight(1100)
         plots_scroll.setWidget(self.plots_widget)
         self.tabs.addTab(plots_scroll, "Plots")
 
         # --- Map tab ---
         self.map_view = MapView()
+        self.map_view.set_ghost_visible(self.chk_ghost.isChecked())
         self.tabs.addTab(self.map_view, "Map")
 
         # --- Summary tab ---
@@ -2405,7 +2754,8 @@ class MainWindow(QtWidgets.QMainWindow):
             f.setObjectName("panel")
             v = QtWidgets.QVBoxLayout(f)
             h = QtWidgets.QLabel(title)
-            h.setStyleSheet("color: #8fa0b4; font-size: 11px;")
+            theme.themed(lambda h=h: h.setStyleSheet(
+                theme.dim() + " font-size: 11px;"))
             v.addWidget(h)
             lay.addWidget(f)
             return v
@@ -2455,12 +2805,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         v = frame("Altitude (-D) [m]")
         self.alt_plot = pg.PlotWidget()
-        self.alt_plot.setBackground(QtGui.QColor(*COLOR_BG))
+        theme.themed(lambda: theme.style_plot(self.alt_plot))
         self.alt_plot.showGrid(x=True, y=True, alpha=0.2)
         self.alt_plot.setMinimumHeight(140)
-        self.alt_curve_est = self.alt_plot.plot(
-            pen=pg.mkPen((100, 200, 255), width=2))
-        self.alt_curve_ref = self.alt_plot.plot(pen=PEN_REF)
+        self.alt_curve_est = self.alt_plot.plot()
+        self.alt_curve_ref = self.alt_plot.plot()
+        theme.themed(lambda: (
+            self.alt_curve_est.setPen(theme.pen("est", 2)),
+            self.alt_curve_ref.setPen(theme.pen("ref", 1.5, theme.DASH))))
         v.addWidget(self.alt_plot)
 
         v = frame("Acceleration (body)")
@@ -2495,21 +2847,44 @@ class MainWindow(QtWidgets.QMainWindow):
         for label, path in discover_datasets():
             self.dataset_combo.addItem(label, path)
             seen.add(os.path.abspath(path))
-        recents = self.settings.value("recents", [], type=list)
-        for path in recents:
-            if os.path.abspath(path) not in seen and os.path.isdir(path):
-                self.dataset_combo.addItem(path, path)
+        for path in self._recents():
+            if os.path.abspath(path) not in seen:
+                self.dataset_combo.addItem(config_label(path), path)
         self.dataset_combo.setCurrentIndex(-1)
 
-    def _remember_recent(self, path):
-        recents = self.settings.value("recents", [], type=list)
-        path = os.path.abspath(path)
-        if path in recents:
-            recents.remove(path)
-        recents.insert(0, path)
+    def _recents(self):
+        """Recently opened config files that still exist. Entries from
+        before the GUI opened files were directories, read as their
+        config.yaml."""
+        out = []
+        for path in self.settings.value("recents", [], type=list):
+            if os.path.isdir(path):
+                path = os.path.join(path, "config.yaml")
+            if os.path.isfile(path) and path not in out:
+                out.append(path)
+        return out
+
+    def _remember_recent(self, cfg_path):
+        recents = self._recents()
+        cfg_path = os.path.abspath(cfg_path)
+        if cfg_path in recents:
+            recents.remove(cfg_path)
+        recents.insert(0, cfg_path)
         self.settings.setValue("recents", recents[:10])
 
+    def _select_in_combo(self, cfg_path):
+        cfg_path = os.path.abspath(cfg_path)
+        idx = next((i for i in range(self.dataset_combo.count())
+                    if os.path.abspath(self.dataset_combo.itemData(i) or "")
+                    == cfg_path), -1)
+        if idx < 0:
+            self.dataset_combo.addItem(config_label(cfg_path), cfg_path)
+            idx = self.dataset_combo.count() - 1
+        self.dataset_combo.setCurrentIndex(idx)
+
     def open_dataset(self, path):
+        """`path`: a config YAML (it need not exist yet, see New…) or a
+        dataset directory, meaning its config.yaml."""
         try:
             raw, cfg_path, data_dir = load_raw_config(path)
         except Exception as e:
@@ -2522,25 +2897,27 @@ class MainWindow(QtWidgets.QMainWindow):
         exists = os.path.exists(cfg_path)
         self.cfg_label.setText(
             f"{cfg_path}{'' if exists else '  (NEW, not saved yet)'}")
-        self._update_files_label()
-        self._remember_recent(data_dir)
+        self._update_files_label(raw)
+        if exists:
+            self._remember_recent(cfg_path)
         name = raw.get("name") or os.path.basename(os.path.normpath(data_dir))
-        self.statusBar().showMessage(f"loaded {name}")
-        self.setWindowTitle(f"inspostgui — {name}")
-        idx = self.dataset_combo.findData(data_dir)
-        if idx < 0:
-            self.dataset_combo.addItem(data_dir, data_dir)
-            idx = self.dataset_combo.count() - 1
-        self.dataset_combo.setCurrentIndex(idx)
+        self.statusBar().showMessage(f"loaded {name} ({cfg_path})")
+        self.setWindowTitle(
+            f"inspostgui — {name} [{os.path.basename(cfg_path)}]")
+        self._select_in_combo(cfg_path)
 
-    def _update_files_label(self):
+    def _update_files_label(self, raw):
+        """The CSVs the config points at: inputs: overrides resolved against
+        the config's directory, like the replay does."""
         if not self.data_dir:
             self.files_label.setText("")
             return
+        spec = {"inputs": raw.get("inputs") or {}}
         parts = []
-        for fname in ("imu.csv", "ref.csv", "gnss.csv", "mag.csv",
-                      "baro.csv"):
-            p = os.path.join(self.data_dir, fname)
+        for stream in ("imu", "ref", "gnss", "heading", "mag", "baro",
+                       "speed"):
+            p = replay.input_path(self.data_dir, spec, stream)
+            fname = os.path.basename(p)
             if os.path.exists(p):
                 parts.append(f"{fname} ({os.path.getsize(p) // 1024} kB)")
             else:
@@ -2554,24 +2931,28 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_browse(self):
         start = self.data_dir or os.path.join(REPO_ROOT, "datasets")
-        path = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Select dataset directory (with config.yaml + the CSVs)", start)
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open dataset config (YAML next to the CSVs)", start,
+            "Config YAML (*.yaml *.yml);;All files (*)")
         if path:
             self.open_dataset(path)
 
     # --- config buttons ------------------------------------------------
     def _on_cfg_reload(self):
-        if self.data_dir:
-            self.open_dataset(self.data_dir)
+        if self.cfg_path:
+            self.open_dataset(self.cfg_path)
 
     def _on_cfg_new(self):
-        path = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Dataset directory for the new config", REPO_ROOT)
+        start = os.path.join(self.data_dir or REPO_ROOT, "config.yaml")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "New config (in the dataset directory with the CSVs)",
+            start, "Config YAML (*.yaml *.yml)",
+            options=QtWidgets.QFileDialog.Option.DontConfirmOverwrite)
         if not path:
             return
-        if os.path.exists(os.path.join(path, "config.yaml")):
+        if os.path.exists(path):
             QtWidgets.QMessageBox.information(
-                self, "Exists", "This directory already has a config.yaml "
+                self, "Exists", f"{os.path.basename(path)} already exists "
                 "-- loading it instead.")
         self.open_dataset(path)
 
@@ -2585,8 +2966,14 @@ class MainWindow(QtWidgets.QMainWindow):
         with open(path, "w", encoding="utf-8") as f:
             yaml.safe_dump(raw, f, sort_keys=False)
         self.cfg_path = path
+        # The config's own directory is where its CSVs are looked up, so a
+        # Save As into another directory moves the dataset with it.
+        self.data_dir = os.path.dirname(os.path.abspath(path))
         self.editor.load(raw)  # new baseline for "already present" keys
         self.cfg_label.setText(path)
+        self._update_files_label(raw)
+        self._remember_recent(path)
+        self._select_in_combo(path)
         self.statusBar().showMessage(f"saved {path}")
 
     def _on_cfg_save(self):
@@ -2632,8 +3019,10 @@ class MainWindow(QtWidgets.QMainWindow):
                                           "\n".join(errors))
             return
 
+        self._keep_ghost()
         self.results = None
         self._drained = 0
+        self._fix_drained = 0
         self._alt_t, self._alt_est, self._alt_ref = [], [], []
         self._alt_has_finite = False
         self._trail_gap = False
@@ -2647,7 +3036,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.worker = ReplayWorker(spec, self.data_dir,
                                    realtime=self.chk_realtime.isChecked(),
-                                   speed=self.speed_spin.value())
+                                   speed=self.speed_combo.currentData())
         self.worker.sig_status.connect(self.statusBar().showMessage)
         self.worker.sig_progress.connect(self.progress.setValue)
         self.worker.sig_finished.connect(self._on_finished)
@@ -2657,6 +3046,50 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pause_btn.setEnabled(True)
         self.pause_btn.setChecked(False)
         self.worker.start()
+
+    def _keep_ghost(self):
+        """Turn the run on screen into the ghost of the one about to start.
+        Only within one dataset directory (config variants included): a
+        trail of another dataset is no comparison."""
+        if self._run_dir != self.data_dir:
+            self._ghost = None
+        elif self.results is not None:
+            points, breaks = self.pos_view.trail_snapshot()
+            self._ghost = {
+                "points": points, "breaks": breaks,
+                "origin": self.results.get("origin_ecef"),
+                "rms": (self.results["pos_rms_m"]
+                        if self.results["scored_epochs"] else None),
+                "cfg": self._run_cfg,
+                "est_latlon": [(r[1], r[2]) for r in self.results["kml_est"]],
+            }
+        # else: the last run failed, the ghost before it stays.
+        self._run_dir = self.data_dir
+        self._run_cfg = self.cfg_path
+        self._ghost_placed = False
+        if self._ghost:
+            self.pos_view.set_ghost(self._ghost["points"],
+                                    self._ghost["breaks"])
+        else:
+            self.pos_view.set_ghost([], [])
+
+    def _place_ghost(self, origin_ecef):
+        """Move the ghost into this run's local frame once its origin is
+        known (a config change can move the bootstrap point)."""
+        self._ghost_placed = True
+        g = self._ghost
+        if not g or g["origin"] is None:
+            return
+        if max(abs(a - b) for a, b in zip(g["origin"], origin_ecef)) < 1e-3:
+            return
+        g["points"] = _move_ned_origin(g["points"], g["origin"], origin_ecef)
+        g["origin"] = tuple(origin_ecef)
+        self.pos_view.set_ghost(g["points"], g["breaks"])
+
+    def _set_ghost_visible(self, on):
+        self.pos_view.set_ghost_visible(on)
+        if hasattr(self, "map_view"):  # built after the Replay tab
+            self.map_view.set_ghost_visible(on)
 
     def _on_pause(self, checked):
         if self.worker is not None:
@@ -2677,13 +3110,20 @@ class MainWindow(QtWidgets.QMainWindow):
                        results.get("warmup_end_sec", 0.0))
         self.map_view.set_tracks(
             [(row[1], row[2]) for row in results["kml_est"]],
-            [(row[0], row[1]) for row in results["kml_ref"]])
+            [(row[0], row[1]) for row in results["kml_ref"]],
+            results["fix_latlon"],
+            self._ghost["est_latlon"] if self._ghost else ())
         self.pdf_btn.setEnabled(True)
         self.kml_btn.setEnabled(bool(results["kml_est"]))
         rms = results["pos_rms_m"]
+        prev = self._ghost["rms"] if self._ghost else None
         msg = (f"done: {results['name']}, mode {results['mode']}"
                + (f", pos rms {rms:.2f} m ({results['scored_epochs']} "
                   f"scored epochs)" if results["scored_epochs"] else "")
+               + (f", previous run {prev:.2f} m"
+                  + (f" ({os.path.basename(self._ghost['cfg'])})"
+                     if self._ghost["cfg"] != self.cfg_path else "")
+                  if prev is not None else "")
                + (" [STOPPED]" if results["aborted"] else ""))
         self.statusBar().showMessage(msg)
         self.lbl_status.setText(msg)
@@ -2719,6 +3159,7 @@ class MainWindow(QtWidgets.QMainWindow):
                          gnss_delay_curve=self.results["gnss_delay_curve"],
                          sensor_rate=self.results["sensor_rate"],
                          findings=self.results["findings"],
+                         configured_gnss_delay_ms=self.results["gnss_delay_ms"],
                          growth_rate=self.results["growth_rate"],
                          baro_growth_rate=self.results["baro_growth_rate"],
                          ahrs_growth_rate=self.results["ahrs_growth_rate"])
@@ -2790,13 +3231,17 @@ class MainWindow(QtWidgets.QMainWindow):
         box.setStyleSheet("QTextEdit { font-family: monospace; min-width: 620px; }")
         box.exec()
 
-    # --- live UI ----------------------------------------------------------
-    def _on_fly_toggled(self, checked):
-        if checked:
-            self.chk_follow.setChecked(False)
-        self.chk_follow.setEnabled(not checked)
-        self.pos_view.set_fly_enabled(checked)
+    def _on_theme_changed(self):
+        name = self.theme_combo.currentData()
+        self.settings.setValue("theme", name)
+        theme.set_theme(name)
+        # The post-run plots are built with the palette of their moment,
+        # rebuilding them is simpler than chasing every curve.
+        if self.results:
+            populate_plots(self.plots_widget, self.results["rec"],
+                           self.results.get("warmup_end_sec", 0.0))
 
+    # --- live UI ----------------------------------------------------------
     def _update_ui(self):
         w = self.worker
         if w is None:
@@ -2807,8 +3252,14 @@ class MainWindow(QtWidgets.QMainWindow):
             new_pos = w.rec["pos"][self._drained:n]
             new_vel = w.rec["vel"][self._drained:n]
             new_ref = w.rec["ref_pos"][self._drained:n]
+            new_fix = w.fix_ned[self._fix_drained:]
             live = dict(w.live)
+            origin_now = w.origin_ecef
         self._drained = n
+        self._fix_drained += len(new_fix)
+        self.pos_view.append_fix(new_fix)
+        if not self._ghost_placed and origin_now is not None:
+            self._place_ghost(origin_now)
 
         est_pts, est_speeds, est_breaks, ref_pts = [], [], [], []
         for ts, p, v, r in zip(new_t, new_pos, new_vel, new_ref):
@@ -2998,11 +3449,17 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("dataset", nargs="?", default=None,
-                    help="dataset directory (with config.yaml) or a "
-                         "config YAML path to open at startup")
+                    help="config YAML to open at startup, or a dataset "
+                         "directory (opens its config.yaml)")
     ap.add_argument("--batch", action="store_true",
                     help="headless replay + summary printout, no GUI")
+    ap.add_argument("--theme", choices=sorted(theme.THEMES),
+                    help="colour theme (remembered for the next start, "
+                         "also switchable in the toolbar)")
     args = ap.parse_args()
+    if args.theme:
+        QtCore.QSettings("zwiener", "inspostgui").setValue("theme",
+                                                            args.theme)
 
     if args.batch:
         if not args.dataset:

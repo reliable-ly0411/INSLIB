@@ -547,7 +547,7 @@ the characteristics it found so the pair can be added to `BLE_PROFILES`.
 
 Turns a recorded `.ubx` into the `datasets/` replay format (`config.yaml`
 + `imu.csv` / `baro.csv` / `mag.csv` / `gnss.csv` / `ref.csv` /
-`speed.csv`) that `tools/replay.c` and `python/replay.py` score. With `--pos` it takes an
+`speed.csv` / `heading.csv`) that `tools/replay.c` and `python/replay.py` score. With `--pos` it takes an
 RTKLIB post-processed solution as an independent `ref.csv` instead of the
 receiver's own fix.
 
@@ -575,6 +575,24 @@ epoch, and with no reference field every magnetometer sample is rejected
 and yaw runs unaided. A capture that never got a dated fix leaves the key
 at 0 and says so. When an existing `config.yaml` is kept and turns out to
 have no `wmm_year` at all, the run prints the value to paste in.
+
+A dual-antenna receiver in u-blox moving base mode adds NAV-RELPOSNED,
+which becomes `heading.csv` with `heading: enable: 1`, on the same "only
+when the capture has it" rule. A row is kept only when the receiver
+vouches for it (`gnssFixOK`, `relPosValid`, `relPosHeadingValid`, a
+nonzero `accHeading`) and only in moving base mode (`isMoving`): against a
+static RTK base the same field is the direction to the base station, not
+an attitude. Float headings are kept with their `carr_soln`, the replay's
+`heading: require_fixed` decides. The row's `t_us` is not the arrival
+time: it is the `t_us` of the NAV-PVT with the same iTOW (plus the iTOW
+difference when the two belong to neighbouring epochs), so a heading row
+and the `gnss.csv` fix of its epoch carry the identical timestamp and can
+be joined on it. `heading_deg` is the baseline azimuth as measured, not
+the yaw: `heading: baseline_frd` (a FIXME at `[1, 0, 0]`, the median
+measured antenna separation in its comment) turns it into one at replay
+time. `heading: delay_ms` starts at 0 like `gnss: delay_ms` and wants the
+same value. The console summary counts kept and fixed epochs and every
+dropped one by reason.
 
 Odometry (`0x40/0x80`) becomes `speed.csv` with `speed: enable: 1`, on
 the same "only when the capture has it" rule as `mag.csv`. Only frames
@@ -1143,6 +1161,77 @@ can be checked against the ones in `DemoSerial`.
 Needs PyQt6 + pyqtgraph + numpy (`pip install -r python/requirements.txt`,
 the same ones `python/inspostgui.py` uses).
 
+### Calibration report — certificate for the customer, record for the manufacturer
+
+After **Stop and solve**, **Calibration report** writes one LaTeX document
+in two parts, plus the raw recording and a `Makefile`, into a folder of
+your choice:
+
+```sh
+make -C <folder>                 # or: pdflatex file.tex, twice
+```
+
+The second pass is for the page counts. A `Makefile` that is already in
+the folder and was not written by the report is left alone.
+
+A small dialog asks for the username (the login name by default), the
+location, the device and its serial number, and optional remarks.
+Username, location and device are remembered for the next unit. The
+serial number is not. Everything else comes from the session. The name
+in the signature block is left blank, to be written in by hand by
+whoever signs.
+
+**Page 1, the calibration certificate**, is meant to be printed and
+shipped with the unit. It is complete on its own and numbered "Page 1 of
+1": device, serial number, certificate number (recording start + serial),
+date, time, location and position, the reference conditions (|g| from
+WGS84 normal gravity, |F| with declination/inclination from the WMM, IMU
+temperature range), the calibration results in summary (bias, scale
+factor, hard/soft iron, magnetometer and housing alignment, expanded
+uncertainty k=2), a verification table before/after, the overall result,
+a checksum over the coefficients, and name/date/signature fields for
+"calibrated by" and "checked/released by". Remarks longer than
+`CERT_REMARKS_MAX` characters go to the record only, so the certificate
+cannot run onto a second sheet (the test suite builds the worst case and
+checks it ends on page 1).
+
+**The calibration record** follows, with its own page numbering, for the
+manufacturer's files:
+
+- the whole session: data source, the board's sensor configuration,
+  configuration CRC and whether it was correcting the stream, software
+  version, repository and full git commit (flagged when the working tree
+  had uncommitted changes), sample counts, rest/hold times, references and where they
+  came from
+- the acceptance table. The limits are the ones the calibration code
+  already warns at (|g| rms 0.05 m/s², gyro direction 0.05 rad, 3 K
+  span, 20 poses, magnetometer coverage and field deviation), plus: no
+  sample may have arrived already corrected by the board, and no sample
+  may be saturated. Too few poses, a fit that does not reproduce |g|, or
+  a recording taken through the board's own calibration fail; anything
+  else is a note
+- every coefficient in full precision (sensor frame, as uploaded to the
+  board) with standard uncertainties: accelerometer bias, scale and
+  misalignment from the covariance of the fit, the white-noise limit
+  sqrt(psd/T) for the gyro bias. Type A only: a wrong |g| or a drifting
+  temperature is not in it, which is why both are printed alongside
+- diagnostics: the cumulative before/after table, |a|, |ω| (log scale)
+  and |m| over the whole recording against their reference lines, per
+  pose plots, temperature over time, orientation coverage (the direction
+  of every pose and of the field on an azimuth/elevation map, the spread
+  measure, the largest empty cap, which of ±x/±y/±z were visited), noise
+  as ARW/VRW, and the solvers' own warnings verbatim
+- long tables per static pose: sample index range, time, raw mean
+  accelerometer/gyroscope/magnetometer vector, |a| before and after,
+  temperature
+- the raw data: `<name>_imu.csv` and `<name>_mag.csv` next to the `.tex`
+  (replay format, `%.17g`, so nothing is lost in the round trip) are
+  attached to the PDF when it is built, listed with their SHA-256, next
+  to the `inslib_imu_calib.py --csv ...` command that recomputes the
+  calibration from them with the inputs of this session. It has to give
+  the same coefficient checksum, and `python/tests/test_calib_report.py`
+  checks exactly that.
+
 ### Upload to board — one temperature node per session
 
 Next to Save there is **Upload to board**, which writes the session into
@@ -1690,6 +1779,11 @@ extraction `ins_rotmat_to_rpy` uses). No I/O in either, and both are gated
 by `python/tests/test_mag_calib.py`, which puts a known hard iron, soft
 iron, magnetometer rotation and housing rotation into synthetic data and
 requires them all back out.
+
+`inslib_calib_report.py` is the calibration certificate and record the
+GUI writes (see above): formatting plus the little statistics it prints
+(parameter uncertainty from the fit's Jacobian, orientation coverage) and
+the raw-data export. It computes no calibration of its own.
 
 ## testdata/ - reference recordings
 

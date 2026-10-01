@@ -1,0 +1,77 @@
+# Hand-carried, pure-inertial (no GNSS, no magnetometer, no barometer) round
+# trip: the unit starts and ends on the same physical mark/socket, so the
+# true position AND yaw error at the end are both exactly zero (REQ-VER-034).
+# There is no ground truth in between - only ref.csv's two endpoints, see its
+# own header. This is the one dataset that turns "did a change cost the pure
+# free-inertial solution a few centimetres or a fraction of a degree" into a
+# pass/fail gate instead of something only visible on a plot.
+#
+# 160.7 s, ~44.7% in motion (hand-held), ~55.3% auto-ZUPT/ZARU detected
+# stationary. Block-averaged from 797 Hz IMU data to 100 Hz to save Git repo
+# storage space (tools/inslib_decimate_dataset.py)
+
+name: inertial_roundtrip
+aiding: none
+init: auto
+chi2_disable: 1
+allow_unlimited_deadreckoning: 1
+
+free_inertial_start:               # IMU dead reckoning only, see ref.csv row 0
+  enable: 1
+  lat_deg: 48.91097367458455
+  lon_deg: 8.464274892324505
+  height_m: 225.0
+  stddev_m: 0.05
+
+init_hint:                         # the unit's own defined 0 deg, not true north
+  yaw_deg: 0.0
+  yaw_stddev_deg: 0.5
+
+init_stddev:
+  pos_init_stddev_m: 5.00
+  vel_init_stddev_mps: 0.05
+
+baro:
+  enable: 0
+
+gnss:
+  enable: 0
+
+mag:
+  enable: 0
+
+imu:
+  gyr_psd: 5.0e-07
+  acc_psd: 1.0e-05
+  gyr_bias_rw: 1.5e-05
+  acc_bias_rw: 0.0003
+  zero_vel_stddev_mps: 0.05
+  auto_zupt_dwell_sec: 0.1
+  auto_zupt_static_gyr_stddev_deg: 0.35
+  auto_zupt_static_acc_stddev_mps2: 0.45
+  zero_rot_stddev_deg: 0.03
+
+  acc_fixed_bias: [0.0024, -0.0111, -0.0109]
+  gyr_fixed_bias: [0.00048, 0.00057, 0.00015]
+
+score:
+  # Only ref.csv row 1 (timestamped at the last IMU sample) is ever reached
+  # before the stream ends, and warmup_sec is set to fall shortly before it,
+  # so row 0 (the auto-init anchor) is excluded and exactly one epoch -
+  # the round trip's end - is scored (REQ-VER-034).
+  warmup_sec: 160.0
+  min_epochs: 1
+  ahrs: 0
+  attitude: 1
+  # roll/pitch are continuously re-observed from gravity and are not part of
+  # this dataset's claim - ungated (the n=1 stddev below is 0 either way, so
+  # these just need to be > 0, not 0, to not fail the check outright).
+  lim_att_bias_deg: 999
+  lim_att_std_deg: 999
+  # The actual claims of this dataset, ~25%/~15% above the observed
+  # round-trip error of a single deterministic run (build/replay.exe,
+  # MinGW gcc 15.2.0): a change that costs a few cm or a few tenths of a
+  # degree fails this. Retighten after an intentional improvement.
+  lim_yaw_std_deg: 1.0
+  lim_yaw_bias_deg: 0.25   # observed 0.205 deg (100 Hz)
+  lim_pos_rms_m: 0.09      # observed 0.072 m (100 Hz)

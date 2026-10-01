@@ -65,6 +65,7 @@ typedef size_t sock_len_t;
 #include "geodetic_toolbox.h"
 #include "log.h"
 #include "mini_yaml.h"
+#include "imu_mount.h"
 #include "mini_mavlink.h"
 
 /* print_stats() redraws its status line in place (\r, no \n); anything
@@ -1430,6 +1431,9 @@ typedef struct
     float gyr_misalignment[9];
     float acc_fixed_bias[3]; /* [m/s^2] */
     float gyr_fixed_bias[3]; /* [rad/s] */
+    /* Board attitude in the vehicle frame [deg] (REQ-VER-036), composed onto
+       the acc/gyr/mag matrices by config_load(), all-0 -> none. */
+    float imu_mount_rpy_deg[3];
 
     /* runtime */
     nav_suite_t   suite;
@@ -1542,6 +1546,7 @@ static int config_set(insrcv_t* r, const char* sec, const char* key, const char*
     else if (!strcmp(full, "imu.acc_bias_rw")) { if (d > 0.0) r->acc_bias_rw = (float)d; }
     else if (!strcmp(full, "imu.acc_misalignment")) { if (mini_yaml_list(val, r->acc_misalignment, 9) != 0) return -2; }
     else if (!strcmp(full, "imu.gyr_misalignment")) { if (mini_yaml_list(val, r->gyr_misalignment, 9) != 0) return -2; }
+    else if (!strcmp(full, "imu.mount_rpy_deg")) { if (mini_yaml_list(val, r->imu_mount_rpy_deg, 3) != 0) return -2; }
     else if (!strcmp(full, "imu.acc_fixed_bias")) { if (mini_yaml_list(val, r->acc_fixed_bias, 3) != 0) return -2; }
     else if (!strcmp(full, "imu.gyr_fixed_bias")) { if (mini_yaml_list(val, r->gyr_fixed_bias, 3) != 0) return -2; }
     /* Extra process noise on top of what the IMU noise model already
@@ -1836,6 +1841,22 @@ static int config_load(insrcv_t* r, const char* path)
     {
         fprintf(stderr, "[insrcv] cannot open config %s\n", path);
         return -1;
+    }
+
+    /* REQ-VER-036: composed once here, so the host-side displays (tilt,
+       magnetometer checks) and the filter both see vehicle axes. */
+    if (imu_mount_is_set(r->imu_mount_rpy_deg))
+    {
+        if (!imu_mount_compose(r->imu_mount_rpy_deg, r->acc_misalignment) ||
+            !imu_mount_compose(r->imu_mount_rpy_deg, r->gyr_misalignment) ||
+            !imu_mount_compose(r->imu_mount_rpy_deg, r->mag_misalignment))
+        {
+            fprintf(stderr, "[insrcv] config %s: imu.mount_rpy_deg is not finite\n", path);
+            return -1;
+        }
+        fprintf(stderr, "[insrcv] config %s: imu mounting roll %.2f pitch %.2f yaw %.2f deg\n",
+                path, (double)r->imu_mount_rpy_deg[0], (double)r->imu_mount_rpy_deg[1],
+                (double)r->imu_mount_rpy_deg[2]);
     }
 
     bool calib = false;

@@ -73,7 +73,7 @@ _Static_assert(KALMAN_MAX_NOISE_SIZE >= INS_NOISE_COLS_MAX,
    automotive-course aiding. Warn if yaw is drifting too much. */
 #define INS_LOG_YAW_STDDEV_WARN_DEG    (10.0f)
 #define INS_LOG_YAW_AID_GAP_WARN_SEC   (2.0f)
-#define INS_LOG_YAW_AID_GAP_REPEAT_SEC (10.0f)
+#define INS_LOG_YAW_AID_GAP_REPEAT_SEC (120.0f)
 
 /* Diagnostics: a raw gyro sample bit-identical to the previous epoch's,
    repeated this many times in a row, indicates a frozen/stuck sensor bus
@@ -419,6 +419,10 @@ _Static_assert(KALMAN_MAX_NOISE_SIZE >= INS_NOISE_COLS_MAX,
    enough that an outage cannot (REQ-NAV-052). */
 #define INS_GNSS_STOP_MAX_STEP_SEC (2.0f)
 
+/* Horizontal 1-sigma limit below which fused ranges count as position aiding
+ * (REQ-NAV-085, opt.range_aiding_max_hpos_stddev_m). */
+#define INS_DEFAULT_RANGE_AIDING_MAX_HPOS_STDDEV_M (50.0f)
+
 /* How much the carried IMU-bias 1-sigma is widened at the re-bootstrap
    after a quality-loss re-arm (REQ-NAV-061). The consumption site clamps
    the result to the cold-start prior, so this factor only decides how much
@@ -763,6 +767,26 @@ static float udu_get_diag_one(const float* U, const float* d, int n, int idx)
         s += MAT_ELEM(U, idx, k, n, n) * MAT_ELEM(U, idx, k, n, n) * d[k];
     }
     return s;
+}
+
+/* Horizontal position 1-sigma in the worst direction [m]: square root of the
+ * major eigenvalue of the North/East block of P = U*diag(d)*U'. P_ij sums
+ * U(i,k)*U(j,k)*d(k) over k >= max(i,j). */
+static float ins_hpos_major_stddev(const ins_t* f)
+{
+    const int   i_n  = INS_IDX_POS;
+    const int   i_e  = INS_IDX_POS + 1;
+    const float p_nn = udu_get_diag_one(f->U, f->d, f->n, i_n);
+    const float p_ee = udu_get_diag_one(f->U, f->d, f->n, i_e);
+    float       p_ne = MAT_ELEM(f->U, i_n, i_e, f->n, f->n) * f->d[i_e];
+    int         k;
+    for (k = i_e + 1; k < f->n; ++k)
+    {
+        p_ne += MAT_ELEM(f->U, i_n, k, f->n, f->n) * MAT_ELEM(f->U, i_e, k, f->n, f->n) * f->d[k];
+    }
+    const float half_diff = 0.5f * (p_nn - p_ee);
+    const float lambda    = 0.5f * (p_nn + p_ee) + SQRTF(half_diff * half_diff + p_ne * p_ne);
+    return SQRTF(lambda);
 }
 
 /* ============================================================================
@@ -1694,6 +1718,29 @@ static void ins_reacquire_reset_yaw(ins_t* f, const ins_meas_att_hint_t* hint)
     }
 }
 
+/* The attitude ins_reacquire() will hold once it has applied the hint
+ * (ins_apply_att_hint) and whether that attitude's yaw is known
+ * (ins_reacquire_reset_yaw, REQ-NAV-059), so the re-anchoring fix's lever
+ * arm is rotated with it and not with the attitude frozen at the start of the
+ * outage. R is built with yaw 0 when the yaw is unknown: only its vertical
+ * row is then meaningful. */
+static bool ins_reacquire_attitude(const ins_t* f, const ins_meas_att_hint_t* hint, float R[9])
+{
+    float roll, pitch, yaw;
+    ins_rotmat_to_rpy(f->R_b_to_n, &roll, &pitch, &yaw);
+    const bool yaw_known = hint->is_valid && hint->stddev_yaw_rad > 0.0f;
+    if (hint->is_valid && hint->stddev_roll_rad > 0.0f && hint->stddev_pitch_rad > 0.0f)
+    {
+        roll  = hint->roll_rad;
+        pitch = hint->pitch_rad;
+        if (yaw_known) { yaw = hint->yaw_rad; }
+    }
+    float q[4];
+    ins_quat_from_rpy(roll, pitch, yaw_known ? yaw : 0.0f, q);
+    ins_quat_to_rotmat(q, R);
+    return yaw_known;
+}
+
 /* Grow one variance by psd * dt, capped at the state's initial prior and
  * never lowering what is already there. */
 static void ins_inflate_one(float* var, float psd, float dt_sec, float cap)
@@ -2105,7 +2152,9 @@ static bool ins_gnss_entry_quality_ok(const ins_t* f, const ins_measurements_t* 
  * degradation this gate exists for. */
 static bool ins_gnss_stay_quality_ok(const ins_t* f, const ins_measurements_t* m)
 {
-    if (m->local_pos.is_valid) return true;
+    /* Local position, or ranges that counted as position aiding this epoch
+       (REQ-NAV-085), keep the 3D solution up regardless of the GNSS. */
+    if (m->local_pos.is_valid || f->step_ctx.range_pos_aiding) return true;
     if (m->gnss_pos.is_valid)
     {
         if (!ins_cov_is_valid(m->gnss_pos.Qll_ned)) return false;
@@ -2389,7 +2438,17 @@ static void ins_fuse_gnss(ins_t* f, const ins_measurements_t* m)
 
         float pos_new[3], la_n[3], pos_var[3], vel_var[3];
         ins_dlatlonh_to_dned(dllh, f->latlonh[0], f->latlonh[2], pos_new);
-        mat3_mul_vec3(f->R_b_to_n, m->gnss_leverarm_b, la_n);
+        /* REQ-NAV-023: rotated with the attitude the re-anchored filter will
+           hold, horizontally only when its yaw is known (see the bootstrap,
+           REQ-NAV-015, for why an unknown yaw leaves the horizontal arm out). */
+        float      R_re[9];
+        const bool yaw_known = ins_reacquire_attitude(f, &m->att_hint, R_re);
+        mat3_mul_vec3(R_re, m->gnss_leverarm_b, la_n);
+        if (!yaw_known)
+        {
+            la_n[0] = 0.0f;
+            la_n[1] = 0.0f;
+        }
 
         /* The fix locates the ANTENNA, the state the body: step the absolute
            anchor back along the lever arm as well, so it keeps describing the
@@ -2417,10 +2476,38 @@ static void ins_fuse_gnss(ins_t* f, const ins_measurements_t* m)
            from the GNSS position whose vertical row this filter does not
            even fuse. */
         ins_reacquire_vertical(f, m->timestamp, pos_new, pos_var);
-        /* Lever-arm velocity (omega x lever arm) is ignored here: cm/s
-           against a fresh, metre-scale velocity uncertainty. */
-        ins_reacquire(f, m, pos_new, anchor_llh, use_vel ? m->gnss_vel.vel_ned : NULL, pos_var,
-                      vel_var);
+        /* The antenna velocity minus R * (omega x lever arm), the model the
+           GNSS fusion predicts it with: negligible for a car, metres per
+           second for a turning ship with its antenna on the mast. */
+        float vel_imu[3];
+        if (use_vel)
+        {
+            /* This epoch's rate: the strapdown did not run while frozen
+               (REQ-NAV-022), so the last computed one dates from the start
+               of the outage. Less the bias the hint is about to seed per
+               axis, else the kept estimate. */
+            float w_b[3] = {0.0f, 0.0f, 0.0f};
+            if (m->gyr.is_valid)
+            {
+                for (i = 0; i < 3; ++i)
+                {
+                    const bool hinted =
+                        m->att_hint.is_valid && m->att_hint.stddev_gyr_bias_rps[i] > 0.0f;
+                    w_b[i] = m->gyr.data[i] -
+                             (hinted ? m->att_hint.gyr_bias_rps[i] : f->state.gyr_bias[i]);
+                }
+            }
+            float wxla_b[3], v_la_n[3];
+            ins_cross(w_b, m->gnss_leverarm_b, wxla_b);
+            mat3_mul_vec3(R_re, wxla_b, v_la_n);
+            if (!yaw_known)
+            {
+                v_la_n[0] = 0.0f;
+                v_la_n[1] = 0.0f;
+            }
+            for (i = 0; i < 3; ++i) { vel_imu[i] = m->gnss_vel.vel_ned[i] - v_la_n[i]; }
+        }
+        ins_reacquire(f, m, pos_new, anchor_llh, use_vel ? vel_imu : NULL, pos_var, vel_var);
         f->diag.n_gnss_used++;
         f->diag.t_last_gnss_fusion = m->timestamp;
         f->t_last_gnss_fused       = m->timestamp;
@@ -2788,6 +2875,172 @@ static void ins_fuse_speed(ins_t* f, const ins_measurements_t* m)
         0)
     {
         f->diag.n_speed_used++;
+    }
+}
+
+/* Range fusion kernel (REQ-NAV-082): the "line of sight plus residual" layer.
+ * u_n is the unit vector from the antenna towards the anchor in the n-frame,
+ * la_n the antenna lever arm in the n-frame at the time of validity and
+ * residual = predicted - measured range. The row is the local-position
+ * Jacobian [ I3 | 0 | -[l^n]_x | 0 | 0 ] (REQ-NAV-011) projected onto -u_n,
+ * since d(range)/d(antenna position) = -u_n^T. Outliers are skipped. Returns 1
+ * if fused, 0 if rejected by the chi2 gate, -1 on a fusion error. */
+static int ins_fuse_range_row(ins_t* f, const float u_n_in[3], const float la_n[3], float residual,
+                              float var)
+{
+    float Sla[9];
+    float Ht[INS_UNKNOWNS_MAX];
+    float u_n[3] = {u_n_in[0], u_n_in[1], u_n_in[2]};
+    int   i, j;
+
+    /* Horizontal only under barometric height: the vertical part of the
+       line of sight is not corrected but considered (Schmidt), i.e. the
+       height uncertainty is added to the range variance. Zeroing the Down
+       column alone would leak a height error that is still in the residual
+       into North/East. */
+    if (f->height_from_baro && !f->opt.range_height_with_baro)
+    {
+        var += u_n[2] * u_n[2] * udu_get_diag_one(f->U, f->d, f->n, INS_IDX_POS + 2);
+        u_n[2] = 0.0f;
+    }
+
+    ins_cross_matrix(la_n, Sla);
+    memset(Ht, 0, sizeof(Ht));
+    for (j = 0; j < 3; ++j)
+    {
+        Ht[INS_IDX_POS + j] = -u_n[j];
+        /* -u_n^T * (-[l^n]_x), column j */
+        float acc = 0.0f;
+        for (i = 0; i < 3; ++i) { acc += u_n[i] * MAT_ELEM(Sla, i, j, 3, 3); }
+        Ht[INS_IDX_RPY + j] = acc;
+    }
+
+    const float thr = f->opt.chi2_disable ? 0.0f : f->chi2_thr_range;
+    if (ins_fuse_is_outlier(f, &residual, &var, Ht, 1, thr)) { return 0; }
+    return (ins_fuse(f, &residual, &var, Ht, 1, thr, 0 /* skip outliers */) == 0) ? 1 : -1;
+}
+
+/* Antenna position in ECEF for a geodetic body position llh plus the n-frame
+ * lever arm la_n (REQ-NAV-083): cached reference point plus the n-frame offset
+ * from it, so the common case costs double additions only. The reference is
+ * recomputed exactly once the offset leaves INS_RANGE_REF_RADIUS_M. Also
+ * returns the reference's NED-to-ECEF rotation for the line of sight. */
+/* @satisfies REQ-NAV-083 */
+static const float* ins_range_antenna_ecef(ins_t* f, const double llh[3], const float la_n[3],
+                                           double p_ecef[3])
+{
+    float dned[3] = {0.0f, 0.0f, 0.0f};
+    if (f->range_ref.valid)
+    {
+        const double dllh[3] = {llh[0] - f->range_ref.llh[0], llh[1] - f->range_ref.llh[1],
+                                llh[2] - f->range_ref.llh[2]};
+        ins_dlatlonh_to_dned(dllh, f->range_ref.llh[0], f->range_ref.llh[2], dned);
+    }
+    if (!f->range_ref.valid || !(vec3_norm(dned) <= INS_RANGE_REF_RADIUS_M))
+    {
+        f->range_ref.llh[0] = llh[0];
+        f->range_ref.llh[1] = llh[1];
+        f->range_ref.llh[2] = llh[2];
+        ins_latlonh_to_ecef(llh[0], llh[1], llh[2], f->range_ref.ecef);
+        ins_rotmat_n_to_e(llh[0], llh[1], f->range_ref.R_n_to_e);
+        f->range_ref.valid = true;
+        f->diag.n_range_ref_updates++;
+        vec3_zero(dned);
+    }
+
+    float off_n[3], off_e[3];
+    int   i;
+    for (i = 0; i < 3; ++i) { off_n[i] = dned[i] + la_n[i]; }
+    mat3_mul_vec3(f->range_ref.R_n_to_e, off_n, off_e);
+    for (i = 0; i < 3; ++i) { p_ecef[i] = f->range_ref.ecef[i] + (double)off_e[i]; }
+    return f->range_ref.R_n_to_e;
+}
+
+/* Range aiding to known anchors (REQ-NAV-082): the geometry layer. Turns each
+ * entry into line of sight, residual and variance at its own time of validity
+ * and hands them to ins_fuse_range_row(). An epoch that fused ranges and
+ * leaves the horizontal position bounded counts as position aiding
+ * (REQ-NAV-085). */
+/* @satisfies REQ-NAV-082 REQ-NAV-084 REQ-NAV-085 */
+static void ins_fuse_ranges(ins_t* f, const ins_measurements_t* m)
+{
+    bool fused = false;
+    int  k;
+    for (k = 0; k < INS_RANGE_MAX; ++k)
+    {
+        const ins_meas_range_t* r = &m->range[k];
+        if (!r->is_valid) { continue; }
+        f->diag.n_range_seen++;
+
+        /* State at the time of validity, per entry. */
+        const int     delay_ms = (r->delay_ms > 0) ? r->delay_ms : 0;
+        const double* llh_tov  = f->latlonh;
+        const float*  R_tov    = f->R_b_to_n;
+        if (delay_ms > INS_MAX_DELAY_MS)
+        {
+            f->diag.n_range_skipped++;
+            continue;
+        }
+        if (delay_ms > 0)
+        {
+            const ins_history_item_t* h =
+                ins_find_history(f, m->timestamp - (ins_time_us_t)delay_ms * INS_US_PER_MS);
+            if (h == NULL)
+            {
+                f->diag.n_range_skipped++;
+                continue;
+            }
+            llh_tov = h->latlonh;
+            R_tov   = h->R_b_to_n;
+        }
+
+        float la_n[3];
+        mat3_mul_vec3(R_tov, m->range_leverarm_b, la_n);
+
+        /* Anchor minus antenna in double, only the difference goes to float. */
+        double       p_ecef[3];
+        const float* R_n_to_e = ins_range_antenna_ecef(f, llh_tov, la_n, p_ecef);
+        float        d_e[3];
+        int          i;
+        for (i = 0; i < 3; ++i) { d_e[i] = (float)(r->anchor_ecef[i] - p_ecef[i]); }
+        const float rho = vec3_norm(d_e);
+        if (!(rho >= INS_RANGE_MIN_PRED_M))
+        {
+            f->diag.n_range_skipped++;
+            continue;
+        }
+
+        /* Line of sight into the n-frame: u_n = R_n_to_e^T * u_e. */
+        float u_n[3];
+        for (i = 0; i < 3; ++i)
+        {
+            u_n[i] =
+                (MAT_ELEM(R_n_to_e, 0, i, 3, 3) * d_e[0] + MAT_ELEM(R_n_to_e, 1, i, 3, 3) * d_e[1] +
+                 MAT_ELEM(R_n_to_e, 2, i, 3, 3) * d_e[2]) /
+                rho;
+        }
+
+        const float residual = rho - r->range_m;
+        const int   rc       = ins_fuse_range_row(f, u_n, la_n, residual, qsquare(r->stddev_m));
+        if (rc > 0)
+        {
+            fused = true;
+            f->diag.n_range_used++;
+            f->diag.last_range_residual_m = residual;
+            f->diag.last_range_anchor_id  = r->anchor_id;
+        }
+        else if (rc == 0) { f->diag.n_range_rejected++; }
+        else { f->diag.n_range_skipped++; }
+    }
+
+    const float lim = (f->opt.range_aiding_max_hpos_stddev_m > 0.0f)
+                          ? f->opt.range_aiding_max_hpos_stddev_m
+                          : INS_DEFAULT_RANGE_AIDING_MAX_HPOS_STDDEV_M;
+    if (fused && ins_hpos_major_stddev(f) <= lim)
+    {
+        f->t_last_pos_aiding         = m->timestamp;
+        f->step_ctx.range_pos_aiding = true;
+        f->diag.n_range_pos_aiding++;
     }
 }
 
@@ -3875,6 +4128,7 @@ int ins_init(ins_t* f, const ins_init_t* init, const ins_options_t* opt)
         f->chi2_thr_mag   = thr;
         f->chi2_thr_local = thr;
         f->chi2_thr_yaw   = thr;
+        f->chi2_thr_range = thr;
         LOG_INFO("ins: chi2 outlier gate (1 DOF, all channels): %.2f%s", (double)thr,
                  opt->chi2_disable ? " (chi2_disable: never downweighted)" : "");
     }
@@ -4414,7 +4668,28 @@ static bool ins_autoinit_try(ins_t* f, const ins_measurements_t* m)
            sets pos_local instead of the origin, via the same geodetic mapping
            the re-acquisition of REQ-NAV-023 uses. */
         const double* fix_llh_in = m->gnss_pos.llh;
-        const bool    carry =
+
+        /* REQ-NAV-015: the fix locates the ANTENNA, the state the IMU. Step
+           back along the lever arm rotated with the bootstrap attitude, the
+           same way ins_reacquire does. With the yaw unknown only the vertical
+           part is certain: a horizontal arm turned by an arbitrary yaw can
+           land further off than leaving it out. */
+        float      la_n[3];
+        float      R_bs[9];
+        const bool yaw_known = yaw_var < qsquare(INS_YAW_UNKNOWN_STDDEV);
+        {
+            float q_bs[4];
+            ins_quat_from_rpy(roll, pitch, yaw_known ? yaw : 0.0f, q_bs);
+            ins_quat_to_rotmat(q_bs, R_bs);
+            mat3_mul_vec3(R_bs, m->gnss_leverarm_b, la_n);
+        }
+        if (!yaw_known)
+        {
+            la_n[0] = 0.0f;
+            la_n[1] = 0.0f;
+        }
+
+        const bool carry =
             f->origin_carry.valid &&
             ins_autoinit_origin_carry_usable(f, fix_llh_in, m->timestamp, pos_local, fix_llh);
         if (carry)
@@ -4422,7 +4697,15 @@ static bool ins_autoinit_try(ins_t* f, const ins_measurements_t* m)
             origin_llh[0] = f->origin_carry.origin_llh[0];
             origin_llh[1] = f->origin_carry.origin_llh[1];
             origin_llh[2] = f->origin_carry.origin_llh[2];
-            anchor_llh    = fix_llh;
+            /* The exact latitude/longitude of the bootstrap point describe
+               the same point as pos_local, so they move with it. */
+            const float la_n_neg[3] = {-la_n[0], -la_n[1], -la_n[2]};
+            double      dllh_la[3];
+            ins_dned_to_dlatlonh(la_n_neg, fix_llh[0], fix_llh[2], dllh_la);
+            fix_llh[0] += dllh_la[0];
+            fix_llh[1] += dllh_la[1];
+            fix_llh[2] += dllh_la[2];
+            anchor_llh = fix_llh;
         }
         else
         {
@@ -4433,7 +4716,31 @@ static bool ins_autoinit_try(ins_t* f, const ins_measurements_t* m)
             origin_llh[2] = fix_llh_in[2];
             LOG_INFO("ins: Reset of local NED frame");
         }
-        if (ins_gnss_vel_usable(f, &m->gnss_vel)) { vec3_copy(m->gnss_vel.vel_ned, vel_ned); }
+        int k;
+        for (k = 0; k < 3; ++k) { pos_local[k] -= la_n[k]; }
+        if (ins_gnss_vel_usable(f, &m->gnss_vel))
+        {
+            /* The antenna also moves at R * (omega x lever arm) that the IMU
+               does not, the model the GNSS fusion predicts it with. omega is
+               this epoch's rate less the bias the filter is about to start
+               with (carried across a re-arm, else the configured one). */
+            float w_b[3] = {0.0f, 0.0f, 0.0f};
+            if (m->gyr.is_valid)
+            {
+                const float* gb =
+                    f->bias_carry.valid ? f->bias_carry.gyr_bias : f->init.gyr_bias_init_rps;
+                for (k = 0; k < 3; ++k) { w_b[k] = m->gyr.data[k] - gb[k]; }
+            }
+            float wxla_b[3], v_la_n[3];
+            ins_cross(w_b, m->gnss_leverarm_b, wxla_b);
+            mat3_mul_vec3(R_bs, wxla_b, v_la_n);
+            if (!yaw_known)
+            {
+                v_la_n[0] = 0.0f;
+                v_la_n[1] = 0.0f;
+            }
+            for (k = 0; k < 3; ++k) { vel_ned[k] = m->gnss_vel.vel_ned[k] - v_la_n[k]; }
+        }
     }
     else /* have_local: keep the caller's n-frame origin (the init block) so
             the local measurements stay consistent, the fix sets pos_local. */
@@ -5186,6 +5493,30 @@ static void ins_sanitize_measurements(ins_t* f, const ins_measurements_t* in,
         }
     }
 
+    /* Range entries (REQ-NAV-084): a non-finite anchor would turn into a
+       non-finite residual, a negative range is a sign or unit error and a
+       non-positive stddev has no weight to fuse with. */
+    /* @satisfies REQ-NAV-084 */
+    {
+        int k;
+        for (k = 0; k < INS_RANGE_MAX; ++k)
+        {
+            ins_meas_range_t* r = &out->range[k];
+            if (!r->is_valid) { continue; }
+            if (!vec3d_finite(r->anchor_ecef) || !isfinite(r->range_m) || r->range_m < 0.0f ||
+                !isfinite(r->stddev_m) || !(r->stddev_m > 0.0f))
+            {
+                r->is_valid = false;
+                f->diag.n_invalid_input++;
+            }
+        }
+        if (!ins_vec3_finite(out->range_leverarm_b))
+        {
+            vec3_zero(out->range_leverarm_b);
+            f->diag.n_invalid_input++;
+        }
+    }
+
     /* Throttled summary instead of one LOG_WARN per rejected field: a
        flaky sensor bus can otherwise flood the sink at the update rate. */
     if (f->diag.n_invalid_input != n_invalid_before)
@@ -5450,8 +5781,9 @@ int ins_predict_step(ins_t* f, const ins_measurements_t* m_in, float* phi_out)
 void ins_correct_step(ins_t* f)
 {
     if (f == NULL || !f->step_ctx.active) return;
-    f->step_ctx.active          = false;
-    const ins_measurements_t* m = &f->step_ctx.m;
+    f->step_ctx.active           = false;
+    f->step_ctx.range_pos_aiding = false;
+    const ins_measurements_t* m  = &f->step_ctx.m;
 
     /* -------- Measurement fusion -------- */
     if (f->step_ctx.run_fusion)
@@ -5488,6 +5820,7 @@ void ins_correct_step(ins_t* f)
         {
             ins_fuse_baro_height(f, m); /* REQ-NAV-054, no-op unless height_from_baro */
             ins_fuse_speed(f, m);       /* REQ-NAV-068 */
+            ins_fuse_ranges(f, m);      /* REQ-NAV-082 */
             ins_fuse_gnss_course_yaw(f, m);
         }
 

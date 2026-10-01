@@ -16,9 +16,9 @@ In action, fusing IMU measurements with Galileo HAS-corrected GPS/GNSS inputs:
 
 | Metric | Coverage |
 |---|---|
-| C0 (Line) | 99.8% (3940/3946) |
-| C1 (Branch) | 92.3% (2625/2843) |
-| MC/DC | 92.3% (2604/2822) |
+| C0 (Line) | 99.7% (4120/4131) |
+| C1 (Branch) | 92.3% (2747/2977) |
+| MC/DC | 92.2% (2725/2956) |
 <!-- COVERAGE:END -->
 
 <!-- STACK:START -->
@@ -26,8 +26,8 @@ In action, fusing IMU measurements with Galileo HAS-corrected GPS/GNSS inputs:
 
 | Entry point | x86_64-linux-gnu, GCC 14.2.0 |
 |---|---:|
-| `nav_suite_update()` | 12864 |
-| `ins_update()` | 11840 |
+| `nav_suite_update()` | 13504 |
+| `ins_update()` | 12128 |
 | `ahrs_update()` | 8240 |
 | `baro_alt_update()` | 7904 |
 | `nav_suite_init()` | 2704 |
@@ -86,8 +86,9 @@ helper programs and GUI apps are included in this repository.
 
 ![Post processing GUI screenshot](doc/figures/inspostgui_screenshot.png)
 
-`inspostgui.py` is a GUI to post-process measurements: pick a dataset directory
-(CSVs + `config.yaml`), tweak its settings, and replay it.
+`inspostgui.py` is a GUI to post-process measurements: open a dataset's config
+YAML (it sits next to the CSVs, a directory may hold several variants such as
+`config.yaml` and `config_experimental.yaml`), tweak its settings, and replay it.
 
 ```sh
 sh python/setup_venv.sh               # one-time (also runs `make pylib`)

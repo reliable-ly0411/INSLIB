@@ -1,0 +1,13 @@
+# t_us, lat_deg, lon_deg, h_m, roll_deg, pitch_deg, yaw_deg, vn_mps, ve_mps, vd_mps
+# Round-trip truth, not a continuous ground-truth track (REQ-VER-034): the
+# unit was placed on the same physical mark/socket at the start and at the
+# end of a hand-carried pure-inertial run, so both rows describe the SAME
+# true pose (position AND yaw - the mount is not rotationally free, so yaw
+# repeats too; roll/pitch are additionally re-leveled by gravity throughout
+# the run and are not gated here). There is no truth in between. Row 0 is
+# consumed by the filter's auto-init (position only - see
+# free_inertial_start below); row 1 is timestamped at the last IMU sample so
+# score.warmup_sec excludes row 0 and only row 1 is ever scored, making
+# ins pos rms / yaw bias a direct readout of the round-trip drift.
+2743958270,48.91097367458455,8.464274892324505,225.0,0.0,0.0,0.0,0.0,0.0,0.0
+2905669585,48.91097367458455,8.464274892324505,225.0,0.0,0.0,0.0,0.0,0.0,0.0

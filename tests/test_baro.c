@@ -948,6 +948,93 @@ static void scenario_baro_suite(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * Range entries pass through the wrapper (REQ-SUITE-025)
+ * ---------------------------------------------------------------------------
+ */
+
+static void scenario_suite_range_passthrough(void)
+{
+    printf("\n-- scenario: nav_suite range pass-through --\n");
+
+    ins_init_t init;
+    memset(&init, 0, sizeof(init));
+    ins_time_us_t t                = 1000000;
+    init.time                      = t;
+    init.llh[0]                    = 48.783 * M_PI / 180.0;
+    init.llh[1]                    = 9.181 * M_PI / 180.0;
+    init.llh[2]                    = 300.0;
+    init.pos_init_stddev_m         = 5.0f;
+    init.vel_init_stddev_mps       = 0.1f;
+    init.rpy_init_stddev_rad[0]    = DEG2RAD(3.0f);
+    init.rpy_init_stddev_rad[1]    = DEG2RAD(3.0f);
+    init.acc_bias_init_stddev_mps2 = 0.05f;
+    init.gyr_bias_init_stddev_rps  = DEG2RAD(0.05f);
+
+    ins_options_t opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.kalman_update_dt_sec          = 0.01f;
+    opt.max_prediction_time_sec       = 0.5f;
+    opt.allow_unlimited_deadreckoning = true;
+
+    static nav_suite_t s; /* keep the large struct off the stack */
+    memset(&s, 0, sizeof(s));
+    CHECK_TRUE(nav_suite_init(&s, &init, &opt) == 0, "nav_suite_init");
+
+    /* Anchor 200 m north of the start, range from the start itself. */
+    const float dned[3] = {200.0f, 0.0f, 0.0f};
+    double      dllh[3], anchor[3], start[3];
+    ins_dned_to_dlatlonh(dned, init.llh[0], init.llh[2], dllh);
+    ins_latlonh_to_ecef(init.llh[0] + dllh[0], init.llh[1] + dllh[1], init.llh[2] + dllh[2],
+                        anchor);
+    ins_latlonh_to_ecef(init.llh[0], init.llh[1], init.llh[2], start);
+    const double dx = anchor[0] - start[0], dy = anchor[1] - start[1], dz = anchor[2] - start[2];
+    const float  range = (float)sqrt(dx * dx + dy * dy + dz * dz);
+
+    ins_measurements_t m;
+    int                i;
+    /* Phase 1: IMU only, until ins is live. Phase 2: ranges. Phase 3:
+       ranges together with a local position, which makes the wrapper hand
+       ins its datum-shifted scratch copy instead (REQ-SUITE-013). */
+    for (i = 0; i < 400; ++i)
+    {
+        t += US_PER_SEC / 100;
+        memset(&m, 0, sizeof(m));
+        m.timestamp        = t;
+        m.strapdown_dt_sec = 0.01f;
+        m.acc.is_valid     = true;
+        m.gyr.is_valid     = true;
+        m.acc.data[2]      = -GRAVITY;
+        if (i >= 200 && i % 10 == 0)
+        {
+            m.range[0].anchor_ecef[0] = anchor[0];
+            m.range[0].anchor_ecef[1] = anchor[1];
+            m.range[0].anchor_ecef[2] = anchor[2];
+            m.range[0].range_m        = range;
+            m.range[0].stddev_m       = 1.0f;
+            m.range[0].anchor_id      = 3;
+            m.range[0].is_valid       = true;
+        }
+        if (i >= 300 && i % 10 == 0)
+        {
+            m.local_pos.is_valid   = true;
+            m.local_pos.Qll_ned[0] = m.local_pos.Qll_ned[4] = m.local_pos.Qll_ned[8] = 1.0f;
+        }
+        nav_suite_update(&s, &m);
+        if (i == 199) { CHECK_TRUE(s.ins.is_initialized, "ins live before the first range"); }
+        if (i == 299)
+        {
+            CHECK_TRUE(ins_get_diag(&s.ins)->n_range_seen == 10, "ranges reach ins");
+            CHECK_TRUE(nav_suite_get_mode(&s) == NAV_SUITE_MODE_FULL,
+                       "counting ranges keep the suite in FULL (REQ-NAV-085)");
+        }
+    }
+    CHECK_TRUE(s.local_frame_external, "local position took the scratch-copy path");
+    CHECK_TRUE(ins_get_diag(&s.ins)->n_range_seen == 20,
+               "ranges reach ins through the datum-shifted copy too");
+    CHECK_TRUE(ins_get_diag(&s.ins)->last_range_anchor_id == 3, "anchor id carried through");
+}
+
+/* ---------------------------------------------------------------------------
  * Scenario 8: datum-aligned initialization (h_init)
  * ---------------------------------------------------------------------------
  */
@@ -3023,6 +3110,135 @@ static void scenario_height_ellipsoid_no_baro(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * Scenario 16b2: absolute height with the GNSS antenna above the IMU
+ *
+ * The fix reports the antenna, ins and the local height reference the IMU.
+ * The offset filter has to be fed the IMU's ellipsoid height, or it absorbs
+ * the lever arm and nav_suite_get_height_ellipsoid() jumps by it when it
+ * hands over from ins (FULL) to reference + offset (COASTING). Run level
+ * and pitched: only the rotated lever arm, not its raw z, gets the offset
+ * right in the second case.
+ * ---------------------------------------------------------------------------
+ */
+
+static void run_height_ellipsoid_leverarm(float pitch_deg)
+{
+    const double lat       = 48.783 * M_PI / 180.0;
+    const double lon       = 9.181 * M_PI / 180.0;
+    const float  h_ell_imu = 390.0f;
+    const float  la_b[3]   = {-2.0f, 0.0f, -1.3f}; /* antenna behind and above */
+    const float  pitch     = DEG2RAD(pitch_deg);
+    /* antenna down = IMU down + (R_b_to_n * la_b)_down, pitch only */
+    const float la_d      = -sinf(pitch) * la_b[0] + cosf(pitch) * la_b[2];
+    const float h_ell_ant = h_ell_imu - la_d;
+    char        name[96];
+
+    ins_init_t init;
+    memset(&init, 0, sizeof(init));
+    ins_time_us_t t                = 1000000;
+    init.time                      = t;
+    init.llh[0]                    = lat;
+    init.llh[1]                    = lon;
+    init.llh[2]                    = (double)h_ell_imu;
+    init.pos_init_stddev_m         = 1.0f;
+    init.vel_init_stddev_mps       = 0.1f;
+    init.rpy_init_stddev_rad[0]    = DEG2RAD(3.0f);
+    init.rpy_init_stddev_rad[1]    = DEG2RAD(3.0f);
+    init.acc_bias_init_stddev_mps2 = 0.05f;
+    init.gyr_bias_init_stddev_rps  = DEG2RAD(0.05f);
+    init.pos_pred_stddev_m_sqrts   = 0.01f;
+    init.vel_pred_stddev_mps_sqrts = 0.05f;
+    init.rpy_pred_stddev_rad_sqrts = DEG2RAD(0.01f);
+    init.zero_vel_stddev_mps       = 0.01f;
+    init.zero_rot_stddev_rps       = DEG2RAD(0.001f);
+    init.magnetic_n[0]             = 20.0f;
+    init.magnetic_n[2]             = 44.0f;
+
+    ins_options_t opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.kalman_update_dt_sec               = 0.01f;
+    opt.max_prediction_time_sec            = 0.5f;
+    opt.gnss_max_horizontal_pos_stddev_m   = 10.0f;
+    opt.gnss_max_vertical_pos_stddev_m     = 20.0f;
+    opt.gnss_max_horizontal_vel_stddev_mps = 1.0f;
+    opt.gnss_max_vertical_vel_stddev_mps   = 2.0f;
+    opt.magnetometer_min_delay_ms          = 200;
+    opt.auto_init                          = true;
+    opt.max_deadreckoning_sec              = 30.0f;
+
+    static nav_suite_t s;
+    memset(&s, 0, sizeof(s));
+    CHECK_TRUE(nav_suite_init(&s, &init, &opt) == 0, "nav_suite_init");
+    nav_suite_set_auto_zupt_zaru_disable(&s, true);
+
+    double fix_ecef[3];
+    ins_latlonh_to_ecef(lat, lon, (double)h_ell_ant, fix_ecef);
+
+    ins_measurements_t m;
+    float              h_full, h_coast, off;
+    int                i;
+
+    for (i = 1; i <= 4000; ++i)
+    {
+        t += US_PER_SEC / 100;
+        memset(&m, 0, sizeof(m));
+        m.timestamp          = t;
+        m.strapdown_dt_sec   = 0.01f;
+        m.acc.is_valid       = true;
+        m.gyr.is_valid       = true;
+        m.acc.data[0]        = GRAVITY * sinf(pitch);
+        m.acc.data[2]        = -GRAVITY * cosf(pitch);
+        m.gnss_leverarm_b[0] = la_b[0];
+        m.gnss_leverarm_b[1] = la_b[1];
+        m.gnss_leverarm_b[2] = la_b[2];
+        if ((i % 100) == 1)
+        {
+            m.gnss_pos.is_valid = true;
+            ins_ecef_to_latlonh(fix_ecef, &m.gnss_pos.llh[0], &m.gnss_pos.llh[1],
+                                &m.gnss_pos.llh[2]);
+            m.gnss_pos.Qll_ned[0] = 1.0f;
+            m.gnss_pos.Qll_ned[4] = 1.0f;
+            m.gnss_pos.Qll_ned[8] = 2.25f;
+        }
+        nav_suite_update(&s, &m);
+    }
+    CHECK_TRUE(nav_suite_get_mode(&s) == NAV_SUITE_MODE_FULL, "FULL mode");
+    CHECK_TRUE(nav_suite_get_height_ellipsoid(&s, &h_full), "absolute height in FULL");
+    snprintf(name, sizeof(name), "pitch %.0f deg: FULL height is the IMU's", (double)pitch_deg);
+    CHECK_NEAR(h_full, h_ell_imu, 0.1, name);
+    CHECK_TRUE(local_gnss_alt_get(&s.local_gnss, &off, (float*)0), "offset filter runs");
+
+    for (i = 1; i <= 500; ++i)
+    {
+        t += US_PER_SEC / 100;
+        memset(&m, 0, sizeof(m));
+        m.timestamp        = t;
+        m.strapdown_dt_sec = 0.01f;
+        m.acc.is_valid     = true;
+        m.gyr.is_valid     = true;
+        m.acc.data[0]      = GRAVITY * sinf(pitch);
+        m.acc.data[2]      = -GRAVITY * cosf(pitch);
+        nav_suite_update(&s, &m);
+    }
+    CHECK_TRUE(nav_suite_get_mode(&s) == NAV_SUITE_MODE_COASTING, "coasting: offset branch");
+    CHECK_TRUE(nav_suite_get_height_ellipsoid(&s, &h_coast), "absolute height coasting");
+    /* 0.25 m leaves room for the offset filter's convergence after 40
+       fixes of 1.5 m vertical sigma, and still separates the lever arm
+       (1.3 m) and, at 10 deg pitch, a correction by its raw z (0.37 m). */
+    snprintf(name, sizeof(name), "pitch %.0f deg: no jump FULL -> COASTING", (double)pitch_deg);
+    CHECK_NEAR(h_coast, h_full, 0.25, name);
+    snprintf(name, sizeof(name), "pitch %.0f deg: coasting height is the IMU's", (double)pitch_deg);
+    CHECK_NEAR(h_coast, h_ell_imu, 0.25, name);
+}
+
+static void scenario_height_ellipsoid_leverarm(void)
+{
+    printf("\n-- scenario: absolute height, GNSS antenna above the IMU --\n");
+    run_height_ellipsoid_leverarm(0.0f);
+    run_height_ellipsoid_leverarm(10.0f);
+}
+
+/* ---------------------------------------------------------------------------
  * Scenario 16c: WGS84 <-> local NED conversion for GNSS users
  *
  * A GNSS drone flying WGS84 waypoints needs to relate the local n-frame
@@ -4293,6 +4509,7 @@ int main(void)
     scenario_baro_nan_inputs();
     scenario_baro_time_anomaly();
     scenario_baro_suite();
+    scenario_suite_range_passthrough();
     scenario_baro_h_init();
     scenario_baro_rate_invariant_process_noise();
     scenario_baro_h_process_noise();
@@ -4313,6 +4530,7 @@ int main(void)
     scenario_height_gnss_noise_outage_cycle();
     scenario_height_ellipsoid_baro_drift();
     scenario_height_ellipsoid_no_baro();
+    scenario_height_ellipsoid_leverarm();
     scenario_wgs84_conversion();
     scenario_api_guards();
     scenario_corrupted_covariance();

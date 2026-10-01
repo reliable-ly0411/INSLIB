@@ -1,9 +1,33 @@
 # Changelog
 
-INSLIB changes over time. Using:
+## [1.1.1] - 2026-09-28 - Smaller fixes
 
-- [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
-- [Semantic Versioning](https://semver.org/).
+### Added
+
+- Dual-antenna GNSS heading post-processing: new `heading.csv` file format.
+- `config.yaml` option `imu: mount_rpy_deg`: the sensor board's attitude in the
+  body frame, corrects at once accelerometer, gyroscope and magnetometer
+  attitude (without the need to set individual misalignment matrices).
+- Range aiding to known anchors (no full tight coupling yet though).
+
+### Changed
+
+- `inspostgui.py` several small tweaks and bug fixes to improve quality of life.
+- Post-processing: `score: leverarm_frd` fixed: a reference taken at the GNSS
+  antenna no longer shows the lever arm as a height or position offset.
+- Post-processing PDF output: The North-East map marks the start and end of the
+  estimated track.
+
+### Fixed
+
+- `nav_suite`: the local-height/GNSS offset filter was fed the antenna's
+  ellipsoid height against the IMU's local height, so it absorbed the
+  vertical GNSS lever arm.
+- `ins` auto-init bootstrapped the IMU at the GNSS antenna's position. It
+  now starts at the fix minus the lever arm rotated with the bootstrap
+  attitude (only its vertical part while the yaw is unknown).
+- `ins` re-acquisition after an expired coasting window rotated the lever
+  arm with the attitude frozen at the start of the outage.
 
 ## [1.1.0] - 2026-09-13 - Automotive Update
 

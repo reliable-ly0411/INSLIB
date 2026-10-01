@@ -201,7 +201,7 @@ CC_GOALS := all test test-asan check-all coverage readme-coverage \
             $(REPLAY) replay $(INSRCV) insrcv \
             pylib pytest datasets datasets-fog datasets-kfgins \
             datasets-tunnel datasets-tunnel-nhc datasets-tunnel-odometry \
-            datasets-pedestrian simulated crazyflie
+            datasets-pedestrian datasets-inertial-roundtrip simulated crazyflie
 
 define CC_MISSING_MSG
 
@@ -237,7 +237,7 @@ endif
 
 .PHONY: all test clean coverage coverage-clean readme-coverage datasets datasets-kfgins \
         datasets-fog datasets-tunnel datasets-tunnel-nhc datasets-tunnel-odometry \
-        datasets-pedestrian \
+        datasets-pedestrian datasets-inertial-roundtrip \
         simulated crazyflie reqs pylib pytest wmm doc doxygen test-asan \
         format format-check cppcheck clang-tidy stack readme-stack check-all insrcv \
         test_core test_math test_ahrs test_baro test_log test_cfg test_yaml \
@@ -300,9 +300,10 @@ $(TEST_BARO): $(SUITE_SRC) $(KFCORE_SRC) tests/test_baro.c $(NAV_HDR) | $(BUILD_
 $(TEST_LOG): src/log.c tests/test_log.c $(NAV_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
 
-# The YAML subset reader the two harnesses share. Header only, so this
-# needs nothing but -Itools and the test file itself.
-$(TEST_YAML): tests/test_yaml.c tools/mini_yaml.h | $(BUILD_DIR)
+# The config.yaml helpers the two harnesses share (YAML subset reader, IMU
+# mounting). Header only, so this needs nothing but -Itools and the test
+# file itself.
+$(TEST_YAML): tests/test_yaml.c tools/mini_yaml.h tools/imu_mount.h | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) -Itools $(filter %.c,$^) $(LDLIBS) -o $@
 
 $(TEST_CFG): $(FW_CFG_SRC) tests/test_cfg.c $(FW_HDR) | $(BUILD_DIR)
@@ -491,9 +492,9 @@ wmm:
 # `make test` runs the whole list as a regression gate -- a new entry
 # below is picked up by `make test` without a second edit.
 datasets: datasets-fog datasets-kfgins datasets-tunnel datasets-tunnel-nhc \
-          datasets-tunnel-odometry datasets-pedestrian
+          datasets-tunnel-odometry datasets-pedestrian datasets-inertial-roundtrip
 
-$(REPLAY): $(SUITE_SRC) $(KFCORE_SRC) tools/replay.c $(NAV_HDR) | $(BUILD_DIR)
+$(REPLAY): $(SUITE_SRC) $(KFCORE_SRC) tools/replay.c tools/imu_mount.h $(NAV_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
 
 # --- Live UBX receiver (UDP in, nav_suite, PlotJuggler out) -----------------
@@ -508,7 +509,7 @@ endif
 
 insrcv: $(INSRCV)
 
-$(INSRCV): $(SUITE_SRC) $(KFCORE_SRC) tools/insrcv.c tools/mini_yaml.h tools/mini_mavlink.h \
+$(INSRCV): $(SUITE_SRC) $(KFCORE_SRC) tools/insrcv.c tools/mini_yaml.h tools/imu_mount.h tools/mini_mavlink.h \
            $(NAV_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(INSRCV_LDLIBS) -o $@
 
@@ -595,6 +596,13 @@ datasets-pedestrian: $(REPLAY)
 	@for d in $(PEDESTRIAN_DATASETS); do \
 	    echo "== $$d"; $(RUN)$(REPLAY) $$d || exit 1; \
 	done
+
+# Hand-carried, pure-inertial round trip back to the same physical mark: the
+# only committed dataset where the truth is "start == end" rather than a
+# continuous track, turning the free-inertial position AND yaw drift over a
+# full run into a direct, tightly gated regression number (REQ-VER-034).
+datasets-inertial-roundtrip: $(REPLAY)
+	$(RUN)$(REPLAY) datasets/inertial_roundtrip
 
 # --- Simulated regression datasets --------
 # `make simulated` gates BOTH harnesses on the committed synthetic datasets
@@ -699,7 +707,9 @@ COV_OBJDIR := $(COV_DIR)/obj
 # their own object tree -- a shared object would silently take whichever
 # flags make happened to build it with first.
 COV_KFCORE_OBJDIR := $(COV_DIR)/obj-kfcore
-COV_CFLAGS := $(HARNESS_CFLAGS) -O0 -g --coverage
+# -MMD -MP: per-object header dependency files (coverage/obj/**/*.d, included
+# below), so a changed header invalidates every coverage .o that included it.
+COV_CFLAGS := $(HARNESS_CFLAGS) -O0 -g --coverage -MMD -MP
 
 # Branch coverage: the --rc option was renamed in lcov 2.x
 # (1.x: lcov_branch_coverage, 2.x: branch_coverage) -- with the wrong
@@ -759,6 +769,14 @@ COV_BARO_OBJ   := $(addprefix $(COV_OBJDIR)/,$(SUITE_SRC:.c=.o) $(KFCORE_SRC:.c=
 COV_LOG_OBJ    := $(addprefix $(COV_OBJDIR)/,src/log.o tests/test_log.o)
 COV_CFG_OBJ    := $(addprefix $(COV_OBJDIR)/,$(FW_CFG_SRC:.c=.o) tests/test_cfg.o)
 COV_KFCORE_OBJ := $(addprefix $(COV_KFCORE_OBJDIR)/,$(KFCORE_TEST_SRC:.c=.o))
+
+# Pull in the per-object dependency files -MMD -MP generates next to each
+# .o (same name, .d suffix). -include: silently ignored when a .d does not
+# exist yet (first build), unlike include.
+COV_DEPS := $(COV_CORE_OBJ:.o=.d) $(COV_MATH_OBJ:.o=.d) $(COV_AHRS_OBJ:.o=.d) \
+            $(COV_BARO_OBJ:.o=.d) $(COV_LOG_OBJ:.o=.d) $(COV_CFG_OBJ:.o=.d) \
+            $(COV_KFCORE_OBJ:.o=.d)
+-include $(COV_DEPS)
 
 # The firmware config store builds against embedded/stm32f429/Core/Inc,
 # not against src/ - see $(TEST_CFG).

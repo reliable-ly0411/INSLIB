@@ -994,6 +994,26 @@ def wmm_field_ned(lat_deg, lon_deg, year):
     return tuple(out)
 
 
+_lib.ins_yaw_from_baseline_heading.restype = ctypes.c_bool
+_lib.ins_yaw_from_baseline_heading.argtypes = [
+    ctypes.c_float, ctypes.c_float, ctypes.c_float, _f3,
+    ctypes.POINTER(ctypes.c_float)]
+
+
+def yaw_from_baseline_heading(heading_rad, roll_rad, pitch_rad, baseline_b):
+    """Vehicle yaw [rad] from the measured azimuth of a body-fixed antenna
+    baseline (dual-antenna GNSS heading), or None where the C
+    ``ins_yaw_from_baseline_heading`` refuses (non-finite input, zero or
+    near-vertical baseline). ``baseline_b`` points, in body FRD, from the
+    antenna the azimuth is measured from to the one it points to. Thin
+    wrapper, so the replay harnesses share one geometry with the firmware."""
+    out = ctypes.c_float()
+    ok = _lib.ins_yaw_from_baseline_heading(
+        float(heading_rad), float(roll_rad), float(pitch_rad),
+        _f3(*baseline_b), ctypes.byref(out))
+    return out.value if ok else None
+
+
 def ecef_to_llh(x, y, z):
     lon = math.atan2(y, x)
     p = math.hypot(x, y)

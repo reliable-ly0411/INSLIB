@@ -1,8 +1,9 @@
 /** @file test_yaml.c
  * @author Jan Zwiener (jan@zwiener.org)
  *
- * Tests for the YAML subset reader shared by tools/replay.c and
- * tools/insrcv.c (tools/mini_yaml.h).
+ * Tests for the config.yaml helpers shared by tools/replay.c and
+ * tools/insrcv.c: the YAML subset reader (tools/mini_yaml.h) and the IMU
+ * mounting (tools/imu_mount.h).
  *
  * A dataset directory is read by this reader and by python/replay.py
  * (PyYAML) alike, so what the two disagree about is not caught anywhere:
@@ -17,12 +18,16 @@
  *   2. malformed_list: a list that is too short, or is not numbers at
  *                      all, is refused and leaves the destination at
  *                      whatever it held.
+ *   3. imu_mount:      imu: mount_rpy_deg composes the ZYX board
+ *                      attitude onto a calibration matrix, after the
+ *                      calibration it already holds (REQ-VER-036).
  */
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
 
 #include "mini_yaml.h"
+#include "imu_mount.h"
 
 static int fails = 0;
 
@@ -253,12 +258,107 @@ static void scenario_malformed_list(void)
     CHECK_TRUE(v != (const char*)0 && !strcmp(v, "200"), "and does not swallow the next key");
 }
 
+/* ---------------------------------------------------------------------------
+ * 3. imu: mount_rpy_deg composed onto a calibration matrix (REQ-VER-036)
+ * ------------------------------------------------------------------------- */
+
+static void mat3_cm_mul_vec(const float M[9], const float v[3], float out[3])
+{
+    int r;
+    for (r = 0; r < 3; ++r) { out[r] = M[r] * v[0] + M[r + 3] * v[1] + M[r + 6] * v[2]; }
+}
+
+static void scenario_imu_mount(void)
+{
+    const float d2r = 3.14159265358979323846f / 180.0f;
+    printf("\n-- imu_mount\n");
+
+    /* Sensor x axis 9 deg left of the vehicle's forward axis is a mounting
+       yaw of -9 deg: the forward axis, seen in sensor axes, comes out as
+       vehicle x. */
+    {
+        const float mount[3] = {0.0f, 0.0f, -9.0f};
+        const float fwd_s[3] = {cosf(9.0f * d2r), sinf(9.0f * d2r), 0.0f};
+        float       M[9]     = {0};
+        float       out[3];
+        CHECK_TRUE(imu_mount_is_set(mount) && imu_mount_compose(mount, M),
+                   "a yaw-only mounting is accepted");
+        mat3_cm_mul_vec(M, fwd_s, out);
+        CHECK_TRUE(fabsf(out[0] - 1.0f) < 1e-6f && fabsf(out[1]) < 1e-6f && fabsf(out[2]) < 1e-6f,
+                   "and maps the vehicle's forward axis onto vehicle x");
+    }
+
+    /* The composed matrix is the ZYX rotation of the stated angles: reading
+       roll/pitch/yaw back off it the way ins_rotmat_to_rpy does returns
+       them. */
+    {
+        const float mount[3] = {20.0f, -15.0f, 170.0f};
+        float       M[9]     = {0};
+        CHECK_TRUE(imu_mount_compose(mount, M), "a full mounting is accepted");
+        const float roll  = atan2f(M[5], M[8]) / d2r;
+        const float pitch = -asinf(M[2]) / d2r;
+        const float yaw   = atan2f(M[1], M[0]) / d2r;
+        CHECK_TRUE(fabsf(roll - 20.0f) < 1e-4f && fabsf(pitch + 15.0f) < 1e-4f &&
+                       fabsf(yaw - 170.0f) < 1e-4f,
+                   "and is the ZYX rotation of the stated angles");
+    }
+
+    /* An existing per-axis calibration is kept and the mounting applied on
+       top of it: composed(x) == R * (M0 * x). */
+    {
+        const float mount[3] = {2.0f, -3.0f, -9.0f};
+        const float M0[9]    = {1.01f, 0.002f, -0.001f, 0.003f, 0.99f, 0.0f, 0.0f, -0.002f, 1.02f};
+        const float x[3]     = {0.4f, -2.0f, 9.7f};
+        float       R[9]     = {0};
+        float       M[9];
+        float       a[3];
+        float       b[3];
+        float       out[3];
+        memcpy(M, M0, sizeof M);
+        CHECK_TRUE(imu_mount_compose(mount, R) && imu_mount_compose(mount, M),
+                   "a mounting on top of a calibration is accepted");
+        mat3_cm_mul_vec(M0, x, a);
+        mat3_cm_mul_vec(R, a, b);
+        mat3_cm_mul_vec(M, x, out);
+        CHECK_TRUE(fabsf(out[0] - b[0]) < 1e-5f && fabsf(out[1] - b[1]) < 1e-5f &&
+                       fabsf(out[2] - b[2]) < 1e-5f,
+                   "and is applied after the calibration, not before it");
+    }
+
+    /* A zero mounting is not set, and composing it changes nothing. */
+    {
+        const float zero[3] = {0.0f, 0.0f, 0.0f};
+        const float M0[9]   = {1.01f, 0.002f, -0.001f, 0.003f, 0.99f, 0.0f, 0.0f, -0.002f, 1.02f};
+        float       M[9];
+        int         i;
+        float       worst = 0.0f;
+        memcpy(M, M0, sizeof M);
+        CHECK_TRUE(!imu_mount_is_set(zero) && imu_mount_compose(zero, M),
+                   "a zero mounting is not set");
+        for (i = 0; i < 9; ++i)
+        {
+            if (fabsf(M[i] - M0[i]) > worst) worst = fabsf(M[i] - M0[i]);
+        }
+        CHECK_TRUE(worst < 1e-7f, "and composing it is a no-op");
+    }
+
+    /* Non-finite angles are refused and leave M untouched. */
+    {
+        const float bad[3] = {0.0f, NAN, 0.0f};
+        float       M[9]   = {2.0f, 0.0f, 0.0f, 0.0f, 2.0f, 0.0f, 0.0f, 0.0f, 2.0f};
+        CHECK_TRUE(!imu_mount_compose(bad, M), "a non-finite mounting is refused");
+        CHECK_TRUE(fabsf(M[0] - 2.0f) < 1e-9f && fabsf(M[1]) < 1e-9f,
+                   "and leaves the matrix untouched");
+    }
+}
+
 /* ------------------------------------------------------------------------- */
 
 int main(void)
 {
     scenario_block_sequence();
     scenario_malformed_list();
+    scenario_imu_mount();
     printf("\n==== %d failures ====\n", fails);
     return fails == 0 ? 0 : 1;
 }

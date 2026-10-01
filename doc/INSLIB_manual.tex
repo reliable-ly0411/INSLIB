@@ -64,7 +64,7 @@
     free_inertial_start,
     lim_groves_pos_rms_factor,
     gyr_psd,acc_psd,gyr_bias_rw,acc_bias_rw,gyr_fixed_bias,acc_fixed_bias,
-    gyr_misalignment,acc_misalignment,zero_vel_stddev_mps,
+    gyr_misalignment,acc_misalignment,mount_rpy_deg,zero_vel_stddev_mps,
     zero_rot_stddev_deg,auto_zupt_static_gyr_deg,auto_zupt_static_acc_mps2,
     auto_zupt_max_vel_mps,
     auto_zupt_max_vel_stddev_mps,auto_zupt_static_gyr_stddev_deg,
@@ -89,6 +89,7 @@
     pos_init_stddev_m,vel_init_stddev_mps,rpy_init_stddev_rad_deg,
     yaw_init_stddev_rad_deg,acc_bias_init_stddev_mps2,gyr_bias_init_stddev_rps_deg,
     roll_deg,pitch_deg,rpy_stddev_deg,yaw_deg,yaw_stddev_deg,
+    heading,baseline_frd,require_fixed,stddev_scale,stddev_min_deg,
     enable,stddev_ut,min_delay_ms,wmm_year,estimate_bias,bias_init_ut,bias_rw_ut_sqrts,
     fixed_bias,misalignment,stddev_m,acc_bias_rw,
     h_process_noise,acc_bias_init_mps2,acc_noise_mps2_sqrthz,gyr_noise_psd,acc_noise_mps2,
@@ -125,7 +126,7 @@
        \large Software Documentation and Mathematical Models\\[1cm]
        \includegraphics[width=0.33\textwidth]{figures/inslib_logo.pdf}
 }
-\newcommand{\inslibversion}{1.1.0}
+\newcommand{\inslibversion}{1.1.1}
 \author{Jan Zwiener \\ \texttt{jan@zwiener.org}}
 \date{Version \inslibversion\\[2mm] \today}
 
@@ -138,8 +139,8 @@ INSLIB is a portable C-only (C11) library for 3D navigation state estimation.
 Its core is a 15-state (optionally 18-state) error-state Kalman filter
 fusing inertial measurements with (delayed) GNSS position/velocity,
 barometer, magnetometer, local position references, absolute yaw
-references, scalar ground speed and zero-velocity / zero-rotation
-information. Around it the library provides two standalone attitude filters
+references, scalar ground speed, ranges to known anchors and
+zero-velocity / zero-rotation information. Around it the library provides two standalone attitude filters
 (ARS/AHRS), a baro/accelerometer vertical channel filter
 (\code{baro\_\allowbreak{}alt}), a local-height-to-ellipsoid offset filter, a World
 Magnetic Model (WMM) lookup and a wrapper (\code{nav\_\allowbreak{}suite}) that runs all
@@ -320,7 +321,7 @@ All measurements of one epoch are collected in a single
   \item \textbf{Measurement fusion} in fixed order: magnetometer,
         absolute yaw, zero-velocity, zero-rotation, local position,
         GNSS position/velocity, barometric height, absolute speed,
-        GNSS course-over-ground yaw.
+        ranges to known anchors, GNSS course-over-ground yaw.
   \item \textbf{History snapshot} into a ring buffer (for delayed
         measurements, \S\ref{sec:delayed}) and \textbf{health check}.
 \end{enumerate}
@@ -1205,6 +1206,85 @@ rather than taken as its magnitude. Latency is the norm on this input -- a
 Bluetooth OBD-II round trip is tens of milliseconds -- and is handled by the
 same history anchoring GNSS uses (\S\ref{sec:delayed}).
 
+\subsubsection{Ranges to known anchors}
+\label{sec:range}
+
+A range measurement is the distance between the platform's
+ranging antenna and an anchor at a known position. Up to
+\code{INS\_\allowbreak{}RANGE\_\allowbreak{}MAX} entries per epoch go into
+\code{ins\_\allowbreak{}measurements\_\allowbreak{}t.range[]}, each with the
+anchor position in ECEF (\code{double}), the measured range, its $1\sigma$, its
+own delay and an anchor id for diagnostics. One lever arm
+(\code{range\_\allowbreak{}leverarm\_\allowbreak{}b}) applies to all entries.
+Each entry is one scalar row:
+\begin{equation}
+  h(\vect{x}) = \left\lVert \vect{a}^\eframe - \vect{p}^\eframe_{\text{ant}} \right\rVert ,
+  \qquad
+  z_r = h(\vect{x}_{\text{tov}}) - z_{\text{meas}} ,
+  \qquad
+  \mat{H}_r =
+  \begin{bmatrix}
+    -\vect{u}\T & \mat{0} & \vect{u}\T \cross{\vect{l}^\nframe} & \mat{0} & \mat{0}
+  \end{bmatrix},
+\end{equation}
+with $\vect{u}$ the unit line-of-sight vector from the antenna to the anchor in
+the n-frame and $\vect{l}^\nframe$ the lever arm. $\mat{H}_r$ is the
+local-position Jacobian projected onto $-\vect{u}$, so the lever arm couples the
+range into the attitude.
+
+The fusion is split in two layers. A geometry layer turns an entry into
+$\vect{u}$, $z_r$ and a variance, and a fusion kernel only sees those three.
+
+\paragraph{Geometry without per-epoch trigonometry.} The filter's absolute
+position is geodetic, the anchors are ECEF. Converting every epoch would cost
+double precision trigonometry, which is slow on single-precision embedded
+targets. The antenna position is therefore formed from a cached reference
+point (geodetic position, its exact ECEF position, its NED-to-ECEF rotation)
+plus the n-frame offset from it, i.e.\ with double additions only. The
+reference is recomputed exactly once the position moves farther than
+\code{INS\_\allowbreak{}RANGE\_\allowbreak{}REF\_\allowbreak{}RADIUS\_\allowbreak{}M}
+from it. The error of the approximation is about $s^2/R_\oplus$ at a distance
+$s$ from the reference, millimetres inside the radius. The range is rotation
+invariant, so the reference's rotation instead of the current one only tilts
+$\vect{u}$ by $s/R_\oplus$. The anchor minus antenna difference is formed in
+double, only the result goes to single precision, which resolves terrestrial
+anchors to millimetres. Satellite distances will need the norm in double as
+well, together with the pseudorange geometry layer.
+
+\paragraph{Barometric height.} While the filter runs on the barometric height
+source (\S\ref{sec:baro-height-meas}), ranges correct North/East only by default: the
+Down component of $\vect{u}$ is removed from $\mat{H}_r$ and the height
+uncertainty is considered instead of corrected:
+\begin{equation}
+  R = \sigma_{\text{meas}}^2 + u_D^2\, P_{DD} .
+\end{equation}
+Zeroing the Down column alone would leave a height error in $z_r$ and leak it
+into North/East. The barometric datum and the anchors' ellipsoid heights
+disagree, and a multipath-lengthened range over a steep line of sight would
+push a height the barometer determines better. GNSS position fusion is
+restricted to the horizontal under barometric height for the same reason.
+\code{opt.range\_\allowbreak{}height\_\allowbreak{}with\_\allowbreak{}baro}
+switches the height correction back on, for installations whose anchors sit
+well above and below the platform. Without the barometric height source ranges
+always correct all three axes.
+
+\paragraph{Scope and coasting.} Ranges are fused on a live filter only. They
+neither initialize nor re-acquire it. Whether an epoch's ranges count as
+position aiding for the coasting window (Figure~\ref{fig:modes}), like a GNSS fix,
+is decided by the covariance after the fusion: they count if the horizontal
+position $1\sigma$ in its worst direction, the square root of the larger
+eigenvalue of the North/East block, stays at or below
+\code{opt.range\_\allowbreak{}aiding\_\allowbreak{}max\_\allowbreak{}hpos\_\allowbreak{}stddev\_\allowbreak{}m}.
+A single range bounds the position along its line of sight only, so one anchor
+keeps the filter alive only until the across-track uncertainty has grown past
+the limit, while anchors with a usable geometry keep it ready through a GNSS
+outage and also keep it from the GNSS quality-loss exit.
+\code{nav\_\allowbreak{}suite} stays in FULL mode as long as they count. The
+criterion is only as good as the stated range $1\sigma$: multipath is a
+positive bias, and too small a $1\sigma$ keeps the filter ready on a biased
+solution. The anchors are absolute, so a \code{nav\_\allowbreak{}suite}
+local-frame offset does not apply to them.
+
 \subsubsection{Position decimation against an unknown correlation}
 \label{sec:gnss-pos-decimation}
 
@@ -1256,6 +1336,7 @@ NED) is the caller's responsibility. Outliers are \emph{skipped}, not
 downweighted (\S\ref{sec:robust}).
 
 \subsubsection{Absolute yaw}
+\label{sec:ins-yaw}
 
 A heading reference (dual-antenna GNSS, mocap pose, gyro compass) is
 fused as a scalar residual on the yaw component of the attitude error:
@@ -1270,6 +1351,29 @@ fused as a scalar residual on the yaw component of the attitude error:
 since to first order a heading residual equals the yaw component of the
 n-frame attitude error. Fusion is skipped near gimbal lock
 ($|\sin\theta| > 0.99$), where yaw is ill-defined.
+
+\paragraph{Dual-antenna heading.} A moving base receiver pair (u-blox
+NAV-RELPOSNED \code{relPosHeading}) measures the azimuth $h$ of the vector
+between its two antennas, not the vehicle yaw. With that baseline
+$\vect{b}^b$ fixed in the body frame, the level-frame baseline
+$\vect{c} = \mat{R}_y(\theta)\,\mat{R}_x(\phi)\,\vect{b}^b$ has azimuth
+$\psi + \operatorname{atan2}(c_y, c_x)$, so
+\begin{equation}
+  \psi_{\text{meas}} = \operatorname{wrap}_{\pm\pi}\!\left(
+    h - \operatorname{atan2}(c_y, c_x)\right)
+\end{equation}
+is exact for any mounting and tilt
+(\code{ins\_\allowbreak{}yaw\_\allowbreak{}from\_\allowbreak{}baseline\_\allowbreak{}heading()},
+REQ-NAV-087). For a baseline along the body $x$ axis $c_y = 0$ and the
+azimuth is the yaw at any roll and pitch. Any other mounting couples the
+attitude in: a baseline across the vehicle reads 3.6\,deg off at 20\,deg
+roll and 10\,deg pitch if fed as yaw directly. The function refuses a
+baseline whose horizontal projection is shorter than a tenth of its
+length, where antenna phase noise dominates the azimuth. The firmware
+glue and both replay harnesses call it with the attitude the suite holds
+at the time, level while it holds none, and pass the receiver's heading
+delay as \code{yaw\_\allowbreak{}delay\_\allowbreak{}ms}. With no
+magnetometer and no motion this is also what gives auto-init its yaw.
 
 \paragraph{Automotive mode (course-over-ground yaw).} Opt-in
 (\code{automotive\_\allowbreak{}mode}), this reuses the same scalar update with
@@ -1483,7 +1587,16 @@ point:
   \item \textbf{Position/velocity} from the fix; with a local-position
         fix the caller's geodetic anchor is kept as origin and the fix sets
         \code{pos\_\allowbreak{}local}, so subsequent local measurements stay
-        consistent.
+        consistent. A GNSS fix locates the antenna: the origin is the fix,
+        and the IMU starts at
+        $\code{pos\_\allowbreak{}local} = -\mathbf{R}_{b\to n}\,\mathbf{l}_b$, the
+        lever arm rotated with the attitude just determined. The initial
+        velocity is the fix's minus
+        $\mathbf{R}_{b\to n}(\boldsymbol{\omega}\times\mathbf{l}_b)$, the
+        antenna's own motion on a turning platform. With the yaw still
+        unknown only the vertical components are applied, since a
+        horizontal arm rotated by an arbitrary yaw can land further off
+        than not moving it at all.
   \item \textbf{Height source} is latched once here, for a GNSS bootstrap only,
         from whether a barometer is \emph{streaming} at this instant: the most
         recent plausible sample cached during the collecting window must exist
@@ -1735,7 +1848,13 @@ The \emph{first usable fix re-acquires} instead of fusing. The re-acquisition:
         through the same datum-referenced conversion the fusion uses.
         The barometer knows where the platform is. The raw sample
         carries no filter lag of its own, and its single-sample accuracy
-        becomes the vertical variance.
+        becomes the vertical variance. A GNSS fix is moved from the antenna
+        to the IMU first: position by $\mathbf{R}_{b\to n}\,\mathbf{l}_b$,
+        velocity by $\mathbf{R}_{b\to n}(\boldsymbol{\omega}\times\mathbf{l}_b)$
+        with this epoch's gyro rate (the frozen filter computed none during
+        the outage), rotated with the attitude the filter will hold after an
+        attitude hint is applied. Without a heading in that hint the yaw is
+        unknown (next item), and only the vertical components are applied.
   \item \emph{Keeps attitude and IMU biases} -- frozen, unchanged since
         the window expired, and re-leveling would need a static phase a
         vehicle does not have at a tunnel exit
@@ -2283,6 +2402,13 @@ A scalar random-walk Kalman filter estimates
   o = h_{\text{GNSS,ellipsoid}} - h_{\text{local}},
 \end{equation}
 the ellipsoid height of the datum origin (\S\ref{sec:heightsystems}).
+Both heights refer to the IMU point: the fix reports the antenna, so the
+suite first moves it by the down component of the GNSS lever arm, rotated
+with its best available attitude,
+$h_{\text{GNSS,ellipsoid}} = h_{\text{antenna}} + (\mathbf{R}_{b\to n}\,\mathbf{l}_b)_D$.
+Without that, $o$ would absorb the lever arm and the absolute height would
+jump by it whenever \code{nav\_\allowbreak{}suite\_\allowbreak{}get\_\allowbreak{}height\_\allowbreak{}ellipsoid}
+switches between ins and $h_{\text{local}} + o$.
 The filter is deliberately \emph{agnostic} to where the local height
 comes from: with the barometric source $o$ lumps the weather-dependent
 pressure offset, the geoid undulation and the ISA model error, with an
@@ -2652,7 +2778,7 @@ one place, the detailed context is in the sections above.
 
 A dataset directory carries the neutral CSV streams
 (\code{imu.csv}, \code{ref.csv}, and optionally \code{gnss.csv}, \code{mag.csv},
-\code{baro.csv}, \code{speed.csv}, the column contract lives in
+\code{baro.csv}, \code{speed.csv}, \code{heading.csv}, the column contract lives in
 \code{datasets/replay\_\allowbreak{}format.py})
 plus one \code{config.yaml} that tells the harness \emph{how} to run the filter:
 aiding source, initialisation mode, the sensor noise model, sensor calibration
@@ -2729,6 +2855,7 @@ imu:                        # sensor noise model (REQUIRED) + calibration
   acc_fixed_bias: [0,0,0]                                        # [m/s^2]
   gyr_misalignment: [1,0,0, 0,1,0, 0,0,1]   # col-major 3x3 (0s->identity)
   acc_misalignment: [1,0,0, 0,1,0, 0,0,1]
+  mount_rpy_deg: [0, 0, 0]  # board attitude in the vehicle frame [deg]
   # extra process-noise margin on top of the acc/gyro-driven pos/vel/rpy
   # noise above, 0 -> default. The rpy default assumes a NON-RIGID mount,
   # where attitude model error dwarfs the gyro's random walk; a rigid mount
@@ -2986,6 +3113,15 @@ speed:
   stddev_rel: 0.0           # speed-proportional 1-sigma, 0 -> default
   min_speed_mps: 0.0        # skip below this FILTERED speed, 0 -> default
   delay_ms: 0               # how old a sample is at its timestamp
+# Dual-antenna GNSS heading from heading.csv (moving base NAV-RELPOSNED).
+# The 1-sigma is a per-row column, these keys only scale and floor it.
+heading:
+  enable: 0                 # Process heading.csv
+  baseline_frd: [1, 0, 0]   # base -> rover antenna, body FRD, any length
+  require_fixed: 1          # 1 -> only carrier-phase fixed rows
+  stddev_scale: 0.0         # multiplies the row's 1-sigma, 0 -> 1.0
+  stddev_min_deg: 0.0       # floor after scaling, 0 -> none
+  delay_ms: 0               # how old a row is at its timestamp
 
 ahrs:                       # SHARED ARS/AHRS noise override (0 -> derived
                              # from imu: above), both sub-filters consume
@@ -3013,6 +3149,7 @@ inputs:                     # optional per-stream CSV filename overrides
   mag:  mag.csv
   baro: baro.csv
   speed: speed.csv
+  heading: heading.csv
 \end{lstlisting}
 
 \paragraph{Top level.}
@@ -3092,6 +3229,25 @@ inputs:                     # optional per-stream CSV filename overrides
     accelerometer, the gyroscope and the magnetometer alike. One placement
     gives roll and pitch; a second on a face that is not parallel to the
     first also gives the yaw, which gravity on its own can never observe.
+  \item[\code{mount\_\allowbreak{}rpy\_\allowbreak{}deg}] \emph{3-list, deg, default 0.} Attitude of
+    the sensor board's axes in the vehicle body frame (ZYX roll, pitch,
+    yaw, FRD), e.g. \code{[0, 0, -9]} for a board whose x axis points
+    9\,deg left of the vehicle's forward axis. The harnesses
+    (\code{tools/\allowbreak{}replay.c}, \code{tools/\allowbreak{}insrcv.c},
+    \code{python/\allowbreak{}replay.py}, \code{inspostgui.py}) premultiply the
+    rotation $R(\text{roll},\text{pitch},\text{yaw})$, which takes a board-frame
+    vector into the vehicle frame, onto the accelerometer, gyroscope and
+    magnetometer matrices, $M \leftarrow R\,M$, after the per-axis
+    calibration those already hold. The filter then works in vehicle axes:
+    lever arms, \code{heading: baseline\_\allowbreak{}frd} and every reported
+    attitude refer to the vehicle, not to the board. The configured
+    matrices themselves are left as written (REQ-VER-036).
+
+    A yaw mounting error can be read off a drive with a dual-antenna
+    heading: run once with \code{heading: enable: 0}, so the yaw comes from
+    GNSS velocity and accelerations and therefore follows the board's x
+    axis, and compare it against the heading of the same epochs while
+    driving straight. The median difference is the mounting yaw.
   \item[\code{pos\_\allowbreak{}pred\_\allowbreak{}stddev\_\allowbreak{}m\_\allowbreak{}sqrts}, \code{vel\_\allowbreak{}pred\_\allowbreak{}stddev\_\allowbreak{}mps\_\allowbreak{}sqrts},
     \code{rpy\_\allowbreak{}pred\_\allowbreak{}stddev\_\allowbreak{}rad\_\allowbreak{}sqrts}] \emph{m/$\sqrt{\mathrm s}$,
     m/s/$\sqrt{\mathrm s}$, rad/$\sqrt{\mathrm s}$} Extra process-noise margin added \emph{on top of} the
@@ -3352,6 +3508,36 @@ consume the same physical gyro/accelerometer.
     noise source.
 \end{description}
 
+\paragraph{\code{heading:} --- dual-antenna GNSS heading (optional, REQ-VER-035).}
+\begin{description}\setlength\itemsep{0pt}
+  \item[\code{heading: enable}] \emph{0/1, default 0.} Open
+    \code{heading.csv} and fuse its rows as absolute yaw
+    (\S\ref{sec:ins-yaw}), the newest row of each IMU interval. A missing
+    file is a hard error, as for \code{mag}/\code{baro}/\code{speed}.
+  \item[\code{heading: baseline\_\allowbreak{}frd}] \emph{3-list, default
+    $[1,0,0]$.} Direction from the moving base antenna to the rover
+    antenna in the body frame, any length. The file holds the azimuth of
+    that vector as measured, so a remounted antenna pair is a config
+    edit, not a reconversion.
+  \item[\code{heading: require\_\allowbreak{}fixed}] \emph{0/1, default 1.}
+    Skip rows whose carrier-phase solution is not fixed. A float baseline
+    can be decimetres off, which across a metre of antenna separation is
+    degrees of heading while the receiver's accuracy still claims less.
+  \item[\code{heading: stddev\_\allowbreak{}scale},
+    \code{heading: stddev\_\allowbreak{}min\_\allowbreak{}deg}]
+    \emph{default 0 $\to$ 1.0 / no floor.} The row's 1-sigma (the
+    receiver's \code{accHeading}) is multiplied by the scale and then
+    floored. The formal accuracy knows nothing about antenna phase-centre
+    variation or a flexing baseline, which is what the floor is for.
+  \item[\code{heading: delay\_\allowbreak{}ms}] \emph{ms, default 0.}
+    Age of a row at its timestamp, anchored in the state history like
+    \code{gnss: delay\_\allowbreak{}ms}. The converter stamps a heading
+    with the time of the NAV-PVT of the same epoch, so the GNSS delay is
+    the starting point.
+\end{description}
+Each harness prints how many rows were offered as yaw and how many were
+skipped as not fixed, for a bad 1-sigma, or by the baseline geometry.
+
 \paragraph{Non-holonomic lateral constraint (top level, optional).}
 \code{automotive\_\allowbreak{}lateral\_\allowbreak{}constraint} [0/1, default 0] fuses a synthetic
 measurement stating that a wheeled vehicle does not travel sideways: the
@@ -3370,7 +3556,12 @@ without a GNSS fusion.
 Used by the accuracy summary, the plots and the regression gates. \code{warmup\_\allowbreak{}sec}
 [s, default 60] delays scoring after the first fix, \code{ahrs} [0/1] also scores
 the attitude filters, \code{leverarm\_\allowbreak{}frd} [m] maps the filter position onto the
-ground-truth point, \code{min\_\allowbreak{}epochs} sets the minimum scored-epoch count. The
+ground-truth point (e.g.\ the antenna, when \code{ref.csv} is the receiver's own
+solution): the position error, the ellipsoid height error and every estimate the
+plots overlay on the reference (state history, North-East map, both altitude
+pages, where the barometer's curves move with it) refer to that point, so a
+lever arm is never reported as filter error (REQ-VER-037).
+\code{min\_\allowbreak{}epochs} sets the minimum scored-epoch count. The
 \code{lim\_\allowbreak*} keys are the per-dataset
 guard-rails that \code{make simulated}/\code{make datasets} trip on, they are
 tuned regression thresholds, not accuracy claims, and each one at 0 is simply
@@ -3610,7 +3801,11 @@ power to \emph{end} it.
 GNSS course and without a magnetometer nothing measures yaw, and at standstill
 a MEMS gyroscope cannot find north either, its bias being orders of magnitude
 above the earth rate. The dead-reckoned track therefore has a shape but no
-absolute direction, and the yaw variance grows to ``unknown''.
+absolute direction, and the yaw variance grows to ``unknown'' -- unless the
+operator states the start heading themselves via \code{init\_\allowbreak{}hint}
+(section~\ref{sec:configyaml}), e.g. a bench test with the unit facing a known
+direction, in which case that stated uncertainty is what the yaw variance
+starts from instead.
 Horizontal position drifts with nothing on board to correct it. The barometer
 holds the vertical channel and the ZUPTs hold velocity and the IMU biases
 whenever the platform stands still -- that is what makes such a run
@@ -3618,13 +3813,20 @@ informative, and it is also all of it.
 
 \medskip
 \noindent A typical configuration for an indoor inertial-sensor run, GNSS
-excluded outright:
+excluded outright (shipped as
+\code{doc/example\_\allowbreak{}conf/config\_\allowbreak{}local\_\allowbreak{}inertial.yaml},
+a starting point for a quick test of pure inertial navigation):
 
 \begin{lstlisting}[style=cfg]
+aiding: none                # replay only: no gnss.csv needed (insrcv
+                            # ignores the key, gnss: enable 0 below is
+                            # its counterpart there)
+
 chi2_disable: 1             # outlier rejection off: expected at a standstill
                             # bootstrap and during ZUPT-only coasting
 
-free_inertial_start:        # implemented by insrcv and both replay harnesses
+free_inertial_start:        # implemented by insrcv, both replay harnesses
+                            # and inspostgui
   enable: 1                 # implies: no DR budget, no GNSS-quality exit
   lat_deg: 49.0             # where the platform starts, as well as known
   lon_deg: 8.4
@@ -3633,10 +3835,16 @@ free_inertial_start:        # implemented by insrcv and both replay harnesses
                             # 3D entry gate (gnss: start_max_horizontal_
                             # pos_stddev_m), so keep it at or below it
 
+init_hint:                  # known start heading, e.g. a bench test with
+                            # the unit facing a defined/known direction
+  yaw_deg: 0.0
+  yaw_stddev_deg: 0.5       # 0 -> no hint (usual: stays unknown, see
+                            # above); >0 -> use it
+
 init_stddev:
   pos_init_stddev_m: 5.00
   vel_init_stddev_mps: 0.05
-  yaw_init_stddev_rad_deg: 0.1
+  yaw_init_stddev_rad_deg: 0.1  # unused while init_hint.yaw_stddev_deg > 0
 
 gnss:
   enable: 0                 # decode and publish, but aid nothing with it
@@ -3717,6 +3925,17 @@ aiding: none                # no gnss.csv, the declaration starts the filter
 init: auto                  # bootstrap from it, exactly as the live path does
 \end{lstlisting}
 
+The same trick works for a run that moves in between, as long as it returns to
+where -- and, if the mount does not turn freely, how -- it started:
+\code{datasets/inertial\_\allowbreak{}roundtrip} carries a hand-carried,
+160.7\,s pure-inertial recording whose \code{ref.csv} holds only the start and
+end pose, identical because the unit was placed back on the same physical
+mark. \code{score: warmup\_\allowbreak{}sec} is set to fall shortly before the
+end epoch's timestamp so the start row (the auto-init anchor) is excluded and
+only the end row is ever scored, turning the round-trip position AND yaw error
+into a tight regression gate with no ground truth needed for the 160\,s in
+between (REQ-VER-034).
+
 % ------------------------------------------------------------------------------
 \subsection{Dataset CSV streams}
 \label{sec:csvformat}
@@ -3729,8 +3948,8 @@ format (REQ-VER-003), written by the shared helpers in
 harnesses read the same bytes. Only \code{imu.csv} drives the filter,
 \code{ref.csv} is the independent ground truth (used for scoring, for
 \code{init: ref}, and to synthesise fixes under \code{aiding: ref}),
-\code{gnss.csv}, \code{mag.csv}, \code{baro.csv} and \code{speed.csv} are
-consumed only when the matching \code{aiding}/sensor option is on. The
+\code{gnss.csv}, \code{mag.csv}, \code{baro.csv}, \code{speed.csv} and
+\code{heading.csv} are consumed only when the matching \code{aiding}/sensor option is on. The
 first line of each file is a \code{\#} header, every column layout:
 
 \begin{lstlisting}[basicstyle=\ttfamily\footnotesize,columns=fixed,keepspaces=true]
@@ -3757,6 +3976,12 @@ first line of each file is a \code{\#} header, every column layout:
 # speed.csv  (optional, speed: enable) -- any further columns are the
 #            producer's own record, both harnesses read the first two
   t_us, speed_mps
+
+# heading.csv (optional, heading: enable) -- baseline azimuth, NOT yet
+#            the yaw, carr_soln 0 none / 1 float / 2 fixed. Same t_us as
+#            the gnss.csv fix of the same epoch. Both harnesses read the
+#            first four columns, the rest is the producer's record
+  t_us, heading_deg, stddev_deg, carr_soln, length_m, itow_ms
 \end{lstlisting}
 
 \noindent Conventions shared by all streams:

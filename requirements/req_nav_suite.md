@@ -142,7 +142,7 @@ origin already is the datum and needs no reading to find it.
 
 - **Status:** verified
 - **Parent:** REQ-SYS-012
-- **Verification:** Test: tests/test_baro.c:scenario_height_strategy; Test: tests/test_baro.c:scenario_height_ellipsoid_baro_drift; Test: tests/test_baro.c:scenario_height_ellipsoid_no_baro; Test: tests/test_baro.c:scenario_datum_baro_then_lighthouse
+- **Verification:** Test: tests/test_baro.c:scenario_height_strategy; Test: tests/test_baro.c:scenario_height_ellipsoid_baro_drift; Test: tests/test_baro.c:scenario_height_ellipsoid_no_baro; Test: tests/test_baro.c:scenario_datum_baro_then_lighthouse; Test: tests/test_baro.c:scenario_height_ellipsoid_leverarm
 
 The wrapper shall define a local height reference: the height above
 the NED origin from the source that survives a GNSS outage -- baro_alt
@@ -158,7 +158,14 @@ GNSS ellipsoid height from the fix, vertical standard deviation from
 its NED covariance (pairs without a positive vertical variance are
 skipped), and the local height reference -- extrapolated to the GNSS
 time of validity with the estimated climb rate when the measurement is
-delayed (gnss_delay_ms).
+delayed (gnss_delay_ms). The fix's height shall first be moved from the
+antenna to the IMU point, the point both ins and a barometer on the
+sensor board report, by the down component of the measurement's GNSS
+lever arm rotated with the suite's best available attitude
+(nav_suite_get_rpy, level while there is none; only roll and pitch
+enter). A non-finite lever arm counts as zero. Otherwise the offset
+absorbs the lever arm, and nav_suite_get_height_ellipsoid() jumps by it
+whenever it switches between ins and the reference plus offset.
 
 The wrapper shall provide nav_suite_get_height() (height above the NED
 origin from the best source: ins under fresh position aiding, else
@@ -664,3 +671,18 @@ offset filter did not repeat it. With the fix stated geodetically there is
 no conversion on the epoch path at all: both consumers read the same
 number out of the measurement, and the accessor that carried it between
 them (ins_get_gnss_fix_llh) is gone with it.
+
+## REQ-SUITE-025 — Range measurements pass through the wrapper
+
+- **Status:** verified
+- **Parent:** REQ-NAV-082
+- **Verification:** Test: tests/test_baro.c:scenario_suite_range_passthrough
+
+nav_suite_update() shall hand the range entries of ins_measurements_t
+(REQ-NAV-082) to ins unchanged, including when the wrapper substitutes
+a datum-shifted copy of the measurement (REQ-SUITE-013). Anchors are
+absolute ECEF positions and the ins absolute position stays on the fix
+when the wrapper moves the local origin (REQ-SUITE-007), so no datum
+correction applies to them. Ranges that count as position aiding
+(REQ-NAV-085) keep the suite in FULL mode (REQ-SUITE-005) through a
+GNSS outage.

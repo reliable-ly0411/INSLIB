@@ -108,11 +108,13 @@ only the report.
 ## inspostgui — post-processing GUI
 
 `inspostgui.py` is an interactive front end over the same machinery:
-pick a dataset (any `config.yaml` under `datasets/` is auto-discovered),
-view/edit/create its config in a form (unknown keys like the `score:
+open a dataset's config YAML (every YAML of a dataset directory under
+`datasets/` is auto-discovered, several configs can sit next to the same
+CSVs), view/edit/create it in a form (unknown keys like the `score:
 lim_*` regression gates are preserved on save), replay it in-process
-with a live 3D trajectory view (speed-colored trail, ground-truth
-overlay, attitude model, fly mode) and evaluate: error plots with the
+with a live 3D trajectory view (speed-colored trail, switchable
+ground-truth and GNSS fix overlays, the previous run as a ghost trail
+to judge a config change, attitude model) and evaluate: error plots with the
 filter's own 1-sigma band, the replay.py accuracy/data-quality summary,
 multi-page PDF export (ins_plots) and KML export (ins_kml).
 
@@ -121,6 +123,8 @@ pip install -r python/requirements-inspostgui.txt
 make pylib
 python3 python/inspostgui.py                                  # or:
 python3 python/inspostgui.py datasets/simulated/profile_1_car
+python3 python/inspostgui.py datasets/fog/config_pyahrs.yaml
+python3 python/inspostgui.py --theme light                    # dark/light, also in the toolbar
 python3 python/inspostgui.py --batch datasets/simulated/profile_1_car  # headless smoke test
 ```
 

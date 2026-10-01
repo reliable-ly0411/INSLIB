@@ -2070,6 +2070,160 @@ static void scenario_autoinit_gnss(void)
     CHECK_NEAR(v[2], 0.0f, 1e-4, "autoinit velocity D");
 }
 
+/* Bootstrap on a fix taken at an antenna 2 m behind, 0.5 m right of and
+ * 1.3 m above the IMU (REQ-NAV-015). With a known yaw the IMU must start at
+ * its own position, with the yaw unknown only the height can be corrected
+ * and the horizontal start stays at the antenna. */
+static void run_autoinit_gnss_leverarm(bool yaw_known)
+{
+    ins_t f;
+    memset(&f, 0, sizeof(f));
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    ins_options_t opt;
+    fill_default_opt(&opt);
+    opt.auto_init = true;
+    if (ins_init(&f, &init, &opt) != 0)
+    {
+        printf("init failed\n");
+        fails++;
+        return;
+    }
+
+    const float roll_true  = 5.0f * (float)M_PI / 180.0f;
+    const float pitch_true = -3.0f * (float)M_PI / 180.0f;
+    const float yaw_true   = 60.0f * (float)M_PI / 180.0f;
+    const float la_b[3]    = {-2.0f, 0.5f, -1.3f};
+    float       q_true[4], R_true[9], la_n[3];
+    ins_quat_from_rpy(roll_true, pitch_true, yaw_true, q_true);
+    ins_quat_to_rotmat(q_true, R_true);
+    int i;
+    for (i = 0; i < 3; ++i)
+    {
+        la_n[i] = R_true[i] * la_b[0] + R_true[i + 3] * la_b[1] + R_true[i + 6] * la_b[2];
+    }
+
+    /* The IMU sits at the init position, the antenna at IMU + R * la_b. */
+    double imu_llh[3], ant_llh[3], dllh[3];
+    ins_ecef_to_latlonh(init_ecef(&init), &imu_llh[0], &imu_llh[1], &imu_llh[2]);
+    ins_dned_to_dlatlonh(la_n, imu_llh[0], imu_llh[2], dllh);
+    for (i = 0; i < 3; ++i) { ant_llh[i] = imu_llh[i] + dllh[i]; }
+
+    float g_vec[3];
+    ins_gravity_ned((float)imu_llh[0], (float)imu_llh[2], g_vec);
+    float acc_body[3];
+    for (i = 0; i < 3; ++i)
+    {
+        acc_body[i] = -(R_true[i * 3 + 0] * g_vec[0] + R_true[i * 3 + 1] * g_vec[1] +
+                        R_true[i * 3 + 2] * g_vec[2]);
+    }
+    const float gyr_body[3] = {0.0f, 0.0f, 0.0f};
+
+    const float        dt = 0.01f;
+    ins_time_us_t      t  = 0;
+    ins_measurements_t m;
+    int                step;
+    for (step = 1; step <= 20; ++step)
+    {
+        t += us_from_sec(dt);
+        memset(&m, 0, sizeof(m));
+        m.timestamp = t;
+        set_imu(&m, acc_body, gyr_body, dt);
+        ins_update(&f, &m);
+    }
+    /* The bootstrap epoch turns (pitch and yaw rate) with the IMU itself at
+       rest: the antenna moves at R * (omega x la), which the start velocity
+       must not inherit. The gyro reads the rate plus the configured bias. */
+    const float w_true[3] = {0.0f, 2.0f * (float)M_PI / 180.0f, 5.0f * (float)M_PI / 180.0f};
+    float       gyr_turn[3], wxla_b[3], v_ant[3];
+    for (i = 0; i < 3; ++i) { gyr_turn[i] = w_true[i] + init.gyr_bias_init_rps[i]; }
+    wxla_b[0] = w_true[1] * la_b[2] - w_true[2] * la_b[1];
+    wxla_b[1] = w_true[2] * la_b[0] - w_true[0] * la_b[2];
+    wxla_b[2] = w_true[0] * la_b[1] - w_true[1] * la_b[0];
+    for (i = 0; i < 3; ++i)
+    {
+        v_ant[i] = R_true[i] * wxla_b[0] + R_true[i + 3] * wxla_b[1] + R_true[i + 6] * wxla_b[2];
+    }
+
+    t += us_from_sec(dt);
+    memset(&m, 0, sizeof(m));
+    m.timestamp = t;
+    set_imu(&m, acc_body, gyr_turn, dt);
+    m.gnss_pos.llh[0]     = ant_llh[0];
+    m.gnss_pos.llh[1]     = ant_llh[1];
+    m.gnss_pos.llh[2]     = ant_llh[2];
+    m.gnss_pos.Qll_ned[0] = 1.0f;
+    m.gnss_pos.Qll_ned[4] = 1.0f;
+    m.gnss_pos.Qll_ned[8] = 1.0f;
+    m.gnss_pos.is_valid   = true;
+    for (i = 0; i < 3; ++i) { m.gnss_vel.vel_ned[i] = v_ant[i]; }
+    m.gnss_vel.Qll_ned[0] = 0.01f;
+    m.gnss_vel.Qll_ned[4] = 0.01f;
+    m.gnss_vel.Qll_ned[8] = 0.01f;
+    m.gnss_vel.is_valid   = true;
+    m.gnss_leverarm_b[0]  = la_b[0];
+    m.gnss_leverarm_b[1]  = la_b[1];
+    m.gnss_leverarm_b[2]  = la_b[2];
+    if (yaw_known)
+    {
+        m.yaw.is_valid   = true;
+        m.yaw.yaw_rad    = yaw_true;
+        m.yaw.stddev_rad = 0.01f;
+    }
+    ins_update(&f, &m);
+    if (!f.is_initialized)
+    {
+        printf("  FAIL  filter did not bootstrap on the fix\n");
+        fails++;
+        return;
+    }
+
+    /* Where the filter put the IMU, in NED metres from the true IMU. */
+    double llh[3], d_llh[3];
+    float  err_ned[3];
+    ins_get_latlonh(&f, llh);
+    for (i = 0; i < 3; ++i) { d_llh[i] = llh[i] - imu_llh[i]; }
+    ins_dlatlonh_to_dned(d_llh, imu_llh[0], imu_llh[2], err_ned);
+    const double err_h = sqrt((double)(err_ned[0] * err_ned[0] + err_ned[1] * err_ned[1]));
+    float        v[3];
+    CHECK_TRUE(ins_get_velocity_ned(&f, v), "leverarm bootstrap: velocity available");
+
+    if (yaw_known)
+    {
+        /* The IMU is at rest: all of the antenna's velocity is lever arm. */
+        CHECK_NEAR(v[0], 0.0f, 1e-4, "leverarm bootstrap, yaw known: vel N at the IMU");
+        CHECK_NEAR(v[1], 0.0f, 1e-4, "leverarm bootstrap, yaw known: vel E at the IMU");
+        CHECK_NEAR(v[2], 0.0f, 1e-4, "leverarm bootstrap, yaw known: vel D at the IMU");
+        CHECK_NEAR(err_h, 0.0, 0.01, "leverarm bootstrap, yaw known: horizontal at the IMU");
+        CHECK_NEAR(err_ned[2], 0.0f, 0.01, "leverarm bootstrap, yaw known: height at the IMU");
+        /* The origin stays the fix, so the IMU starts off the local origin by
+           exactly the rotated lever arm. */
+        float pl[3];
+        CHECK_TRUE(ins_get_position_local(&f, pl), "leverarm bootstrap: local position available");
+        CHECK_NEAR(pl[0], -la_n[0], 0.01, "leverarm bootstrap: pos_local N = -lever arm");
+        CHECK_NEAR(pl[2], -la_n[2], 0.01, "leverarm bootstrap: pos_local D = -lever arm");
+    }
+    else
+    {
+        CHECK_NEAR(err_ned[2], 0.0f, 0.01, "leverarm bootstrap, yaw unknown: height at the IMU");
+        /* Horizontally still at the antenna, not turned by a made-up yaw. */
+        const double la_h = sqrt((double)(la_n[0] * la_n[0] + la_n[1] * la_n[1]));
+        CHECK_NEAR(err_h, la_h, 0.01,
+                   "leverarm bootstrap, yaw unknown: horizontal left at the fix");
+        /* Same split for the velocity: vertical corrected, horizontal kept. */
+        CHECK_NEAR(v[2], 0.0f, 1e-4, "leverarm bootstrap, yaw unknown: vel D at the IMU");
+        CHECK_NEAR(v[0], v_ant[0], 1e-4, "leverarm bootstrap, yaw unknown: vel N left at the fix");
+        CHECK_NEAR(v[1], v_ant[1], 1e-4, "leverarm bootstrap, yaw unknown: vel E left at the fix");
+    }
+}
+
+static void scenario_autoinit_gnss_leverarm(void)
+{
+    printf("\n=== Scenario 14b: auto-init from a fix at a lever arm ===\n");
+    run_autoinit_gnss_leverarm(true);
+    run_autoinit_gnss_leverarm(false);
+}
+
 static void scenario_autoinit_local_pos(void)
 {
     printf("\n=== Scenario 15: auto-init bootstraps from a local NED fix ===\n");
@@ -4949,6 +5103,724 @@ static void scenario_speed_aiding(void)
         speed_test_feed(&f, &t, speed_test_norm(&f) - 2.0f, 0.0f, 50);
         CHECK_TRUE(ins_get_diag(&f)->n_speed_used == 1, "delayed sample fused from the history");
     }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Range aiding to known anchors (REQ-NAV-082 .. REQ-NAV-084)                */
+/* -------------------------------------------------------------------------- */
+
+/* Exact ECEF of a point given as an n-frame offset from a geodetic origin.
+ * Anchors and truth are built this way so the test geometry does not share
+ * the filter's own reference-point approximation (REQ-NAV-083). */
+static void range_test_ecef(const double llh0[3], const float dned[3], double xyz[3])
+{
+    double dllh[3];
+    ins_dned_to_dlatlonh(dned, llh0[0], llh0[2], dllh);
+    ins_latlonh_to_ecef(llh0[0] + dllh[0], llh0[1] + dllh[1], llh0[2] + dllh[2], xyz);
+}
+
+static float range_test_dist(const double a[3], const double b[3])
+{
+    const double dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+    return (float)sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+/* Geodetic start position offset by dned from llh0. */
+static void range_test_offset_llh(const double llh0[3], const float dned[3], double llh[3])
+{
+    double dllh[3];
+    ins_dned_to_dlatlonh(dned, llh0[0], llh0[2], dllh);
+    llh[0] = llh0[0] + dllh[0];
+    llh[1] = llh0[1] + dllh[1];
+    llh[2] = llh0[2] + dllh[2];
+}
+
+/* Filter position error against a geodetic truth, in NED [m]. */
+static void range_test_err_ned(const ins_t* f, const double truth_llh[3], float err[3])
+{
+    double llh[3], dllh[3];
+    ins_get_latlonh(f, llh);
+    dllh[0] = llh[0] - truth_llh[0];
+    dllh[1] = llh[1] - truth_llh[1];
+    dllh[2] = llh[2] - truth_llh[2];
+    ins_dlatlonh_to_dned(dllh, truth_llh[0], truth_llh[2], err);
+}
+
+/* One 100 Hz epoch of level, unaccelerated IMU data plus whatever the
+ * caller put into *m (ranges, lever arm). */
+static void range_test_step(ins_t* f, ins_time_us_t* t_io, ins_measurements_t* m)
+{
+    float g_vec[3];
+    ins_gravity_ned((float)(48.783 * M_PI / 180.0), 300.0f, g_vec);
+    const float acc_body[3] = {0.0f, 0.0f, -g_vec[2]};
+    const float gyr_body[3] = {0.0f, 0.0f, 0.0f};
+    const float dt          = 0.01f;
+    *t_io += us_from_sec(dt);
+    m->timestamp = *t_io;
+    set_imu(m, acc_body, gyr_body, dt);
+    ins_update(f, m);
+}
+
+/* Manual-init a filter from init/opt and run it 2 s in level cruise at the
+ * init velocity so it is live. */
+static bool range_test_start(ins_t* f, ins_time_us_t* t_io, const ins_init_t* init,
+                             const ins_options_t* opt)
+{
+    memset(f, 0, sizeof(*f));
+    if (ins_init(f, init, opt) != 0) { return false; }
+    int step;
+    for (step = 0; step < 200; ++step)
+    {
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        range_test_step(f, t_io, &m);
+    }
+    return f->is_initialized;
+}
+
+/* Fill range entry k with the exact distance from the antenna to the anchor. */
+static void range_test_set(ins_measurements_t* m, int k, const double anchor[3],
+                           const double antenna[3], float stddev_m, uint16_t id)
+{
+    m->range[k].anchor_ecef[0] = anchor[0];
+    m->range[k].anchor_ecef[1] = anchor[1];
+    m->range[k].anchor_ecef[2] = anchor[2];
+    m->range[k].range_m        = range_test_dist(anchor, antenna);
+    m->range[k].stddev_m       = stddev_m;
+    m->range[k].anchor_id      = id;
+    m->range[k].is_valid       = true;
+}
+
+static void scenario_range_aiding(void)
+{
+    printf("\n=== Scenario: range aiding to known anchors (REQ-NAV-082) ===\n");
+
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    const double truth[3] = {init.llh[0], init.llh[1], init.llh[2]};
+    double       truth_ecef[3];
+    ins_latlonh_to_ecef(truth[0], truth[1], truth[2], truth_ecef);
+
+    static const float anchors_ned[4][3] = {{500.0f, 0.0f, -10.0f},
+                                            {0.0f, 500.0f, 5.0f},
+                                            {-500.0f, 0.0f, -20.0f},
+                                            {0.0f, -500.0f, 0.0f}};
+    double             anchors[4][3];
+    int                k, step;
+    for (k = 0; k < 4; ++k) { range_test_ecef(truth, anchors_ned[k], anchors[k]); }
+
+    /* --- four anchors around the platform pull a 36 m start error in --- */
+    {
+        ins_options_t opt;
+        fill_default_opt(&opt);
+        ins_init_t  init2        = init;
+        const float start_err[3] = {30.0f, -20.0f, 0.0f};
+        range_test_offset_llh(truth, start_err, init2.llh);
+        init2.pos_init_stddev_m = 50.0f;
+
+        ins_t         f;
+        ins_time_us_t t = 0;
+        if (!range_test_start(&f, &t, &init2, &opt))
+        {
+            printf("  FAIL  filter did not start\n");
+            fails++;
+            return;
+        }
+        float err[3];
+        range_test_err_ned(&f, truth, err);
+        CHECK_TRUE(sqrtf(err[0] * err[0] + err[1] * err[1]) > 30.0f, "start error present");
+
+        for (step = 0; step < 1000; ++step)
+        {
+            ins_measurements_t m;
+            memset(&m, 0, sizeof(m));
+            if (step % 10 == 0)
+            {
+                for (k = 0; k < 4; ++k)
+                {
+                    range_test_set(&m, k, anchors[k], truth_ecef, 1.0f, (uint16_t)(k + 1));
+                }
+            }
+            range_test_step(&f, &t, &m);
+        }
+        range_test_err_ned(&f, truth, err);
+        CHECK_NEAR(err[0], 0.0, 1.0, "north error after 10 s of ranging");
+        CHECK_NEAR(err[1], 0.0, 1.0, "east error after 10 s of ranging");
+        CHECK_TRUE(ins_get_diag(&f)->n_range_seen == 400, "all range entries seen");
+        CHECK_TRUE(ins_get_diag(&f)->n_range_used == 400, "all range entries fused");
+        CHECK_TRUE(ins_get_diag(&f)->last_range_anchor_id == 4, "last fused anchor id kept");
+        CHECK_NEAR(ins_get_diag(&f)->last_range_residual_m, 0.0, 0.5,
+                   "residual small once converged");
+
+        /* --- a multipath-lengthened range is skipped, not fused --- */
+        float err_before[3], err_after[3];
+        range_test_err_ned(&f, truth, err_before);
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        range_test_set(&m, 0, anchors[0], truth_ecef, 1.0f, 1);
+        m.range[0].range_m += 200.0f;
+        range_test_step(&f, &t, &m);
+        range_test_err_ned(&f, truth, err_after);
+        CHECK_TRUE(ins_get_diag(&f)->n_range_rejected == 1, "outlier counted as rejected");
+        CHECK_TRUE(ins_get_diag(&f)->n_range_used == 400, "outlier not fused");
+        CHECK_NEAR(err_after[0], err_before[0], 0.01, "outlier leaves the position alone");
+    }
+
+    /* --- a single anchor only corrects along its line of sight --- */
+    {
+        ins_options_t opt;
+        fill_default_opt(&opt);
+        ins_init_t  init2        = init;
+        const float start_err[3] = {30.0f, 30.0f, 0.0f};
+        range_test_offset_llh(truth, start_err, init2.llh);
+        init2.pos_init_stddev_m = 50.0f;
+
+        ins_t         f;
+        ins_time_us_t t = 0;
+        if (!range_test_start(&f, &t, &init2, &opt)) { return; }
+        for (step = 0; step < 1000; ++step)
+        {
+            ins_measurements_t m;
+            memset(&m, 0, sizeof(m));
+            if (step % 10 == 0) { range_test_set(&m, 0, anchors[0], truth_ecef, 1.0f, 1); }
+            range_test_step(&f, &t, &m);
+        }
+        float err[3];
+        range_test_err_ned(&f, truth, err);
+        CHECK_NEAR(err[0], 0.0, 3.0, "one anchor due north: north error removed");
+        CHECK_TRUE(err[1] > 20.0f, "one anchor due north: east error untouched");
+    }
+}
+
+static void scenario_range_leverarm_attitude(void)
+{
+    printf("\n=== Scenario: range lever arm and attitude coupling (REQ-NAV-082) ===\n");
+
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    const double truth[3] = {init.llh[0], init.llh[1], init.llh[2]};
+
+    /* --- the lever arm is applied: the exact antenna range leaves no
+           residual, although it differs from the body range by metres --- */
+    {
+        ins_options_t opt;
+        fill_default_opt(&opt);
+        ins_t         f;
+        ins_time_us_t t = 0;
+        if (!range_test_start(&f, &t, &init, &opt)) { return; }
+
+        const float la_b[3]     = {2.0f, 1.0f, -0.5f}; /* level, yaw 0: la_n = la_b */
+        const float anchor_n[3] = {200.0f, 220.0f, -3.0f};
+        const float body_n[3]   = {0.0f, 0.0f, 0.0f};
+        double      anchor[3], antenna[3], body[3];
+        range_test_ecef(truth, anchor_n, anchor);
+        range_test_ecef(truth, la_b, antenna);
+        range_test_ecef(truth, body_n, body);
+        CHECK_TRUE(fabsf(range_test_dist(anchor, antenna) - range_test_dist(anchor, body)) > 1.0f,
+                   "lever arm changes the range by more than 1 m");
+
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        vec3_assign(m.range_leverarm_b, la_b);
+        range_test_set(&m, 0, anchor, antenna, 1.0f, 7);
+        range_test_step(&f, &t, &m);
+        CHECK_TRUE(ins_get_diag(&f)->n_range_used == 1, "antenna range fused");
+        CHECK_NEAR(ins_get_diag(&f)->last_range_residual_m, 0.0, 0.02,
+                   "antenna range predicted through the lever arm");
+    }
+
+    /* --- a yaw error swings a long lever arm sideways, and the range to an
+           anchor abeam pulls the yaw back (attitude columns of H) --- */
+    {
+        ins_options_t opt;
+        fill_default_opt(&opt);
+        ins_init_t init2                = init;
+        init2.rpy_init_rad[2]           = (float)(10.0 * M_PI / 180.0);
+        init2.rpy_init_stddev_rad[2]    = (float)(20.0 * M_PI / 180.0);
+        init2.pos_init_stddev_m         = 0.05f;
+        init2.vel_init_stddev_mps       = 0.01f;
+        init2.acc_bias_init_stddev_mps2 = 0.001f;
+
+        ins_t         f;
+        ins_time_us_t t = 0;
+        if (!range_test_start(&f, &t, &init2, &opt)) { return; }
+
+        const float la_b[3]   = {5.0f, 0.0f, 0.0f};
+        const float east_n[3] = {0.0f, 50.0f, 0.0f};
+        const float nrth_n[3] = {60.0f, 0.0f, 0.0f};
+        double      a_east[3], a_north[3], antenna[3];
+        range_test_ecef(truth, east_n, a_east);
+        range_test_ecef(truth, nrth_n, a_north);
+        range_test_ecef(truth, la_b, antenna); /* true yaw 0: antenna due north */
+
+        float roll, pitch, yaw0, yaw1;
+        ins_get_rpy(&f, &roll, &pitch, &yaw0);
+        int step;
+        for (step = 0; step < 200; ++step)
+        {
+            ins_measurements_t m;
+            memset(&m, 0, sizeof(m));
+            vec3_assign(m.range_leverarm_b, la_b);
+            if (step % 10 == 0)
+            {
+                range_test_set(&m, 0, a_east, antenna, 0.1f, 1);
+                range_test_set(&m, 1, a_north, antenna, 0.1f, 2);
+            }
+            range_test_step(&f, &t, &m);
+        }
+        ins_get_rpy(&f, &roll, &pitch, &yaw1);
+        CHECK_NEAR(yaw0, 10.0 * M_PI / 180.0, 0.01, "yaw error present before ranging");
+        CHECK_NEAR(yaw1, 0.0, 3.0 * M_PI / 180.0, "yaw pulled back through the lever arm");
+    }
+}
+
+static void scenario_range_delay(void)
+{
+    printf("\n=== Scenario: delayed range anchored in the history (REQ-NAV-082) ===\n");
+
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    init.vel_ned[0]          = 20.0f; /* straight towards an anchor due north */
+    const double start[3]    = {init.llh[0], init.llh[1], init.llh[2]};
+    const float  anchor_n[3] = {400.0f, 0.0f, 0.0f};
+    double       anchor[3];
+    range_test_ecef(start, anchor_n, anchor);
+
+    int delay_case;
+    for (delay_case = 0; delay_case < 3; ++delay_case)
+    {
+        ins_options_t opt;
+        fill_default_opt(&opt);
+        opt.auto_zupt_disable = true; /* noiseless cruise reads as standstill */
+        ins_t         f;
+        ins_time_us_t t = 0;
+        if (!range_test_start(&f, &t, &init, &opt)) { return; }
+
+        /* The filter's own track is the truth here (noiseless IMU). */
+        double track[21][3];
+        int    step;
+        for (step = 0; step < 21; ++step)
+        {
+            ins_measurements_t m;
+            memset(&m, 0, sizeof(m));
+            range_test_step(&f, &t, &m);
+            ins_get_latlonh(&f, track[step]);
+        }
+        /* A range valid 200 ms before the epoch it is delivered on. */
+        double old_ecef[3];
+        ins_latlonh_to_ecef(track[0][0], track[0][1], track[0][2], old_ecef);
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        range_test_set(&m, 0, anchor, old_ecef, 5.0f, 1);
+        m.range[0].delay_ms = (delay_case == 0)   ? 200
+                              : (delay_case == 1) ? 0
+                                                  : INS_MAX_DELAY_MS + 1;
+        range_test_step(&f, &t, &m);
+
+        const ins_diag_t* d = ins_get_diag(&f);
+        if (delay_case == 0)
+        {
+            CHECK_TRUE(d->n_range_used == 1, "delayed range fused");
+            CHECK_NEAR(d->last_range_residual_m, 0.0, 0.3,
+                       "delayed range predicted from the historical state");
+        }
+        else if (delay_case == 1)
+        {
+            CHECK_TRUE(d->n_range_used == 1, "same range without delay fused");
+            CHECK_TRUE(d->last_range_residual_m < -3.5f,
+                       "without the delay the 4 m travelled show up in the residual");
+        }
+        else
+        {
+            CHECK_TRUE(d->n_range_used == 0, "over-aged range not fused");
+            CHECK_TRUE(d->n_range_skipped == 1, "over-aged range counted as skipped");
+        }
+    }
+}
+
+static void scenario_range_reference_point(void)
+{
+    printf("\n=== Scenario: range geometry via cached reference point (REQ-NAV-083) ===\n");
+
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    init.vel_ned[0]          = 21.0f;
+    init.vel_ned[1]          = 21.0f; /* ~30 m/s diagonal: latitude and longitude both move */
+    const double start[3]    = {init.llh[0], init.llh[1], init.llh[2]};
+    const float  anchor_n[3] = {1000.0f, 1100.0f, -30.0f};
+    double       anchor[3];
+    range_test_ecef(start, anchor_n, anchor);
+
+    ins_options_t opt;
+    fill_default_opt(&opt);
+    opt.auto_zupt_disable = true;
+    ins_t         f;
+    ins_time_us_t t = 0;
+    if (!range_test_start(&f, &t, &init, &opt)) { return; }
+    const uint32_t ref0 = ins_get_diag(&f)->n_range_ref_updates;
+
+    /* 100 s, ~3 km. A huge stddev keeps the correction negligible, so the
+       filter's own predicted range (residual + reported range) can be
+       compared with the exact one at the position it holds afterwards. */
+    float max_err = 0.0f;
+    int   n_cmp   = 0;
+    int   step;
+    for (step = 0; step < 10000; ++step)
+    {
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        double llh[3], p_ecef[3];
+        if (step % 10 == 0)
+        {
+            ins_get_latlonh(&f, llh);
+            ins_latlonh_to_ecef(llh[0], llh[1], llh[2], p_ecef);
+            range_test_set(&m, 0, anchor, p_ecef, 1.0e4f, 1);
+        }
+        range_test_step(&f, &t, &m);
+        if (step % 10 == 0)
+        {
+            ins_get_latlonh(&f, llh);
+            ins_latlonh_to_ecef(llh[0], llh[1], llh[2], p_ecef);
+            const float pred  = ins_get_diag(&f)->last_range_residual_m + m.range[0].range_m;
+            const float exact = range_test_dist(anchor, p_ecef);
+            const float e     = fabsf(pred - exact);
+            if (e > max_err) { max_err = e; }
+            n_cmp++;
+        }
+    }
+    const uint32_t n_ref = ins_get_diag(&f)->n_range_ref_updates - ref0;
+    printf("  info  max |predicted - exact| range over %d epochs: %.4f m, %u reference updates\n",
+           n_cmp, (double)max_err, (unsigned int)n_ref);
+    CHECK_TRUE(ins_get_diag(&f)->n_range_used == (uint32_t)n_cmp, "every range fused");
+    CHECK_TRUE(max_err < 0.005f, "predicted range within 5 mm of the exact geometry");
+    CHECK_TRUE(n_ref >= 25 && n_ref <= 35,
+               "reference recomputed about once per INS_RANGE_REF_RADIUS_M travelled");
+}
+
+static void scenario_range_baro_height(void)
+{
+    printf("\n=== Scenario: ranges and the barometric height source (REQ-NAV-082) ===\n");
+
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    float g_vec[3];
+    ins_gravity_ned((float)init.llh[0], (float)init.llh[2], g_vec);
+    const float acc_body[3] = {0.0f, 0.0f, -g_vec[2]};
+    const float gyr_body[3] = {0.0f, 0.0f, 0.0f};
+
+    /* Truth 1.5 m below where the filter starts. Two anchors fore and aft,
+       40 m below the platform: steep lines of sight (u_D = 0.8) whose North
+       components cancel, so only the height can explain the residuals. */
+    const double truth[3] = {init.llh[0], init.llh[1], init.llh[2] - 1.5};
+    double       truth_ecef[3], a_fore[3], a_aft[3];
+    ins_latlonh_to_ecef(truth[0], truth[1], truth[2], truth_ecef);
+    const float fore_n[3] = {30.0f, 0.0f, 40.0f};
+    const float aft_n[3]  = {-30.0f, 0.0f, 40.0f};
+    range_test_ecef(truth, fore_n, a_fore);
+    range_test_ecef(truth, aft_n, a_aft);
+
+    int mode;
+    for (mode = 0; mode < 3; ++mode)
+    {
+        /* 0: no barometer, 1: barometric height (default), 2: barometric
+           height with opt.range_height_with_baro */
+        ins_options_t opt;
+        fill_default_opt(&opt);
+        opt.range_height_with_baro = (mode == 2);
+        ins_t         f;
+        ins_time_us_t t = 0;
+        if (mode == 0)
+        {
+            ins_init_t init2        = init;
+            init2.pos_init_stddev_m = 1.0f;
+            if (!range_test_start(&f, &t, &init2, &opt)) { return; }
+            CHECK_TRUE(!f.height_from_baro, "no barometer: GNSS-style height source");
+        }
+        else
+        {
+            opt.auto_init = true;
+            memset(&f, 0, sizeof(f));
+            CHECK_TRUE(ins_init(&f, &init, &opt) == 0, "init ok");
+            baro_height_bootstrap(&f, &init, &t, acc_body, gyr_body, 0.01f, true, false);
+            CHECK_TRUE(f.is_initialized && f.height_from_baro, "barometric height source");
+        }
+
+        float err0[3], err1[3];
+        range_test_err_ned(&f, truth, err0);
+        int step;
+        for (step = 0; step < 200; ++step)
+        {
+            ins_measurements_t m;
+            memset(&m, 0, sizeof(m));
+            if (step % 10 == 0)
+            {
+                range_test_set(&m, 0, a_fore, truth_ecef, 0.5f, 1);
+                range_test_set(&m, 1, a_aft, truth_ecef, 0.5f, 2);
+            }
+            range_test_step(&f, &t, &m);
+        }
+        range_test_err_ned(&f, truth, err1);
+        printf("  info  mode %d: height error %.4f -> %.4f m\n", mode, (double)err0[2],
+               (double)err1[2]);
+        CHECK_TRUE(ins_get_diag(&f)->n_range_used == 40, "ranges fused");
+        if (mode == 1)
+        {
+            CHECK_NEAR(err1[2], err0[2], 1e-3, "barometric height: ranges leave the height alone");
+        }
+        else { CHECK_TRUE(fabsf(err1[2]) < 0.3f * fabsf(err0[2]), "ranges correct the height"); }
+    }
+}
+
+/* Auto-init a filter on one GNSS fix at the init position: with a limited
+ * coasting window a prescribed-value start needs a fix anyway, and ranges
+ * cannot provide one (REQ-NAV-086). */
+static bool range_test_bootstrap(ins_t* f, ins_time_us_t* t_io, const ins_init_t* init,
+                                 ins_options_t* opt)
+{
+    float g_vec[3];
+    ins_gravity_ned((float)init->llh[0], (float)init->llh[2], g_vec);
+    const float acc_body[3] = {0.0f, 0.0f, -g_vec[2]};
+    const float gyr_body[3] = {0.0f, 0.0f, 0.0f};
+    opt->auto_init          = true;
+    memset(f, 0, sizeof(*f));
+    if (ins_init(f, init, opt) != 0) { return false; }
+    baro_height_bootstrap(f, init, t_io, acc_body, gyr_body, 0.01f, false, false);
+    return f->is_initialized;
+}
+
+static void scenario_range_coasting(void)
+{
+    printf("\n=== Scenario: ranges as position aiding for coasting (REQ-NAV-085) ===\n");
+
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    const double truth[3] = {init.llh[0], init.llh[1], init.llh[2]};
+    double       truth_ecef[3];
+    ins_latlonh_to_ecef(truth[0], truth[1], truth[2], truth_ecef);
+    static const float anchors_ned[4][3] = {{500.0f, 0.0f, -10.0f},
+                                            {0.0f, 500.0f, 5.0f},
+                                            {-500.0f, 0.0f, -20.0f},
+                                            {0.0f, -500.0f, 0.0f}};
+    double             anchors[4][3];
+    int                k, step;
+    for (k = 0; k < 4; ++k) { range_test_ecef(truth, anchors_ned[k], anchors[k]); }
+
+    /* --- four anchors keep a filter with a 3 s coasting window ready for
+           30 s without any GNSS --- */
+    {
+        ins_options_t opt;
+        fill_default_opt(&opt);
+        opt.allow_unlimited_deadreckoning = false;
+        opt.max_deadreckoning_sec         = 3.0f;
+        opt.auto_zupt_disable             = true; /* no ZUPT bounding the drift */
+        ins_t         f;
+        ins_time_us_t t = 0;
+        if (!range_test_bootstrap(&f, &t, &init, &opt))
+        {
+            printf("  FAIL  filter did not start\n");
+            fails++;
+            return;
+        }
+        bool ready_throughout = true;
+        for (step = 0; step < 3000; ++step)
+        {
+            ins_measurements_t m;
+            memset(&m, 0, sizeof(m));
+            if (step % 10 == 0)
+            {
+                for (k = 0; k < 4; ++k)
+                {
+                    range_test_set(&m, k, anchors[k], truth_ecef, 1.0f, (uint16_t)(k + 1));
+                }
+            }
+            range_test_step(&f, &t, &m);
+            /* past the readiness warm-up (INS_MIN_RUNTIME_UNTIL_READY_MS) */
+            if (step >= 200 && !ins_is_ready(&f)) { ready_throughout = false; }
+        }
+        CHECK_TRUE(ready_throughout, "four anchors: ready through 30 s without GNSS");
+        CHECK_TRUE(ins_deadreckoning_ms(&f) < 200, "four anchors: coasting clock kept short");
+        CHECK_TRUE(ins_get_diag(&f)->n_range_pos_aiding == 300,
+                   "four anchors: every ranging epoch counted as position aiding");
+    }
+
+    /* --- one anchor bounds one direction only: the ranges count until the
+           across-track uncertainty passes the limit, then the window expires --- */
+    {
+        ins_options_t opt;
+        fill_default_opt(&opt);
+        opt.allow_unlimited_deadreckoning  = false;
+        opt.max_deadreckoning_sec          = 3.0f;
+        opt.auto_zupt_disable              = true;
+        opt.range_aiding_max_hpos_stddev_m = 3.0f;
+        ins_init_t init2                   = init;
+        init2.pos_init_stddev_m            = 1.0f;
+        ins_t         f;
+        ins_time_us_t t = 0;
+        if (!range_test_bootstrap(&f, &t, &init2, &opt))
+        {
+            printf("  FAIL  filter did not start\n");
+            fails++;
+            return;
+        }
+        bool was_ready = false;
+        for (step = 0; step < 6000; ++step)
+        {
+            ins_measurements_t m;
+            memset(&m, 0, sizeof(m));
+            if (step % 10 == 0) { range_test_set(&m, 0, anchors[0], truth_ecef, 1.0f, 1); }
+            range_test_step(&f, &t, &m);
+            if (step == 200) { was_ready = ins_is_ready(&f); }
+        }
+        const ins_diag_t* d = ins_get_diag(&f);
+        printf("  info  one anchor: %u of %u ranging epochs counted\n",
+               (unsigned int)d->n_range_pos_aiding, (unsigned int)d->n_range_used);
+        CHECK_TRUE(was_ready, "one anchor: ready while the uncertainty is small");
+        CHECK_TRUE(d->n_range_pos_aiding > 0, "one anchor: counted at first");
+        CHECK_TRUE(d->n_range_pos_aiding < d->n_range_used, "one anchor: stops counting");
+        CHECK_TRUE(!ins_is_ready(&f), "one anchor: coasting window expires in the end");
+    }
+
+    /* --- bad GNSS fixes would take the filter out of the 3D solution
+           (REQ-NAV-052), counting ranges keep it in --- */
+    {
+        int with_ranges;
+        for (with_ranges = 0; with_ranges < 2; ++with_ranges)
+        {
+            ins_options_t opt;
+            fill_default_opt(&opt);
+            ins_t         f;
+            ins_time_us_t t = 0;
+            if (!range_test_bootstrap(&f, &t, &init, &opt))
+            {
+                printf("  FAIL  filter did not start\n");
+                fails++;
+                return;
+            }
+
+            for (step = 0; step < 1500; ++step)
+            {
+                ins_measurements_t m;
+                memset(&m, 0, sizeof(m));
+                if (step % 10 == 0)
+                {
+                    /* a fix far too poor for the 3D solution */
+                    m.gnss_pos.llh[0]     = truth[0];
+                    m.gnss_pos.llh[1]     = truth[1];
+                    m.gnss_pos.llh[2]     = truth[2];
+                    m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 30.0f * 30.0f;
+                    m.gnss_pos.Qll_ned[8]                         = 30.0f * 30.0f;
+                    m.gnss_pos.is_valid                           = true;
+                    if (with_ranges)
+                    {
+                        for (k = 0; k < 4; ++k)
+                        {
+                            range_test_set(&m, k, anchors[k], truth_ecef, 1.0f, (uint16_t)(k + 1));
+                        }
+                    }
+                }
+                range_test_step(&f, &t, &m);
+            }
+            if (with_ranges)
+            {
+                CHECK_TRUE(ins_get_diag(&f)->n_gnss_quality_exit == 0,
+                           "counting ranges: no GNSS quality exit");
+                CHECK_TRUE(ins_is_ready(&f), "counting ranges: still ready");
+            }
+            else
+            {
+                CHECK_TRUE(ins_get_diag(&f)->n_gnss_quality_exit == 1,
+                           "without ranges: GNSS quality exit taken");
+            }
+        }
+    }
+}
+
+static void scenario_range_input_validation(void)
+{
+    printf("\n=== Scenario: range input validation and gates (REQ-NAV-084) ===\n");
+
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    const double truth[3] = {init.llh[0], init.llh[1], init.llh[2]};
+    double       truth_ecef[3], anchor[3];
+    ins_latlonh_to_ecef(truth[0], truth[1], truth[2], truth_ecef);
+    const float anchor_n[3] = {200.0f, 0.0f, 0.0f};
+    range_test_ecef(truth, anchor_n, anchor);
+
+    ins_options_t opt;
+    fill_default_opt(&opt);
+    ins_t         f;
+    ins_time_us_t t = 0;
+    if (!range_test_start(&f, &t, &init, &opt)) { return; }
+
+    /* --- each malformed entry is dropped at the boundary --- */
+    int bad;
+    for (bad = 0; bad < 5; ++bad)
+    {
+        const uint32_t     inv0 = ins_get_diag(&f)->n_invalid_input;
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        range_test_set(&m, 0, anchor, truth_ecef, 1.0f, 1);
+        switch (bad)
+        {
+        case 0: m.range[0].anchor_ecef[1] = NAN; break;
+        case 1: m.range[0].range_m = NAN; break;
+        case 2: m.range[0].range_m = -1.0f; break;
+        case 3: m.range[0].stddev_m = 0.0f; break;
+        default: m.range[0].stddev_m = INFINITY; break;
+        }
+        range_test_step(&f, &t, &m);
+        CHECK_TRUE(ins_get_diag(&f)->n_invalid_input == inv0 + 1,
+                   "malformed range counted invalid");
+    }
+    CHECK_TRUE(ins_get_diag(&f)->n_range_seen == 0, "malformed ranges never seen");
+
+    /* --- a non-finite lever arm is zeroed, the range itself still fuses --- */
+    {
+        const uint32_t     inv0 = ins_get_diag(&f)->n_invalid_input;
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        range_test_set(&m, 0, anchor, truth_ecef, 1.0f, 1);
+        m.range_leverarm_b[0] = NAN;
+        range_test_step(&f, &t, &m);
+        CHECK_TRUE(ins_get_diag(&f)->n_invalid_input == inv0 + 1, "NaN lever arm counted invalid");
+        CHECK_TRUE(ins_get_diag(&f)->n_range_used == 1, "range fused with zeroed lever arm");
+    }
+
+    /* --- an anchor on top of the antenna has no line of sight --- */
+    {
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        range_test_set(&m, 0, truth_ecef, truth_ecef, 1.0f, 2);
+        range_test_step(&f, &t, &m);
+        CHECK_TRUE(ins_get_diag(&f)->n_range_skipped == 1, "range at the anchor skipped");
+    }
+
+    /* --- chi2 gate, and its global override (REQ-NAV-035) --- */
+    {
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        range_test_set(&m, 0, anchor, truth_ecef, 1.0f, 1);
+        m.range[0].range_m += 200.0f;
+        range_test_step(&f, &t, &m);
+        CHECK_TRUE(ins_get_diag(&f)->n_range_rejected == 1, "outlier rejected by the chi2 gate");
+
+        ins_options_t opt2 = opt;
+        opt2.chi2_disable  = true;
+        ins_t         g;
+        ins_time_us_t tg = 0;
+        if (!range_test_start(&g, &tg, &init, &opt2)) { return; }
+        memset(&m, 0, sizeof(m));
+        range_test_set(&m, 0, anchor, truth_ecef, 1.0f, 1);
+        m.range[0].range_m += 200.0f;
+        range_test_step(&g, &tg, &m);
+        CHECK_TRUE(ins_get_diag(&g)->n_range_used == 1, "chi2_disable: outlier fused");
+        CHECK_TRUE(ins_get_diag(&g)->n_range_rejected == 0, "chi2_disable: nothing rejected");
+    }
+
+    const ins_diag_t* d = ins_get_diag(&f);
+    CHECK_TRUE(d->n_range_seen == d->n_range_used + d->n_range_rejected + d->n_range_skipped,
+               "every seen range ends in exactly one outcome");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -7936,6 +8808,123 @@ static void scenario_deadreckoning_reacquire(void)
         CHECK_TRUE(ins_is_ready(&f2), "unlimited deadreckoning: ready without aiding");
     }
 #undef RUN_EPOCHS
+}
+
+/* REQ-NAV-023: the re-anchoring fix comes from an antenna 20 m behind and 5 m
+ * above the IMU (a ship's mast) while the platform pitches and yaws. Position
+ * and velocity must land on the IMU: fully with a heading from an attitude
+ * hint, only vertically without one (REQ-NAV-059 resets the yaw to unknown),
+ * and with this epoch's gyro rate, not the one frozen with the filter. */
+static void run_reacquire_leverarm_velocity(bool with_hint)
+{
+    ins_t f;
+    memset(&f, 0, sizeof(f));
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    ins_options_t opt;
+    fill_default_opt(&opt);
+    opt.allow_unlimited_deadreckoning = false; /* 10 s default window */
+    if (ins_init(&f, &init, &opt) != 0)
+    {
+        printf("init failed\n");
+        fails++;
+        return;
+    }
+
+    float g_vec[3];
+    ins_gravity_ned((float)f.latlonh[0], (float)f.latlonh[2], g_vec);
+    const float        acc_body[3]  = {0.0f, 0.0f, -g_vec[2]};
+    const float        gyr_still[3] = {0.0f, 0.0f, 0.0f};
+    const float        la_b[3]      = {-20.0f, 0.0f, -5.0f};
+    const float        dt           = 0.01f;
+    ins_time_us_t      t            = 0;
+    ins_measurements_t m;
+    int                i, k;
+
+    /* Level, heading north: the antenna sits at IMU + la_b in NED. */
+    double llh0[3], dllh[3];
+    ins_ecef_to_latlonh(init_ecef(&init), &llh0[0], &llh0[1], &llh0[2]);
+    double      ant_home[3], ant_exit[3];
+    const float d_home[3] = {la_b[0], la_b[1], la_b[2]};
+    const float d_exit[3] = {50.0f + la_b[0], la_b[1], la_b[2]};
+    ins_dned_to_dlatlonh(d_home, llh0[0], llh0[2], dllh);
+    for (k = 0; k < 3; ++k) { ant_home[k] = llh0[k] + dllh[k]; }
+    ins_dned_to_dlatlonh(d_exit, llh0[0], llh0[2], dllh);
+    for (k = 0; k < 3; ++k) { ant_exit[k] = llh0[k] + dllh[k]; }
+
+    /* 3 s aided at home, then a 12 s outage expires the 10 s window. */
+    for (i = 0; i < 1500; ++i)
+    {
+        t += us_from_sec(dt);
+        memset(&m, 0, sizeof(m));
+        m.timestamp = t;
+        set_imu(&m, acc_body, gyr_still, dt);
+        if (i < 300 && i % 100 == 0)
+        {
+            m.gnss_pos.is_valid = true;
+            for (k = 0; k < 3; ++k) { m.gnss_pos.llh[k] = ant_home[k]; }
+            m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 0.25f;
+            m.gnss_pos.Qll_ned[8]                         = 1.0f;
+            for (k = 0; k < 3; ++k) { m.gnss_leverarm_b[k] = la_b[k]; }
+        }
+        ins_update(&f, &m);
+    }
+    CHECK_TRUE(!ins_is_ready(&f), "leverarm reacquire: window expired");
+
+    /* Exit fix: pitch and yaw rate, IMU itself at rest 50 m north. */
+    const float w_true[3] = {0.0f, 2.0f * (float)M_PI / 180.0f, 5.0f * (float)M_PI / 180.0f};
+    float       gyr_turn[3], v_ant[3];
+    for (k = 0; k < 3; ++k) { gyr_turn[k] = w_true[k] + f.state.gyr_bias[k]; }
+    v_ant[0] = w_true[1] * la_b[2] - w_true[2] * la_b[1];
+    v_ant[1] = w_true[2] * la_b[0] - w_true[0] * la_b[2];
+    v_ant[2] = w_true[0] * la_b[1] - w_true[1] * la_b[0];
+
+    t += us_from_sec(dt);
+    memset(&m, 0, sizeof(m));
+    m.timestamp = t;
+    set_imu(&m, acc_body, gyr_turn, dt);
+    m.gnss_pos.is_valid = true;
+    for (k = 0; k < 3; ++k) { m.gnss_pos.llh[k] = ant_exit[k]; }
+    m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 0.25f;
+    m.gnss_pos.Qll_ned[8]                         = 1.0f;
+    for (k = 0; k < 3; ++k) { m.gnss_vel.vel_ned[k] = v_ant[k]; }
+    m.gnss_vel.Qll_ned[0] = m.gnss_vel.Qll_ned[4] = m.gnss_vel.Qll_ned[8] = 0.01f;
+    m.gnss_vel.is_valid                                                   = true;
+    for (k = 0; k < 3; ++k) { m.gnss_leverarm_b[k] = la_b[k]; }
+    if (with_hint)
+    {
+        m.att_hint.is_valid         = true;
+        m.att_hint.stddev_roll_rad  = 0.01f;
+        m.att_hint.stddev_pitch_rad = 0.01f;
+        m.att_hint.stddev_yaw_rad   = 0.01f;
+    }
+    ins_update(&f, &m);
+    CHECK_TRUE(ins_get_diag(&f)->n_reacquire == 1, "leverarm reacquire: re-acquisition ran");
+
+    float pos[3], v[3];
+    ins_get_position_local(&f, pos);
+    ins_get_velocity_ned(&f, v);
+    CHECK_NEAR(pos[2], 0.0, 0.01, "leverarm reacquire: height at the IMU");
+    CHECK_NEAR(v[2], 0.0, 1e-4, "leverarm reacquire: vel D at the IMU");
+    if (with_hint)
+    {
+        CHECK_NEAR(pos[0], 50.0, 0.01, "leverarm reacquire, heading hinted: N at the IMU");
+        CHECK_NEAR(v[0], 0.0, 1e-4, "leverarm reacquire, heading hinted: vel N at the IMU");
+        CHECK_NEAR(v[1], 0.0, 1e-4, "leverarm reacquire, heading hinted: vel E at the IMU");
+    }
+    else
+    {
+        CHECK_NEAR(pos[0], 50.0 + la_b[0], 0.01,
+                   "leverarm reacquire, no heading: N left at the fix");
+        CHECK_NEAR(v[1], v_ant[1], 1e-4, "leverarm reacquire, no heading: vel E left at the fix");
+    }
+}
+
+static void scenario_reacquire_leverarm_velocity(void)
+{
+    printf("\n=== Scenario 29b: re-acquisition from a fix at a long lever arm ===\n");
+    run_reacquire_leverarm_velocity(true);
+    run_reacquire_leverarm_velocity(false);
 }
 
 /* REQ-NAV-022 (freeze): once the coasting window expires, ins_update() must
@@ -12917,6 +13906,7 @@ int main(void)
     scenario_yaw_aiding_guards();
     scenario_yaw_input_range();
     scenario_autoinit_gnss();
+    scenario_autoinit_gnss_leverarm();
     scenario_autoinit_local_pos();
     scenario_autoinit_mag_yaw();
     scenario_autoinit_mag_yaw_dip_zone();
@@ -12939,6 +13929,13 @@ int main(void)
     scenario_autoinit_att_hint();
     scenario_att_hint_gyr_bias_prior_cap();
     scenario_speed_aiding();
+    scenario_range_aiding();
+    scenario_range_leverarm_attitude();
+    scenario_range_delay();
+    scenario_range_reference_point();
+    scenario_range_baro_height();
+    scenario_range_input_validation();
+    scenario_range_coasting();
     scenario_accessors_and_lifecycle();
     scenario_time_jump_handling();
     scenario_time_jump_unlimited_dr_recovery();
@@ -12957,6 +13954,7 @@ int main(void)
     scenario_bias_prior_check();
     scenario_nan_inf_inputs();
     scenario_deadreckoning_reacquire();
+    scenario_reacquire_leverarm_velocity();
     scenario_deadreckoning_reacquire_far_from_origin();
     scenario_deadreckoning_freeze();
     scenario_coasting_window_still_fuses();

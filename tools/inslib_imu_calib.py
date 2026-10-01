@@ -558,8 +558,16 @@ class Recording:
         # the IMU's (cal.c). A node written against the wrong thermometer
         # is a node at the wrong temperature.
         self.mag_temp_c = []
+        # IMU die temperature per sample, NaN where the input carries
+        # none. For the calibration certificate, which plots it: the
+        # min/max below are all the solve itself needs.
+        self.temp_c = []
         self.temp_min = float("inf")
         self.temp_max = float("-inf")
+        # Samples with an axis at the end stop. Their values are the end
+        # of the range, not a measurement, so the count is a quality
+        # figure of the session.
+        self.n_saturated = 0
         # Samples the board had already corrected when they arrived. A
         # calibration solved over those is the residual of the one the
         # board holds, which is not what the caller believes it has, and
@@ -572,6 +580,9 @@ class Recording:
         self.gyr.append(s.gyr_rps)
         if s.cal_applied:
             self.n_cal_applied += 1
+        if s.saturated:
+            self.n_saturated += 1
+        self.temp_c.append(s.temp_c)
         if math.isfinite(s.temp_c):     # a CSV may not carry one
             self.temp_min = min(self.temp_min, s.temp_c)
             self.temp_max = max(self.temp_max, s.temp_c)
@@ -694,7 +705,8 @@ def load_csv_recording(imu_path, mag_path=None):
 
     imu.csv: t_us, gyr_frd_xyz [rad/s], acc_frd_xyz [m/s^2] and optionally
     imu_temp_c [degC] (datasets/replay_format.py). mag.csv: t_us,
-    mag_frd_xyz [uT], on the same clock as imu.csv, because the static
+    mag_frd_xyz [uT] and optionally mag_temp_c [degC], on the same clock
+    as imu.csv, because the static
     poses are matched to the magnetometer by time. The session has to be
     recorded the same way as a live one: the initial rest period first,
     then poses with rotations in between. Raises ValueError when the
@@ -715,8 +727,9 @@ def load_csv_recording(imu_path, mag_path=None):
                           gyr_rps=(v[0], v[1], v[2]), temp_c=temp, seq=0))
     if mag_path is not None:
         for t_us, v in _csv_rows(mag_path, 4):
+            temp = v[3] if len(v) > 3 and math.isfinite(v[3]) else float("nan")
             rec.add_mag(MagSample(t_us=t_us, mag_ut=(v[0], v[1], v[2]),
-                                  temp_c=float("nan")))
+                                  temp_c=temp))
     return rec
 
 

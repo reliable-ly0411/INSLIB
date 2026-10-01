@@ -27,7 +27,8 @@ int64 microsecond time, radians.
 """
 
 from ._core import (Config, State, Ins, ecef_to_llh, llh_to_ecef,
-                    rpy_to_quat, wmm_field_ned)
+                    rpy_to_quat, wmm_field_ned,
+                    yaw_from_baseline_heading)
 from .suite import Navigator, Solution
 from .telemetry import Telemetry
 from . import telemetry
@@ -35,6 +36,6 @@ from . import telemetry
 __all__ = [
     "Config", "State", "Ins", "Navigator", "Solution", "Telemetry",
     "telemetry", "ecef_to_llh", "llh_to_ecef", "rpy_to_quat",
-    "wmm_field_ned",
+    "wmm_field_ned", "yaw_from_baseline_heading",
 ]
 __version__ = "0.1.0"

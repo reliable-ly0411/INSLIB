@@ -31,6 +31,8 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 import numpy as np
 import pyqtgraph as pg
 
+import ins_gui_theme as theme
+
 EARTH_R = 6378137.0
 
 TILE_URL = "https://tile.openstreetmap.org/%d/%d/%d.png"
@@ -132,7 +134,8 @@ def _qimage_to_array(img):
 
 
 class MapView(QtWidgets.QWidget):
-    """A track and a ground-truth track over an optional OSM background.
+    """A track, a ground-truth track and the GNSS fixes over an optional
+    OSM background.
 
     Unlike the Track tab in tools/inslib_gui.py this is handed a whole
     replayed trajectory at once rather than growing one live, so there is
@@ -164,8 +167,16 @@ class MapView(QtWidgets.QWidget):
 
         bar = QtWidgets.QHBoxLayout()
         self.info = QtWidgets.QLabel("no track yet")
-        self.info.setStyleSheet("color: #8fa0b4;")
+
         bar.addWidget(self.info, 1)
+        self.show_ref = QtWidgets.QCheckBox("Truth")
+        self.show_ref.setChecked(True)
+        self.show_ref.toggled.connect(lambda on: self.c_ref.setVisible(on))
+        bar.addWidget(self.show_ref)
+        self.show_fix = QtWidgets.QCheckBox("GNSS fixes")
+        self.show_fix.setChecked(True)
+        self.show_fix.toggled.connect(lambda on: self.c_fix.setVisible(on))
+        bar.addWidget(self.show_fix)
         self.map_on = QtWidgets.QCheckBox("OpenStreetMap background")
         self.map_on.setToolTip(
             "Fetches map tiles from tile.openstreetmap.org for the area on "
@@ -182,15 +193,17 @@ class MapView(QtWidgets.QWidget):
         # underneath it would not line up either.
         self.plot.setAspectLocked(True)
         self.plot.addLegend(offset=(10, 10))
-        self.c_ref = self.plot.plot(
-            [], [], pen=pg.mkPen('#e8e8e8', width=1.5,
-                                 style=QtCore.Qt.PenStyle.DashLine),
-            name="truth")
-        self.c_est = self.plot.plot(
-            [], [], pen=pg.mkPen('#ff6a6a', width=2), name="estimate")
+        # The previous run's estimate, first so it draws behind.
+        self.c_ghost = self.plot.plot([], [], name="previous run")
+        self._ghost_wanted = True
+        self.c_ref = self.plot.plot([], [], name="truth")
+        # Dots, not a line: joining 1 Hz fixes draws chords nobody drove.
+        self.c_fix = self.plot.plot(
+            [], [], pen=None, symbol="o", symbolSize=4,
+            symbolPen=None, name="GNSS fixes")
+        self.c_est = self.plot.plot([], [], name="estimate")
         self.c_here = self.plot.plot(
-            [], [], pen=None, symbol="+", symbolSize=14,
-            symbolBrush='#ffb454', name="last")
+            [], [], pen=None, symbol="+", symbolSize=14, name="last")
         v.addWidget(self.plot, 1)
 
         # A zoom or a pan changes which tiles are on screen, and this is
@@ -209,8 +222,19 @@ class MapView(QtWidgets.QWidget):
             "Metres east and north of the first estimated position, on "
             "the Web Mercator sphere so map tiles align.")
         self.note.setWordWrap(True)
-        self.note.setStyleSheet("color: #8fa0b4; font-size: 11px;")
         v.addWidget(self.note)
+        theme.themed(self._restyle)
+
+    def _restyle(self):
+        self.info.setStyleSheet(theme.dim())
+        self.note.setStyleSheet(theme.dim() + " font-size: 11px;")
+        theme.style_plot(self.plot)
+        self.c_ref.setPen(theme.pen("ref", 1.5, theme.DASH))
+        self.c_ghost.setPen(theme.pen("ghost", 2))
+        self.c_fix.setSymbolBrush(theme.T["fix"])
+        self.c_est.setPen(theme.pen("map_est", 2))
+        self.c_here.setSymbolBrush(theme.T["map_here"])
+        self.c_here.setSymbolPen(theme.T["map_here"])
 
     # -- projection ----------------------------------------------------
 
@@ -240,7 +264,8 @@ class MapView(QtWidgets.QWidget):
         self.origin = None
         self.origin_merc = None
         self.scale = 1.0
-        for c in (self.c_est, self.c_ref, self.c_here):
+        for c in (self.c_est, self.c_ref, self.c_fix, self.c_here,
+                  self.c_ghost):
             c.setData([], [])
         # Every tile rect is measured against the origin, and the next
         # track sets a new one. Keeping the pictures would keep them
@@ -249,29 +274,45 @@ class MapView(QtWidgets.QWidget):
         self.images.clear()
         self.info.setText("no track yet")
 
-    def set_tracks(self, est_latlon, ref_latlon):
+    def set_ghost_visible(self, on):
+        self._ghost_wanted = on
+        self.c_ghost.setVisible(on)
+
+    def set_tracks(self, est_latlon, ref_latlon, fix_latlon=(),
+                   ghost_latlon=()):
         """Replace the view with a replayed trajectory.
 
-        est_latlon/ref_latlon: sequences of (lat_deg, lon_deg, ...) --
-        e.g. inspostgui.py's results["kml_est"]/["kml_ref"] rows, extra
-        columns (time, altitude, attitude) are ignored. Either may be
+        est_latlon/ref_latlon/fix_latlon/ghost_latlon: sequences of
+        (lat_deg, lon_deg, ...) -- e.g. inspostgui.py's results["kml_est"]/
+        ["kml_ref"] rows, extra columns (time, altitude, attitude) are
+        ignored. ghost_latlon is a previous run's estimate. Any may be
         empty. The origin is the first point of whichever is projected
-        first (est, if both are given).
+        first (est, then ref, then fix).
         """
         self.clear()
-        if not est_latlon and not ref_latlon:
+        if not est_latlon and not ref_latlon and not fix_latlon:
             return
-        est_xy = np.array([self._project(r[0], r[1]) for r in est_latlon]) \
-            if est_latlon else np.empty((0, 2))
-        ref_xy = np.array([self._project(r[0], r[1]) for r in ref_latlon]) \
-            if ref_latlon else np.empty((0, 2))
+
+        def project(rows):
+            return (np.array([self._project(r[0], r[1]) for r in rows])
+                    if rows else np.empty((0, 2)))
+        est_xy = project(est_latlon)
+        ref_xy = project(ref_latlon)
+        fix_xy = project(fix_latlon)
+        ghost_xy = project(ghost_latlon)
         if est_xy.size:
             self.c_est.setData(est_xy[:, 0], est_xy[:, 1])
             self.c_here.setData([est_xy[-1, 0]], [est_xy[-1, 1]])
         if ref_xy.size:
             self.c_ref.setData(ref_xy[:, 0], ref_xy[:, 1])
-        self.info.setText("estimate %d pts   truth %d pts"
-                          % (len(est_latlon), len(ref_latlon)))
+        if fix_xy.size:
+            self.c_fix.setData(fix_xy[:, 0], fix_xy[:, 1])
+        if ghost_xy.size:
+            self.c_ghost.setData(ghost_xy[:, 0], ghost_xy[:, 1])
+        self.c_ghost.setVisible(self._ghost_wanted and bool(ghost_xy.size))
+        self.info.setText("estimate %d pts   truth %d pts   GNSS %d fixes"
+                          % (len(est_latlon), len(ref_latlon),
+                             len(fix_latlon)))
         if self.map_on.isChecked():
             self._update_tiles()
 

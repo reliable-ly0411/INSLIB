@@ -21,6 +21,8 @@
  *   mag.csv      t_us, mag_frd_xyz [uT]          (optional)
  *   baro.csv     t_us, static pressure [Pa]      (optional)
  *   speed.csv    t_us, ground speed [m/s]        (optional)
+ *   heading.csv  t_us, baseline azimuth [deg], 1-sigma [deg], carr_soln
+ *                                                (optional)
  *
  * Usage: replay <config.yaml | datadir> [errdump.csv]
  *        (a datadir implies datadir/config.yaml, the errdump carries
@@ -37,6 +39,7 @@
 #include "geodetic_toolbox.h"
 #include "linalg.h"
 #include "mini_yaml.h"
+#include "imu_mount.h"
 
 /* All streams are loaded in full at their native rate. The per-stream buffers
  * grow on demand (realloc doubling). If the machine runs out of memory the
@@ -81,6 +84,7 @@ typedef struct
     char in_mag[256];
     char in_baro[256];
     char in_speed[256];
+    char in_heading[256];
 
     int   automotive_mode;               /* 0/1: yaw from GNSS course over ground (REQ-NAV-034) */
     float automotive_min_speed_mps;      /* 0 -> default */
@@ -122,6 +126,9 @@ typedef struct
     float gyr_misalignment[9]; /* gyro  3x3, col-major */
     float acc_fixed_bias[3];   /* [m/s^2] */
     float gyr_fixed_bias[3];   /* [rad/s] */
+    /* Board attitude in the vehicle frame [deg], composed onto the acc/gyr/
+       mag matrices after parsing (REQ-VER-036), all-0 -> none. */
+    float imu_mount_rpy_deg[3];
     /* Extra process-noise margin on top of the physically-derived acc/gyro
        noise (0 -> default, not zero!) */
     float pos_pred_stddev_m_sqrts;   /* [m/sqrt(s)] */
@@ -286,6 +293,17 @@ typedef struct
                                 skipped (0 -> default) */
     int   speed_delay_ms;    /* how old a sample is at its timestamp */
 
+    /* heading: dual-antenna GNSS heading (REQ-NAV-010), the azimuth of the
+       antenna baseline, turned into a yaw with the mounting below and the
+       current roll/pitch (REQ-NAV-087). Unlike speed the 1-sigma is a
+       per-row column, the config only scales and floors it. */
+    int   heading_enable;
+    float heading_baseline_frd[3]; /* base -> rover antenna, body FRD */
+    int   heading_require_fixed;   /* 1 -> carrSoln 2 only */
+    float heading_stddev_scale;    /* multiplies the row's 1-sigma (0 -> 1.0) */
+    float heading_stddev_min_deg;  /* floor after scaling (0 -> none) */
+    int   heading_delay_ms;        /* how old a row is at its timestamp */
+
     /* baro: */
     int   baro_enable;
     float baro_stddev_m;              /* 0 -> consumer default */
@@ -404,6 +422,7 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
     else if (!strcmp(full, "inputs.mag")) { snprintf(c->in_mag, sizeof(c->in_mag), "%s", val); }
     else if (!strcmp(full, "inputs.baro")) { snprintf(c->in_baro, sizeof(c->in_baro), "%s", val); }
     else if (!strcmp(full, "inputs.speed")) { snprintf(c->in_speed, sizeof(c->in_speed), "%s", val); }
+    else if (!strcmp(full, "inputs.heading")) { snprintf(c->in_heading, sizeof(c->in_heading), "%s", val); }
     else if (!strcmp(full, "automotive_mode")) { c->automotive_mode = (int)d; }
     else if (!strcmp(full, "automotive_min_speed_mps")) { c->automotive_min_speed_mps = (float)d; }
     else if (!strcmp(full, "automotive_lateral_constraint"))
@@ -442,6 +461,7 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
     else if (!strcmp(full, "imu.acc_bias_rw")) { c->acc_bias_rw = (float)d; }
     else if (!strcmp(full, "imu.acc_misalignment")) { if (mini_yaml_list(val, c->acc_misalignment, 9) != 0) return -2; }
     else if (!strcmp(full, "imu.gyr_misalignment")) { if (mini_yaml_list(val, c->gyr_misalignment, 9) != 0) return -2; }
+    else if (!strcmp(full, "imu.mount_rpy_deg")) { if (mini_yaml_list(val, c->imu_mount_rpy_deg, 3) != 0) return -2; }
     else if (!strcmp(full, "imu.acc_fixed_bias")) { if (mini_yaml_list(val, c->acc_fixed_bias, 3) != 0) return -2; }
     else if (!strcmp(full, "imu.gyr_fixed_bias")) { if (mini_yaml_list(val, c->gyr_fixed_bias, 3) != 0) return -2; }
     else if (!strcmp(full, "imu.pos_pred_stddev_m_sqrts"))
@@ -622,6 +642,12 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
     else if (!strcmp(full, "speed.stddev_rel")) { c->speed_stddev_rel = (float)d; }
     else if (!strcmp(full, "speed.min_speed_mps")) { c->speed_min_mps = (float)d; }
     else if (!strcmp(full, "speed.delay_ms")) { c->speed_delay_ms = (int)d; }
+    else if (!strcmp(full, "heading.enable")) { c->heading_enable = (int)d; }
+    else if (!strcmp(full, "heading.baseline_frd")) { if (mini_yaml_list(val, c->heading_baseline_frd, 3) != 0) return -2; }
+    else if (!strcmp(full, "heading.require_fixed")) { c->heading_require_fixed = (int)d; }
+    else if (!strcmp(full, "heading.stddev_scale")) { c->heading_stddev_scale = (float)d; }
+    else if (!strcmp(full, "heading.stddev_min_deg")) { c->heading_stddev_min_deg = (float)d; }
+    else if (!strcmp(full, "heading.delay_ms")) { c->heading_delay_ms = (int)d; }
     else if (!strcmp(full, "baro.enable")) { c->baro_enable = (int)d; }
     else if (!strcmp(full, "baro.stddev_m")) { c->baro_stddev_m = (float)d; }
     else if (!strcmp(full, "baro.acc_bias_rw")) { c->baro_acc_bias_rw = (float)d; }
@@ -753,6 +779,11 @@ static int load_config(const char* path, replay_cfg_t* c)
     snprintf(c->in_mag, sizeof(c->in_mag), "mag.csv");
     snprintf(c->in_baro, sizeof(c->in_baro), "baro.csv");
     snprintf(c->in_speed, sizeof(c->in_speed), "speed.csv");
+    snprintf(c->in_heading, sizeof(c->in_heading), "heading.csv");
+    /* The mounting where the baseline azimuth IS the yaw, and only fixed
+       headings: a float one can be degrees off while claiming better. */
+    c->heading_baseline_frd[0] = 1.0f;
+    c->heading_require_fixed   = 1;
     c->warmup_sec     = 60.0;
     c->score_attitude = 1; /* opt OUT, so every existing dataset keeps its
                               attitude gates without touching its config */
@@ -844,6 +875,14 @@ typedef struct
     int64_t t_us;
     float   speed_mps;
 } speed_epoch_t;
+
+typedef struct
+{
+    int64_t t_us;
+    float   heading_deg; /* baseline azimuth, not yet the yaw */
+    float   stddev_deg;
+    int     carr_soln;   /* 0 none, 1 float, 2 fixed */
+} heading_epoch_t;
 
 typedef struct
 {
@@ -1080,6 +1119,77 @@ static int load_speed(const char* path, speed_epoch_t** out)
     return n;
 }
 
+/* heading.csv: "t_us, heading_deg, stddev_deg, carr_soln" plus the
+   producer's own trailing columns, which are not read. */
+static int load_heading(const char* path, heading_epoch_t** out)
+{
+    *out    = NULL;
+    FILE* f = fopen(path, "r");
+    if (!f) { return -1; }
+    char             line[256];
+    int              n   = 0;
+    int              cap = 0;
+    heading_epoch_t* h   = NULL;
+    while (fgets(line, sizeof(line), f))
+    {
+        long long t;
+        float     hd, sd;
+        int       cs;
+        if (line[0] == '#') continue;
+        if (sscanf(line, "%lld,%f,%f,%d", &t, &hd, &sd, &cs) != 4) { continue; }
+        h                = grow_or_die(h, n, &cap, sizeof(*h), path);
+        h[n].t_us        = (int64_t)t;
+        h[n].heading_deg = hd;
+        h[n].stddev_deg  = sd;
+        h[n].carr_soln   = cs;
+        n++;
+    }
+    fclose(f);
+    *out = h;
+    return n;
+}
+
+/* Why a heading row did not become a yaw measurement. */
+typedef enum
+{
+    HEADING_OK = 0,
+    HEADING_NOT_FIXED,    /* require_fixed and carr_soln != 2 */
+    HEADING_BAD_STDDEV,   /* 1-sigma not finite or not positive */
+    HEADING_BAD_GEOMETRY, /* ins_yaw_from_baseline_heading() refused */
+    HEADING_N_REASONS
+} heading_reason_t;
+
+/* One heading.csv row -> the yaw measurement ins consumes. Mirrors
+   heading_measurement() in python/replay.py: gate on the carrier-phase
+   solution, scale and floor the receiver's 1-sigma, then undo the antenna
+   mounting with the attitude the suite holds right now (level when it holds
+   none yet, which is exact for a baseline along x). */
+static heading_reason_t heading_measurement(const replay_cfg_t* c, const heading_epoch_t* h,
+                                            const nav_suite_t* s, float* yaw_rad,
+                                            float* stddev_rad)
+{
+    if (c->heading_require_fixed && h->carr_soln != 2) return HEADING_NOT_FIXED;
+    float sd_deg = h->stddev_deg * (c->heading_stddev_scale > 0.0f ? c->heading_stddev_scale : 1.0f);
+    if (c->heading_stddev_min_deg > 0.0f && sd_deg < c->heading_stddev_min_deg)
+    {
+        sd_deg = c->heading_stddev_min_deg;
+    }
+    if (!(isfinite(sd_deg) && sd_deg > 0.0f)) return HEADING_BAD_STDDEV;
+    float roll = 0.0f, pitch = 0.0f, yaw_now = 0.0f;
+    if (!nav_suite_get_rpy(s, &roll, &pitch, &yaw_now))
+    {
+        roll  = 0.0f;
+        pitch = 0.0f;
+    }
+    if (!ins_yaw_from_baseline_heading(DEG2RAD(h->heading_deg), roll, pitch,
+                                       c->heading_baseline_frd, yaw_rad))
+    {
+        return HEADING_BAD_GEOMETRY;
+    }
+    *stddev_rad = DEG2RAD(sd_deg);
+    return HEADING_OK;
+}
+
 /* ---------------------------------------------------------------------------
  * Coasting re-acquisition metric (REQ-VER-029)
  *
@@ -1155,6 +1265,7 @@ static gnss_epoch_t*  g_gnss;
 static mag_epoch_t*   g_mag;
 static baro_epoch_t*  g_baro;
 static speed_epoch_t* g_speed;
+static heading_epoch_t* g_heading;
 
 /* 3D position error of the ins solution against one reference epoch, with the
  * scoring lever arm mapping the filter position onto the truth point. Returns
@@ -1415,6 +1526,18 @@ int main(int argc, char** argv)
         if (n_speed <= 0)
         {
             fprintf(stderr, "speed: enable but no usable %s\n", path);
+            return 1;
+        }
+    }
+
+    int n_heading = 0;
+    if (cfg.heading_enable)
+    {
+        snprintf(path, sizeof(path), "%s/%s", datadir, cfg.in_heading);
+        n_heading = load_heading(path, &g_heading);
+        if (n_heading <= 0)
+        {
+            fprintf(stderr, "heading: enable but no usable %s\n", path);
             return 1;
         }
     }
@@ -1716,6 +1839,22 @@ int main(int argc, char** argv)
     opt.gnss_vel_noise_acc_window_sec = cfg.vel_noise_acc_window_sec;
     memcpy(opt.mag_misalignment, cfg.mag_misalignment, sizeof(opt.mag_misalignment));
     memcpy(opt.mag_fixed_bias, cfg.mag_fixed_bias, sizeof(opt.mag_fixed_bias));
+    /* REQ-VER-036: board mounting on top of the per-sensor calibration,
+       applied to the copies handed to the filter only. */
+    if (imu_mount_is_set(cfg.imu_mount_rpy_deg))
+    {
+        if (!imu_mount_compose(cfg.imu_mount_rpy_deg, opt.imu_acc_misalignment) ||
+            !imu_mount_compose(cfg.imu_mount_rpy_deg, opt.imu_gyr_misalignment) ||
+            !imu_mount_compose(cfg.imu_mount_rpy_deg, opt.mag_misalignment))
+        {
+            fprintf(stderr, "%s: imu: mount_rpy_deg is not finite\n", cfg_path);
+            return 1;
+        }
+        printf("imu mounting: roll %.2f pitch %.2f yaw %.2f deg (board vs. vehicle axes),"
+               " composed onto the acc/gyr/mag calibration\n",
+               (double)cfg.imu_mount_rpy_deg[0], (double)cfg.imu_mount_rpy_deg[1],
+               (double)cfg.imu_mount_rpy_deg[2]);
+    }
 
     memset(&g_suite, 0, sizeof(g_suite));
     if (nav_suite_init(&g_suite, &init, &opt) != 0)
@@ -1912,7 +2051,8 @@ int main(int argc, char** argv)
     int i_coast_gap = 0; /* next gap still waiting for its reference epoch */
 
     int64_t       t_prev       = 0;
-    int           iref = 0, ignss = 0, imag = 0, ibaro = 0, ispeed = 0;
+    int           iref = 0, ignss = 0, imag = 0, ibaro = 0, ispeed = 0, iheading = 0;
+    unsigned long n_heading_reason[HEADING_N_REASONS] = {0};
     int64_t       fi_next_t_us = 0; /* next free_inertial_start offer */
     unsigned long n_fi_offers  = 0;
     long          n_imu = 0;
@@ -2143,6 +2283,30 @@ int main(int argc, char** argv)
                 m.speed_delay_ms   = cfg.speed_delay_ms;
             }
         }
+        if (cfg.heading_enable)
+        {
+            /* Newest row of the interval only, same contract as speed. */
+            const heading_epoch_t* hm = (const heading_epoch_t*)0;
+            while (iheading < n_heading && g_heading[iheading].t_us <= t)
+            {
+                hm = &g_heading[iheading];
+                iheading++;
+            }
+            if (hm != (const heading_epoch_t*)0)
+            {
+                float                  yaw_meas = 0.0f, sd_meas = 0.0f;
+                const heading_reason_t why =
+                    heading_measurement(&cfg, hm, &g_suite, &yaw_meas, &sd_meas);
+                n_heading_reason[why]++;
+                if (why == HEADING_OK)
+                {
+                    m.yaw.is_valid   = true;
+                    m.yaw.yaw_rad    = yaw_meas;
+                    m.yaw.stddev_rad = sd_meas;
+                    m.yaw_delay_ms   = cfg.heading_delay_ms;
+                }
+            }
+        }
 
         nav_suite_update(&g_suite, &m);
 
@@ -2200,7 +2364,15 @@ int main(int argc, char** argv)
             float ell_h_m;
             if (scored && nav_suite_get_height_ellipsoid(&g_suite, &ell_h_m))
             {
-                stat_add(&ell_h, (double)ell_h_m - ref->h_m);
+                /* REQ-VER-037: height of the reference point, not the IMU.
+                   Only roll/pitch enter the down component, and the suite
+                   has an attitude whenever it has a height; level if not. */
+                const float* la = cfg.score_leverarm_frd;
+                float        r = 0.0f, p = 0.0f, y = 0.0f;
+                if (!nav_suite_get_rpy(&g_suite, &r, &p, &y)) { r = p = 0.0f; }
+                const float la_d = -sinf(p) * la[0] + sinf(r) * cosf(p) * la[1] +
+                                   cosf(r) * cosf(p) * la[2];
+                stat_add(&ell_h, (double)ell_h_m - (double)la_d - ref->h_m);
             }
         }
 
@@ -2254,6 +2426,13 @@ int main(int argc, char** argv)
                " +-%g m, then the filter is on its own\n",
                n_fi_offers, cfg.fi_lat_deg, cfg.fi_lon_deg, cfg.fi_height_m,
                (double)cfg.fi_stddev_m);
+    }
+    if (cfg.heading_enable)
+    {
+        printf("heading aiding: %d rows, %lu offered as yaw, %lu not fixed, %lu bad 1-sigma,"
+               " %lu refused by the baseline geometry\n",
+               n_heading, n_heading_reason[HEADING_OK], n_heading_reason[HEADING_NOT_FIXED],
+               n_heading_reason[HEADING_BAD_STDDEV], n_heading_reason[HEADING_BAD_GEOMETRY]);
     }
     printf("ins: %u predicts, %u gnss fusions (%u seen), %u fuse fails, "
            "%u auto-zupt, %u downweighted\n",

@@ -573,6 +573,44 @@ bool ins_vec3_finite(const float v[3])
     return isfinite(v[0]) && isfinite(v[1]) && isfinite(v[2]);
 }
 
+/* A baseline whose horizontal projection is shorter than this fraction of
+   its length measures an azimuth amplified by at least the inverse of it:
+   a 1 cm antenna phase error across a 1 m baseline tilted to 10 percent
+   horizontal is already 6 deg of heading. Below that the heading is not a
+   measurement of anything and is refused rather than passed on. */
+#define INS_BASELINE_MIN_HORIZONTAL_FRACTION 0.1f
+
+/* @satisfies REQ-NAV-087 */
+bool ins_yaw_from_baseline_heading(float heading_rad, float roll_rad, float pitch_rad,
+                                   const float baseline_b[3], float* yaw_rad)
+{
+    if (!isfinite(heading_rad) || !isfinite(roll_rad) || !isfinite(pitch_rad) ||
+        !ins_vec3_finite(baseline_b))
+    {
+        return false;
+    }
+    const float len2 = baseline_b[0] * baseline_b[0] + baseline_b[1] * baseline_b[1] +
+                       baseline_b[2] * baseline_b[2];
+    if (!(len2 > 0.0f)) return false;
+
+    /* c = Ry(pitch) * Rx(roll) * b: the baseline in the level frame that
+       only the yaw rotation separates from NED. */
+    const float sr = sinf(roll_rad);
+    const float cr = cosf(roll_rad);
+    const float sp = sinf(pitch_rad);
+    const float cp = cosf(pitch_rad);
+    const float cx = cp * baseline_b[0] + sp * (sr * baseline_b[1] + cr * baseline_b[2]);
+    const float cy = cr * baseline_b[1] - sr * baseline_b[2];
+
+    const float h2 = cx * cx + cy * cy;
+    if (!(h2 >= INS_BASELINE_MIN_HORIZONTAL_FRACTION * INS_BASELINE_MIN_HORIZONTAL_FRACTION * len2))
+    {
+        return false;
+    }
+    *yaw_rad = ins_angle_diff(heading_rad, atan2f(cy, cx));
+    return true;
+}
+
 float ins_isa_altitude_from_pressure(float pressure_pa)
 {
     return INS_ISA_SCALE_M * (1.0f - powf(pressure_pa / INS_ISA_P0_PA, INS_ISA_EXP));

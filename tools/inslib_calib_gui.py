@@ -25,6 +25,11 @@ sensor sits rather than what it reads:
     field and gravity cannot change with attitude, and how much it does
     is the misalignment. Written as the mag: keys.
 
+After a solve, **Calibration report** writes the session as a LaTeX
+document (inslib_calib_report.py) for pdflatex: a one-page calibration
+certificate for the customer, followed by the manufacturer's calibration
+record with the raw recording attached.
+
 The result can go into a config.yaml, or straight into the board:
 **Upload to board** writes the session as ONE temperature node into the
 board's own calibration table, merged into whatever is already stored.
@@ -60,6 +65,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import getpass
 import math
 import os
 import struct
@@ -75,6 +81,7 @@ import inslib_imu_calib as calib     # noqa: E402  (recording, solve, writer)
 import inslib_imu_tk as imu_tk         # noqa: E402
 import inslib_frame_align as fa        # noqa: E402  (mounting rotations)
 import inslib_mag_calib as mag_calib   # noqa: E402  (hard/soft iron)
+import inslib_calib_report as report   # noqa: E402  (calibration certificate)
 from inslib_ubx import (CLASS_NAV, CLS_INSLIB, ID_IMU, ID_MAG,   # noqa: E402
                         ID_NAV_PVT, IMU_FMT, MAG_FMT, build_imu_status,
                         ubx_frame)
@@ -1134,6 +1141,71 @@ class ApplyCalWorker(BoardRequest):
             self.sig_done.emit(False, str(e))
 
 
+class ReportDialog(QtWidgets.QDialog):
+    """Who, where and what, for the calibration certificate.
+
+    Username defaults to the login name. The certificate prints it as
+    such and leaves the name in the signature block blank, for whoever
+    signs to write in by hand. The fields
+    that stay the same from one unit to the next (person, place, device
+    type) are remembered between sessions. The serial number is not: a
+    number carried over from the previous unit is the one mistake a
+    certificate must not make quietly."""
+
+    KEPT = ("operator", "place", "device")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Calibration report")
+        self.setMinimumWidth(460)
+        st = QtCore.QSettings("INSLIB", "inslib_calib_gui")
+        try:
+            user = getpass.getuser()
+        except Exception:        # noqa: BLE001  (no login name to be had)
+            user = ""
+        f = QtWidgets.QFormLayout(self)
+        self.ed = {}
+        for key, label, default in (
+                ("operator", "Username", user),
+                ("place", "Location", ""),
+                ("device", "Device", ""),
+                ("serial", "Serial number", "")):
+            ed = QtWidgets.QLineEdit(str(st.value("report/" + key, default))
+                                     if key in self.KEPT else default)
+            f.addRow(label, ed)
+            self.ed[key] = ed
+        self.ed["place"].setPlaceholderText("e.g. lab, building, city")
+        self.ed["serial"].setPlaceholderText("goes into the report number")
+        self.remarks = QtWidgets.QPlainTextEdit()
+        self.remarks.setPlaceholderText("Remarks (left empty: lines to write "
+                                        "on in the printout)")
+        self.remarks.setMaximumHeight(90)
+        f.addRow("Remarks", self.remarks)
+        note = QtWidgets.QLabel(
+            "Date, time, position, reference gravity and field, and the "
+            "board's state are taken from the session.")
+        note.setWordWrap(True)
+        note.setStyleSheet(DIM + " font-size: 11px;")
+        f.addRow(note)
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self._accept)
+        bb.rejected.connect(self.reject)
+        f.addRow(bb)
+
+    def _accept(self):
+        st = QtCore.QSettings("INSLIB", "inslib_calib_gui")
+        for key in self.KEPT:
+            st.setValue("report/" + key, self.ed[key].text().strip())
+        self.accept()
+
+    def values(self):
+        out = {k: e.text().strip() for k, e in self.ed.items()}
+        out["remarks"] = self.remarks.toPlainText()
+        return out
+
+
 class CalibWindow(QtWidgets.QMainWindow):
     def __init__(self, args):
         super().__init__()
@@ -1198,6 +1270,22 @@ class CalibWindow(QtWidgets.QMainWindow):
         # says what the board was told, the bit says what reached the
         # sample. NaN before a recording has been solved.
         self.rec_cal_frac = float("nan")
+        # The last solved recording and what surrounded it, for the
+        # calibration certificate: the solve keeps only its results, the
+        # certificate plots the whole session.
+        self.rec = None
+        self.rec_t_start = None         # wall clock, recording started
+        self.rec_t_end = None           # wall clock, recording stopped
+        self.rec_board_info = None      # the board's state message then
+        # The rest/hold times the solve ran with. The spin boxes are free
+        # again after it, and the record's reproduce command is only
+        # right with the values that were actually used.
+        self.rec_init_sec = None
+        self.rec_pose_sec = None
+        self.source_text = ""           # the link, in words
+        self._position = None           # (lat, lon, height or None)
+        self._gravity_model = None      # (g, where it came from)
+        self._wmm = None                # (field uT, decl, incl, year)
         self._hint_state = None         # what the housing panel last said
         self._t0 = time.monotonic()
 
@@ -1632,6 +1720,15 @@ class CalibWindow(QtWidgets.QMainWindow):
             "own calibration table")
         self.btn_upload.clicked.connect(self.on_upload)
         row.addWidget(self.btn_upload)
+        self.btn_report = QtWidgets.QPushButton("Calibration report")
+        self.btn_report.setToolTip(
+            "Write this session as a LaTeX document plus a Makefile:\n"
+            "page 1 is the calibration certificate for the customer, the "
+            "pages after it\nthe manufacturer's calibration record (full "
+            "coefficients, diagnostics,\nper-pose tables, the raw "
+            "recording attached). Build it with make or\npdflatex (twice).")
+        self.btn_report.clicked.connect(self.on_report)
+        row.addWidget(self.btn_report)
         row.addStretch(1)
         v.addLayout(row)
 
@@ -1862,6 +1959,8 @@ class CalibWindow(QtWidgets.QMainWindow):
         spec = self.ed_latlon.text().strip()
         if not spec:
             self._field_source = ""
+            self._position = None
+            self._wmm = None
             return
         try:
             vals = [float(x) for x in spec.replace(";", ",").split(",")
@@ -1876,6 +1975,7 @@ class CalibWindow(QtWidgets.QMainWindow):
         # Ellipsoidal. Left out it reads as sea level, and the free air
         # term is 3.1e-6 m/s^2 for every metre that was not given.
         height = vals[2] if len(vals) == 3 else 0.0
+        self._position = (lat, lon, vals[2] if len(vals) == 3 else None)
 
         # Gravity before the field: it needs neither a magnetometer nor a
         # field strength, so a WMM lookup that comes back empty must not
@@ -1896,6 +1996,7 @@ class CalibWindow(QtWidgets.QMainWindow):
         self.say("[calib] WMM at %.3f %.3f: %.1f uT, declination %+.1f deg, "
                  "inclination %+.1f deg" % (lat, lon, field, decl, incl))
         self._wmm_dip = incl
+        self._wmm = (field, decl, incl, year)
 
     def _set_gravity_from(self, lat, lon, height):
         """Gravity from WGS84 normal gravity at this position.
@@ -1912,6 +2013,8 @@ class CalibWindow(QtWidgets.QMainWindow):
                      % self.sp_gravity.value())
             return
         self.sp_gravity.setValue(g)
+        self._gravity_model = (g, "WGS84 normal gravity at %.4f, %.4f, "
+                                  "h = %.0f m" % (lat, lon, height))
         self.say("[calib] normal gravity at %.3f %.3f, h=%.0f m (ellipsoidal)"
                  ": %.5f m/s2, against the standard %.5f"
                  % (lat, lon, height, g, calib.G_MPS2))
@@ -2021,6 +2124,10 @@ class CalibWindow(QtWidgets.QMainWindow):
         self.btn_upload.setEnabled(bool(can_send and self.uploader is None
                                         and (ok or self.magcal is not None
                                              or self.housing is not None)))
+        # The certificate plots the recording, so it needs the one the
+        # solve came from, not only its numbers.
+        self.btn_report.setEnabled(bool(self.cal is not None
+                                        and self.rec is not None))
 
     def recording(self):
         return self.worker is not None and self.worker.snapshot() is not None
@@ -2032,6 +2139,7 @@ class CalibWindow(QtWidgets.QMainWindow):
             return
         if self.args.demo:
             self.source = DemoSerial()
+            self.source_text = "Demo (synthetischer Datenstrom, kein Board)"
             self.say("[calib] --demo: synthetic IMU stream, no board")
         elif self.cb_source.currentIndex() == 1:
             spec = self.ed_udp.text().strip()
@@ -2045,6 +2153,7 @@ class CalibWindow(QtWidgets.QMainWindow):
                 self.say("[calib] cannot listen on %s: %s (is something else "
                          "bound to it?)" % (spec, e))
                 return
+            self.source_text = "UDP %s (inslib_hub.py fan-out)" % spec
             self.say("[calib] listening on udp:%s -- the hub needs a fan-out "
                      "to this port" % spec)
         else:
@@ -2064,6 +2173,7 @@ class CalibWindow(QtWidgets.QMainWindow):
                 self.say("[calib] inslib_hub.py owns the port while it runs; "
                          "switch Source to the hub fan-out instead")
                 return
+            self.source_text = "%s, %d Baud" % (port, self.sp_baud.value())
             self.say("[calib] opened %s at %d baud" % (port, self.sp_baud.value()))
 
         self._gnss_fix = None
@@ -2174,6 +2284,9 @@ class CalibWindow(QtWidgets.QMainWindow):
     def _start_recording(self):
         self.cal = None
         self.magcal = None
+        self.rec = None
+        self.rec_t_start = datetime.datetime.now().astimezone()
+        self.rec_t_end = None
         self.rec_cal_frac = float("nan")
         self.pose_count = 0
         self.sphere.set_poses(np.zeros((0, 3)))
@@ -2198,6 +2311,11 @@ class CalibWindow(QtWidgets.QMainWindow):
         if rec is None or len(rec) < 1000:
             self.say("[calib] nothing recorded")
             return
+        self.rec = rec
+        self.rec_t_end = datetime.datetime.now().astimezone()
+        self.rec_board_info = self.worker.board_info()
+        self.rec_init_sec = self.sp_init.value()
+        self.rec_pose_sec = self.sp_pose.value()
         # Kept for the board upload: the magnetometer calibration is
         # looked up by the magnetometer's own die temperature there.
         self.mag_temp_c = (sum(rec.mag_temp_c) / len(rec.mag_temp_c)
@@ -2903,6 +3021,84 @@ class CalibWindow(QtWidgets.QMainWindow):
             "Wrote %s\n\nUse it with:\n  insrcv --config %s\n  "
             "python3 python/replay.py <datadir>"
             % (self.out_path, os.path.basename(self.out_path)))
+
+    # ------------------------------------------------------------------
+    # Calibration certificate
+    # ------------------------------------------------------------------
+    def _report_input(self, meta):
+        """ReportInput for the last solve, `meta` from the ReportDialog.
+
+        Everything is taken as it was AT THE SOLVE where it can still be
+        told apart: the gravity and field the fit was scaled to live on
+        the results, while the spin boxes may have been edited since."""
+        cal, mc = self.cal, self.magcal
+        g_src = "entered by hand"
+        if (self._gravity_model is not None
+                and abs(self._gravity_model[0] - cal.gravity) < 5e-6):
+            g_src = self._gravity_model[1]
+        elif abs(cal.gravity - calib.G_MPS2) < 1e-9:
+            g_src = "standard gravity, not from the position"
+        if mc is not None:
+            measured = mc.field_source == "measured, no reference"
+            f_ref = 0.0 if measured else mc.field_ut
+            f_src = "" if measured else mc.field_source
+        else:
+            f_ref = self.sp_field.value()
+            f_src = self._field_source if f_ref > 0.0 else ""
+        wmm = self._wmm
+        return report.ReportInput(
+            rec=self.rec, cal=cal, magcal=mc, housing=self.housing,
+            init_sec=self.rec_init_sec, pose_sec=self.rec_pose_sec,
+            operator=meta["operator"], place=meta["place"],
+            device=meta["device"], serial=meta["serial"],
+            remarks=meta["remarks"], position=self._position,
+            gravity_source=g_src, field_ref_ut=f_ref, field_source=f_src,
+            wmm_decl_deg=wmm[1] if wmm else None,
+            wmm_incl_deg=wmm[2] if wmm else None,
+            t_start=self.rec_t_start, t_end=self.rec_t_end,
+            source=self.source_text, board_info=self.rec_board_info,
+            rec_cal_frac=self.rec_cal_frac)
+
+    def on_report(self):
+        if self.cal is None or self.rec is None:
+            return
+        dlg = ReportDialog(self)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        meta = dlg.values()
+        stamp = (self.rec_t_start or datetime.datetime.now()).strftime(
+            "%Y%m%d_%H%M")
+        tag = "".join(c for c in meta["serial"] if c.isalnum() or c in "-_")
+        name = "calibration_certificate_%s%s.tex" % (
+            (tag + "_") if tag else "", stamp)
+        start = os.path.join(os.path.dirname(os.path.abspath(self.out_path)),
+                             name)
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Calibration certificate and record (.tex)", start,
+            "LaTeX (*.tex);;All files (*)")
+        if not path:
+            return
+        try:
+            written = report.write_report(path, self._report_input(meta))
+        except Exception as e:   # noqa: BLE001  (shown, not swallowed)
+            QtWidgets.QMessageBox.critical(self, "Report failed", str(e))
+            self.say("[calib] writing the report failed:\n"
+                     + traceback.format_exc())
+            return
+        for p in written:
+            self.say("[calib] wrote %s" % p)
+        folder = os.path.dirname(os.path.abspath(path))
+        mk = ("" if any(os.path.basename(p) == "Makefile" for p in written)
+              else "\n\n(A Makefile of someone else's is already in that "
+              "folder and was left alone.)")
+        QtWidgets.QMessageBox.information(
+            self, "Report written",
+            "Wrote %s\nand the raw recording beside it (attached to the "
+            "PDF when it is built, keep the files together).\n\nBuild the "
+            "PDF with\n  make -C \"%s\"\nor run pdflatex %s twice (the "
+            "page count needs the second pass).\n\nPage 1 is the "
+            "certificate for the customer, the rest is the record."
+            "%s" % (path, folder, os.path.basename(path), mk))
 
     # ------------------------------------------------------------------
     # Upload into the board's own calibration table

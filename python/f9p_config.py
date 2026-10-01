@@ -18,7 +18,14 @@ Configures:
     navigation solution both run at 4 Hz), dynModel airborne <4g
   - Message output on UART1 AND UART2:
       NAV-PVT, NAV-COV, RXM-RAWX, RXM-SFRBX, TIM-TP  = on
+      NAV-RELPOSNED                                  = on
       NAV-TIMEGPS                                    = off
+    (NAV-RELPOSNED carries the dual-antenna heading once this receiver
+     is the rover of a u-blox moving base pair, which the firmware fuses
+     as yaw. Setting up the pair itself, the base's RTCM 4072/MSM output
+     into this receiver, is not done here. Without it the message only
+     appears with RTK corrections from a static base, where the firmware
+     and the converter drop it because isMoving is not set.)
     (TIM-TP announces the NEXT timepulse with week+TOW ahead of time.
      The firmware consumes the announcement itself, pairs it with the
      hardware capture of the corresponding edge, and sends the result
@@ -73,6 +80,7 @@ CFG = {
     "CFG-MSGOUT-RXM_RAWX_UART1":    (0x209102A5, 1),
     "CFG-MSGOUT-RXM_SFRBX_UART1":   (0x20910232, 1),
     "CFG-MSGOUT-TIM_TP_UART1":      (0x2091017E, 1),
+    "CFG-MSGOUT-NAV_RELPOSNED_UART1": (0x2091008E, 1),
     # Message output UART2 (key = UART1 key + 1)
     "CFG-MSGOUT-NAV_PVT_UART2":     (0x20910008, 1),
     "CFG-MSGOUT-NAV_COV_UART2":     (0x20910085, 1),
@@ -80,6 +88,7 @@ CFG = {
     "CFG-MSGOUT-RXM_RAWX_UART2":    (0x209102A6, 1),
     "CFG-MSGOUT-RXM_SFRBX_UART2":   (0x20910233, 1),
     "CFG-MSGOUT-TIM_TP_UART2":      (0x2091017F, 1),
+    "CFG-MSGOUT-NAV_RELPOSNED_UART2": (0x2091008F, 1),
     # USB protocols (there is NO baud rate key for USB) - output
     "CFG-USBOUTPROT-UBX":   (0x10780001, 1),
     "CFG-USBOUTPROT-NMEA":  (0x10780002, 0),
@@ -94,6 +103,7 @@ CFG = {
     "CFG-MSGOUT-RXM_RAWX_USB":    (0x209102A7, 1),
     "CFG-MSGOUT-RXM_SFRBX_USB":   (0x20910234, 1),
     "CFG-MSGOUT-TIM_TP_USB":      (0x20910180, 1),
+    "CFG-MSGOUT-NAV_RELPOSNED_USB": (0x20910090, 1),
 }
 # Baud rates LAST (connection drops if we are ourselves on the UART)
 CFG_BAUD = {

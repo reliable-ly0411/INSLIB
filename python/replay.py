@@ -82,6 +82,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from INSLIB import Navigator, Config, Telemetry, ecef_to_llh   # noqa: E402
+from INSLIB import yaw_from_baseline_heading   # noqa: E402
 # The sub-filter breakdown, the status bits and the ISA conversion live in
 # the shared telemetry module, so a live receiver and this replay put the
 # identical tree on the wire (see INSLIB/telemetry.py).
@@ -151,6 +152,9 @@ DEFAULTS = {
         "acc_bias_rw": 0.0,
         "acc_misalignment": (0.0,) * 9,  # col-major 3x3 (all-0 -> identity)
         "gyr_misalignment": (0.0,) * 9,
+        # Board attitude in the vehicle frame [deg], ZYX, composed onto the
+        # acc/gyr/mag matrices by mounted_calibration() (REQ-VER-036).
+        "mount_rpy_deg": (0.0, 0.0, 0.0),
         "acc_fixed_bias": (0.0, 0.0, 0.0),  # [m/s^2], removed permanently
         "gyr_fixed_bias": (0.0, 0.0, 0.0),  # [rad/s]
         # Extra process-noise margin on top of the physically-derived acc/
@@ -401,8 +405,20 @@ DEFAULTS = {
               "stddev_rel": 0.0,      # speed-proportional; 0 -> default (3%)
               "min_speed_mps": 0.0,   # 0 -> default
               "delay_ms": 0.0},       # how old a sample is at its timestamp
+    # Dual-antenna GNSS heading (REQ-NAV-010), e.g. u-blox moving base
+    # NAV-RELPOSNED. heading.csv holds the azimuth of the antenna baseline,
+    # turned into a yaw here with baseline_frd and the current roll/pitch
+    # (REQ-NAV-087). The per-row 1-sigma is the receiver's own, this section
+    # only scales and floors it.
+    "heading": {"enable": 0,
+                "baseline_frd": [1.0, 0.0, 0.0],  # base -> rover antenna, FRD
+                "require_fixed": 1,     # 1 -> carrSoln 2 (fixed) rows only
+                "stddev_scale": 0.0,    # 0 -> 1.0
+                "stddev_min_deg": 0.0,  # 0 -> no floor
+                "delay_ms": 0.0},       # how old a row is at its timestamp
     "inputs": {"imu": "imu.csv", "ref": "ref.csv", "gnss": "gnss.csv",
-               "mag": "mag.csv", "baro": "baro.csv", "speed": "speed.csv"},
+               "mag": "mag.csv", "baro": "baro.csv", "speed": "speed.csv",
+               "heading": "heading.csv"},
 }
 
 # Sections of the config.yaml schema that belong to a DIFFERENT consumer of
@@ -494,6 +510,33 @@ def _rotmat_from_rpy(rpy):
     return ((cp * cy, sr * sp * cy - cr * sy, cr * sp * cy + sr * sy),
             (cp * sy, sr * sp * sy + cr * cy, cr * sp * sy - sr * cy),
             (-sp, sr * cp, cr * cp))
+
+
+def mounted_calibration(spec):
+    """(acc, gyr, mag) calibration matrices as the filter gets them, col-major
+    9-tuples: the configured matrices with imu: mount_rpy_deg composed on
+    top, M := R(roll, pitch, yaw) * M, all-zero M read as identity
+    (REQ-VER-036, same arithmetic as tools/imu_mount.h). Returns the
+    configured matrices unchanged when no mounting is set. Never written
+    back into `spec`, so a loaded, edited and saved config (inspostgui.py)
+    does not get the mounting twice."""
+    imu = spec["imu"]
+    mats = (tuple(float(v) for v in imu["acc_misalignment"]),
+            tuple(float(v) for v in imu["gyr_misalignment"]),
+            tuple(float(v) for v in spec["mag"]["misalignment"]))
+    mount = tuple(float(v) for v in imu.get("mount_rpy_deg") or (0.0, 0.0, 0.0))
+    if len(mount) != 3 or not all(math.isfinite(v) for v in mount):
+        sys.exit(f"imu: mount_rpy_deg must be three finite angles, got {mount}")
+    if not any(mount):
+        return mats
+    R = _rotmat_from_rpy(tuple(math.radians(v) for v in mount))  # row-major
+    out = []
+    for M in mats:
+        if not any(M):
+            M = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+        out.append(tuple(sum(R[r][k] * M[k + 3 * c] for k in range(3))
+                         for c in range(3) for r in range(3)))
+    return tuple(out)
 
 
 def _rotvec_from_rotmat(R):
@@ -635,6 +678,19 @@ def pos_error_ecef(nav, ref_now, score_leverarm_frd):
     la_e = _matvec_rm(ned_to_ecef_rot(ref_now["lat_rad"], ref_now["lon_rad"]),
                       la_n)
     return [fecef[i] - recef[i] + la_e[i] for i in range(3)]
+
+
+def ref_point_offset_ned(nav, score_leverarm_frd):
+    """R_b_to_n * score.leverarm_frd [m, NED]: add it to an IMU-point quantity
+    to get the reference point's (REQ-VER-037). Rotated with the suite's best
+    attitude (nav.rpy(): ins, else AHRS, else ARS), level with yaw 0 without
+    one, which still gets the down component right for a level vehicle.
+    Zero for a zero lever arm."""
+    if not any(score_leverarm_frd):
+        return (0.0, 0.0, 0.0)
+    rpy = nav.rpy() or (0.0, 0.0, 0.0)
+    R = _rotmat_from_rpy(rpy)
+    return tuple(sum(R[r][k] * score_leverarm_frd[k] for k in range(3)) for r in range(3))
 
 
 def ref_to_local_ned(ref_now, origin_ecef, origin_lat, origin_lon):
@@ -1207,6 +1263,60 @@ def load_speed(path):
     return rows
 
 
+def load_heading(path):
+    """heading.csv -> [(t_us, heading_deg, stddev_deg, carr_soln)].
+
+    The baseline azimuth as the receiver measured it, its 1-sigma and the
+    carrier-phase solution (0 none, 1 float, 2 fixed). Trailing columns
+    (baseline length, iTOW) are the producer's record and not read,
+    matching load_heading() in tools/replay.c."""
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
+                continue
+            p = line.strip().split(",")
+            if len(p) < 4:
+                continue
+            try:
+                rows.append((int(p[0]), float(p[1]), float(p[2]), int(p[3])))
+            except ValueError:
+                continue
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+HEADING_OK = "ok"
+HEADING_NOT_FIXED = "not fixed"
+HEADING_BAD_STDDEV = "bad 1-sigma"
+HEADING_BAD_GEOMETRY = "refused by the baseline geometry"
+
+
+def heading_measurement(hcfg, row, rpy):
+    """One heading.csv row -> (reason, yaw_rad, stddev_rad).
+
+    Mirrors heading_measurement() in tools/replay.c: gate on the carrier-
+    phase solution, scale and floor the receiver's 1-sigma, then undo the
+    antenna mounting with the attitude the suite holds right now (`rpy`,
+    None -> level, which is exact for a baseline along x)."""
+    _, heading_deg, sd_deg, carr_soln = row
+    if int(hcfg["require_fixed"]) and carr_soln != 2:
+        return HEADING_NOT_FIXED, None, None
+    scale = float(hcfg["stddev_scale"]) or 1.0
+    sd_deg = sd_deg * scale
+    floor = float(hcfg["stddev_min_deg"])
+    if floor > 0.0 and sd_deg < floor:
+        sd_deg = floor
+    if not (math.isfinite(sd_deg) and sd_deg > 0.0):
+        return HEADING_BAD_STDDEV, None, None
+    roll, pitch = (rpy[0], rpy[1]) if rpy else (0.0, 0.0)
+    yaw = yaw_from_baseline_heading(math.radians(heading_deg), roll, pitch,
+                                    tuple(float(v) for v in hcfg["baseline_frd"]))
+    if yaw is None:
+        return HEADING_BAD_GEOMETRY, None, None
+    return HEADING_OK, yaw, math.radians(sd_deg)
+
+
 def iter_imu(path):
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -1250,6 +1360,7 @@ def build_config(spec, ref0, t0_us, lat0, lon0, h0, gyr_bias):
     # roll/pitch, so it's only passed through when the config actually
     # asks for it (0 -> falls back to the roll/pitch value below).
     init_sd = spec["init_stddev"]
+    acc_m, gyr_m, mag_m = mounted_calibration(spec)
     rp_stddev_rad = math.radians(
         init_sd["rpy_init_stddev_rad_deg"] or (1.0 if init_ref else 3.0))
     yaw_stddev_rad = (math.radians(init_sd["yaw_init_stddev_rad_deg"])
@@ -1342,8 +1453,8 @@ def build_config(spec, ref0, t0_us, lat0, lon0, h0, gyr_bias):
         estimate_mag_bias=bool(spec["mag"]["estimate_bias"]),
         # IMU calibration (REQ-NAV-037) + GNSS covariance conditioning
         # (REQ-NAV-038); .get() keeps older configs (no such keys) working.
-        imu_acc_misalignment=tuple(noise.get("acc_misalignment", (0.0,) * 9)),
-        imu_gyr_misalignment=tuple(noise.get("gyr_misalignment", (0.0,) * 9)),
+        imu_acc_misalignment=acc_m,
+        imu_gyr_misalignment=gyr_m,
         imu_acc_fixed_bias=tuple(noise.get("acc_fixed_bias", (0.0, 0.0, 0.0))),
         imu_gyr_fixed_bias=tuple(noise.get("gyr_fixed_bias", (0.0, 0.0, 0.0))),
         gnss_pos_cov_scale=gnss.get("pos_cov_scale", 0.0),
@@ -1363,7 +1474,7 @@ def build_config(spec, ref0, t0_us, lat0, lon0, h0, gyr_bias):
         gnss_vel_noise_acc_scale_hor=gnss.get("vel_noise_acc_scale_hor", 0.0),
         gnss_vel_noise_acc_scale_ver=gnss.get("vel_noise_acc_scale_ver", 0.0),
         gnss_vel_noise_acc_window_sec=gnss.get("vel_noise_acc_window_sec", 0.0),
-        mag_misalignment=tuple(spec["mag"].get("misalignment", (0.0,) * 9)),
+        mag_misalignment=mag_m,
         mag_fixed_bias=tuple(spec["mag"].get("fixed_bias", (0.0, 0.0, 0.0))),
         auto_init_window_sec=float(spec.get("auto_init_window_sec", 0.0)),
     )
@@ -2317,6 +2428,10 @@ def notable_settings(spec):
             f"{[round(x, 4) for x in ab]} m/s^2")
     if _vec_nonzero(imu["gyr_misalignment"]) or _vec_nonzero(imu["acc_misalignment"]):
         notes.append("IMU misalignment/scale calibration active")
+    if _vec_nonzero(imu["mount_rpy_deg"]):
+        notes.append("IMU mounting roll/pitch/yaw %s deg (board vs. vehicle axes), "
+                     "composed onto the acc/gyr/mag calibration"
+                     % [round(float(v), 3) for v in imu["mount_rpy_deg"]])
 
     mag = spec["mag"]
     if mag["estimate_bias"]:
@@ -2596,7 +2711,7 @@ def main():
     # nav.mag() is handed the raw sample and ins.c calibrates it, applying it
     # here as well would correct twice). Anything replay derives from the mag
     # stream on its own goes through mag_calibrate() with these.
-    mag_misalign = tuple(float(v) for v in mag_cfg["misalignment"])
+    mag_misalign = mounted_calibration(spec)[2]
     mag_bias_cfg = tuple(float(v) for v in mag_cfg["fixed_bias"])
     mag_cal_active = any(mag_misalign) or any(mag_bias_cfg)
 
@@ -2614,6 +2729,13 @@ def main():
         speeds = load_speed(input_path(data_dir, spec, "speed"))
         if not speeds:
             sys.exit(f"speed: enable but no usable speed.csv in {data_dir}")
+
+    heading_cfg = spec["heading"]
+    headings = []
+    if int(heading_cfg["enable"]):
+        headings = load_heading(input_path(data_dir, spec, "heading"))
+        if not headings:
+            sys.exit(f"heading: enable but no usable heading.csv in {data_dir}")
 
     leverarm = tuple(gnss_cfg["leverarm_frd"])
     score_la = tuple(spec["score"].get("leverarm_frd") or (0.0, 0.0, 0.0))
@@ -2745,6 +2867,9 @@ def main():
     n_speed_fused = 0
     speed_sd_cfg = float(speed_cfg["stddev_mps"])
     speed_delay_cfg = int(round(float(speed_cfg["delay_ms"])))
+    iheading = 0
+    heading_reasons = {}
+    heading_delay_cfg = int(round(float(heading_cfg["delay_ms"])))
     t_prev = None
     n_imu = 0
     last_ref = None
@@ -2841,6 +2966,10 @@ def main():
             # origin_h instead. Same NED-down convention as the other *_d
             # fields, so it overlays directly on the altitude-profile page.
             "nav_height_ellipsoid_d",
+            # REQ-VER-037: pos moved onto the score.leverarm_frd point, and
+            # the up shift from the board to that point (0 without a lever
+            # arm) for the board-point curves of the altitude pages.
+            "pos_ref_pt", "ref_pt_up",
             # ins's own velocity-aware auto-ZUPT/ZARU detector (shaded on
             # the plot pages so stops can be correlated with bias jumps).
             "zupt_active",
@@ -2860,6 +2989,13 @@ def main():
             # the outlier page can show WHEN, not just how many.
             "dw_full3d", "dw_ars", "dw_ahrs", "dw_baro_alt", "dw_local_gnss",
         )}
+        # A single ref.csv row (e.g. the MVP-placeholder ref.csv
+        # inslib_convert_ubx_to_csv.py writes when a capture has no real
+        # fix) gets forward-filled onto every later epoch by last_ref
+        # below, which would otherwise masquerade as a full, flat "ground
+        # truth" trajectory (zero speed/distance) to ins_plots.py. Record
+        # the real epoch count so it can tell the two apart.
+        rec["ref_epoch_count"] = len(ref)
 
     # --plot North-East map recorder: the ground track alone (two floats
     # per sample), sampled independently of - and by default faster than -
@@ -3007,6 +3143,19 @@ def main():
         if speed_now is not None:
             nav.speed(speed_now[1], speed_sd_cfg, speed_delay_cfg)
             n_speed_fused += 1
+
+        # Dual-antenna heading (REQ-NAV-010/087). Newest row only, same
+        # contract as the speed above.
+        heading_now = None
+        while iheading < len(headings) and headings[iheading][0] <= t:
+            heading_now = headings[iheading]
+            iheading += 1
+        if heading_now is not None:
+            why, yaw_meas, sd_meas = heading_measurement(heading_cfg, heading_now,
+                                                         nav.rpy())
+            heading_reasons[why] = heading_reasons.get(why, 0) + 1
+            if why == HEADING_OK:
+                nav.yaw(yaw_meas, sd_meas, heading_delay_cfg)
 
         nav.update()
 
@@ -3208,6 +3357,12 @@ def main():
                          "rpy_sigma_deg", "acc_bias", "acc_bias_sigma",
                          "gyr_bias", "gyr_bias_sigma", "mag_bias", "mag_bias_sigma"):
                     rec[k].append([math.nan] * 3)
+            # REQ-VER-037: the same position at the reference point, and the
+            # height shift every board-point curve needs on the altitude
+            # pages (baro_alt too, whose sensor sits on the board).
+            la_n = ref_point_offset_ned(nav, score_la)
+            rec["pos_ref_pt"].append([p + d for p, d in zip(rec["pos"][-1], la_n)])
+            rec["ref_pt_up"].append(-la_n[2])
 
             # ARS/AHRS: their own roll/pitch (yaw omitted for the ARS -
             # free-running, not meaningful without a reference) and their
@@ -3336,7 +3491,8 @@ def main():
             # A NaN pair rather than a skipped sample, so the drawn line
             # BREAKS while ins has nothing instead of bridging the gap
             # with a straight chord.
-            track_est.append((track_pos[0], track_pos[1])
+            track_la = ref_point_offset_ned(nav, score_la)  # REQ-VER-037
+            track_est.append((track_pos[0] + track_la[0], track_pos[1] + track_la[1])
                              if track_pos is not None
                              else (math.nan, math.nan))
             if last_ref is not None and origin_ecef is not None:
@@ -3439,7 +3595,9 @@ def main():
         if ref_now is not None and t >= t_warmup_end and in_eval_window:
             h_ell = nav.height_ellipsoid()
             if h_ell is not None:
-                e_height_ell.add(h_ell - ref_now["h_m"])
+                # REQ-VER-037: the reference point's height, not the IMU's
+                e_height_ell.add(h_ell - ref_point_offset_ned(nav, score_la)[2]
+                                 - ref_now["h_m"])
 
         if args.realtime:
             target = wall0 + (t - t0_us) / US_PER_SEC / max(args.speed, 1e-6)
@@ -3462,12 +3620,20 @@ def main():
           f"{len(ref)} reference epochs"
           f"{f', {len(mags)} mag' if mags else ''}"
           f"{f', {len(baros)} baro' if baros else ''}"
-          f"{f', {len(speeds)} speed' if speeds else ''}")
+          f"{f', {len(speeds)} speed' if speeds else ''}"
+          f"{f', {len(headings)} heading' if headings else ''}")
     if n_fi_offers:
         print(f"free-inertial start: {n_fi_offers} declaration(s) offered at "
               f"{fi_spec['lat_deg']:.7f} {fi_spec['lon_deg']:.7f} "
               f"h={fi_spec['height_m']:.1f} m +-{fi_spec['stddev_m']:g} m, "
               f"then the filter is on its own")
+    if headings:
+        print(f"heading aiding: {len(headings)} rows, "
+              f"{heading_reasons.get(HEADING_OK, 0)} offered as yaw, "
+              f"{heading_reasons.get(HEADING_NOT_FIXED, 0)} not fixed, "
+              f"{heading_reasons.get(HEADING_BAD_STDDEV, 0)} bad 1-sigma, "
+              f"{heading_reasons.get(HEADING_BAD_GEOMETRY, 0)} refused by the "
+              f"baseline geometry")
     if speeds:
         d = diag
         print(f"speed aiding: {n_speed_fused} samples offered, "

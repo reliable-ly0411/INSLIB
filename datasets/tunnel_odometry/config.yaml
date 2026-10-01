@@ -69,14 +69,15 @@ score:
   ahrs: 0
   attitude: 0
   ref_delay_ms: 200.0 # ref.csv has a 200 ms delay
+  leverarm_frd: [0.12, 0.6, -0.7]  # ref.csv IS the antenna, same as gnss.leverarm_frd
   # Don't score total RMS (no ground truth in tunnel available)
   lim_pos_rms_m: 0
   lim_ellipsoid_rms_m: 0
   # Score position after tunnel exit (REQ-VER-029).
   coast_gap_min_sec: 30.0
-  # Regression tripwire: observed 22.7 m with the odometry, limit 1 m above
+  # Regression tripwire: observed 22.2 m with the odometry, limit 1 m above
   # that, so a change that costs the coast a metre fails. It also fails with
-  # speed.enable 0 (29.2 m) and with an uncalibrated scale (55.4 m). The
+  # speed.enable 0 (29.5 m) and with an uncalibrated scale (54.9 m). The
   # number is reproducible to the millimetre across gcc 11/15, clang 14 and
   # -O0 to -O3 with FMA. Retighten after an intentional improvement.
-  lim_coast_exit_err_m: 23.7
+  lim_coast_exit_err_m: 23.2

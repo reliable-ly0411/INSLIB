@@ -1,4 +1,15 @@
-# Usage: build/insrcv.exe --config config_local_inertial.yaml
+# Example: a quick test of pure inertial navigation (IMU dead reckoning,
+# no GNSS, no magnetometer, no barometer). The filter bootstraps once from
+# the declared start position below and is on its own from then on.
+# Heading stays unknown (180 deg 1-sigma) unless you tell it otherwise via
+# init_hint below, and nothing bounds the horizontal position either way -
+# expect drift. Adjust the imu noise model to your sensor.
+#
+# Live:   build/insrcv.exe --config config_local_inertial.yaml
+# Replay: python/replay.py, python/inspostgui.py or build/replay with this
+#         file as the dataset's config.yaml
+
+aiding: none                       # replay only: no gnss.csv needed (insrcv ignores it)
 
 chi2_disable: 1
 allow_unlimited_deadreckoning: 1
@@ -10,10 +21,15 @@ free_inertial_start:               # IMU dead reckoning only
   height_m: 118.0
   stddev_m: 0.05                   # Precision of initial position
 
+init_hint:                         # known start heading, e.g. a bench test
+  yaw_deg: 0.0                     # with the unit facing a defined/known direction
+  yaw_stddev_deg: 0.5              # 0 -> no hint (usual: stays unknown, see above)
+                                   # >0 -> use it, e.g. 0.5 if you actually know it
+
 init_stddev:
   pos_init_stddev_m: 5.00
   vel_init_stddev_mps: 0.05
-  yaw_init_stddev_rad_deg: 0.1
+  yaw_init_stddev_rad_deg: 0.1     # unused while init_hint.yaw_stddev_deg > 0
 
 baro:
   enable: 0
@@ -21,7 +37,7 @@ baro:
   stddev_m: 2.0
 
 gnss:
-  enable: 0
+  enable: 0                        # live: decode GNSS, but aid nothing with it
 
 imu:
   gyr_psd: 5.0e-07      # Adjust for actual sensor
