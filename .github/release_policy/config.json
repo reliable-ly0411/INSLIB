@@ -1,0 +1,55 @@
+{
+  "schema": 1,
+  "upstream": "jnz/INSLIB",
+  "branch": "main",
+  "bootstrap_at": "2026-10-20T13:55:00Z",
+  "families": {
+    "stable": "^v\\d+\\.\\d+\\.\\d+$"
+  },
+  "max_attempts": 3,
+  "publication": "blocked: no verified downstream publication recipe; existing owner, credential and human gates remain required",
+  "baseline": {
+    "416637705": {
+      "tag": "v1.4.0",
+      "upstream_sha": "d61a57dd8d7456cd92cd653e0aef7611af02fe7c",
+      "status": "baseline",
+      "published_at": "2026-10-18T18:59:47Z"
+    },
+    "412728710": {
+      "tag": "v1.3.0",
+      "upstream_sha": "dcd7fe6de20e3b6eb192a566edf9d16529a6ed6b",
+      "status": "baseline",
+      "published_at": "2026-10-14T13:11:43Z"
+    },
+    "406843658": {
+      "tag": "v1.2.1",
+      "upstream_sha": "7297745c75ded7e3d073160823e52615183d4077",
+      "status": "baseline",
+      "published_at": "2026-10-08T13:14:00Z"
+    },
+    "402743269": {
+      "tag": "v1.2.0",
+      "upstream_sha": "aa12bc4814d42d874ac8d41dcd006666946050e5",
+      "status": "baseline",
+      "published_at": "2026-10-04T00:11:53Z"
+    },
+    "397865322": {
+      "tag": "v1.1.1",
+      "upstream_sha": "4d13debbf49c72a7016c306ee75e5e4f4e197ecd",
+      "status": "baseline",
+      "published_at": "2026-09-28T00:08:12Z"
+    },
+    "392502463": {
+      "tag": "v1.1.0",
+      "upstream_sha": "28fd0a06db5705defe03c39c0132137a813387e6",
+      "status": "baseline",
+      "published_at": "2026-09-20T16:52:27Z"
+    }
+  },
+  "heavy_workflows": [
+    "ci.yml"
+  ],
+  "automatic_workflows": [
+    "ci.yml"
+  ]
+}

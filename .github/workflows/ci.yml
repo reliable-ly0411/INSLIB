@@ -1,15 +1,26 @@
 name: CI
 
-on:
-  push:
-    branches: [main]
-  pull_request:
+'on':
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Explicit manual source ref (blank uses selected workflow ref)
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Explicit manual source ref (blank uses selected workflow ref)
+        type: string
+        default: ''
+      release_manifest:
+        type: string
+        default: ''
+        description: Pinned manifest from the release gate; empty only for explicit manual builds
 
-# Cancel superseded runs on the same branch/PR.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   check-all:
@@ -26,7 +37,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          fetch-depth: 0
+          ref: ${{ inputs.source_ref || github.sha }}
           submodules: recursive
+      - name: Reconstruct and verify pinned release source
+        if: inputs.release_manifest != ''
+        shell: bash
+        env:
+          RELEASE_MANIFEST: ${{ inputs.release_manifest }}
+        run: python3 .github/release_policy/policy.py materialize
 
       - name: Install toolchain
         run: |
@@ -81,7 +100,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          fetch-depth: 0
+          ref: ${{ inputs.source_ref || github.sha }}
           submodules: recursive
+      - name: Reconstruct and verify pinned release source
+        if: inputs.release_manifest != ''
+        shell: bash
+        env:
+          RELEASE_MANIFEST: ${{ inputs.release_manifest }}
+        run: python3 .github/release_policy/policy.py materialize
 
       - name: make test-asan
         run: make test-asan

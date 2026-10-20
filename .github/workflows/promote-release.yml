@@ -1,0 +1,25 @@
+name: Promote verified artifacts (publication blocked)
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Successful release-gated candidate run ID (never rebuilds)
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify candidate provenance and immutable artifact digests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+        run: python3 .github/release_policy/evidence.py verify
+      - name: Require an authorized publication route
+        run: |
+          echo '::error::Artifacts verified without rebuilding. Publication is blocked: no verified downstream publisher. Existing owner, human and security gates must be retained.'
+          exit 1
