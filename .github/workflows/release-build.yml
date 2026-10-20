@@ -1,0 +1,45 @@
+name: Validate pinned release candidate
+'on':
+  workflow_call:
+    inputs:
+      source_ref:
+        type: string
+        required: true
+      release_manifest:
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: write
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    with:
+      source_ref: ${{ inputs.source_ref }}
+      release_manifest: ${{ inputs.release_manifest }}
+  evidence:
+    needs:
+    - ci
+    if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.source_ref }}
+    - name: Record source and immutable artifact IDs/digests
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RELEASE_MANIFEST: ${{ inputs.release_manifest }}
+      run: python3 .github/release_policy/evidence.py record
+    - uses: actions/upload-artifact@v4
+      with:
+        name: release-evidence
+        path: release-evidence.json
+        if-no-files-found: error
+        retention-days: 90
+    - name: Publication remains blocked
+      run: echo 'Validated candidate only. No verified downstream publisher is configured; existing gates are unchanged.'
+        >> "$GITHUB_STEP_SUMMARY"

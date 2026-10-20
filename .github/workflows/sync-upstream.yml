@@ -1,47 +1,99 @@
 name: Sync upstream
-
 on:
   schedule:
-    # 可替换：cron 使用 UTC；当前为每月 1 日 04:20 UTC，即北京时间 12:20。
-    - cron: "20 4 1 * *"
+    - cron: "20 4 * * *"
   workflow_dispatch:
-
+    inputs:
+      action:
+        description: Sync only, or sync and inspect new formal releases
+        type: choice
+        options: [sync, check-releases]
+        default: sync
+      retry_release_id:
+        description: Explicit retry of one failed release ID (no historical backfill)
+        type: string
+        default: ''
 permissions:
-  contents: write
-
-# 同一时间只保留一个同步任务，避免手动运行与定时运行同时推送 main。
+  contents: read
 concurrency:
-  group: sync-upstream-main
+  group: release-policy-main
   cancel-in-progress: false
-
 jobs:
   sync:
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.release.outputs.build }}
+      release_id: ${{ steps.release.outputs.release_id }}
+      source_ref: ${{ steps.release.outputs.source_ref }}
+      manifest: ${{ steps.release.outputs.manifest }}
     steps:
-      - name: Checkout fork
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
-
-      - name: Merge upstream main
+      - name: Merge upstream without replacing local policy
         env:
-          # 可替换：上游仓库地址和目标分支；例如 jnz/INSLIB 与 main。
-          UPSTREAM_URL: https://github.com/jnz/INSLIB.git
+          UPSTREAM: jnz/INSLIB
           TARGET_BRANCH: main
+        shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote add upstream "$UPSTREAM_URL"
-          git fetch --no-tags upstream "$TARGET_BRANCH"
-          git checkout "$TARGET_BRANCH"
-
-          if git merge-base --is-ancestor "upstream/$TARGET_BRANCH" HEAD; then
-            echo "Fork is already up to date"
-            exit 0
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch --no-recurse-submodules --no-tags upstream "$TARGET_BRANCH"
+          if ! git merge-base --is-ancestor "upstream/$TARGET_BRANCH" HEAD; then
+            if ! git merge --no-ff --no-commit "upstream/$TARGET_BRANCH"; then
+              mapfile -d '' -t conflicts < <(git diff --name-only --diff-filter=U -z)
+              (( ${#conflicts[@]} > 0 )) || exit 1
+              for path in "${conflicts[@]}"; do
+                case "$path" in
+                  .github/workflows/*|.github/release_policy/*) ;;
+                  *) echo "Manual conflict resolution required: $path"; exit 1 ;;
+                esac
+              done
+            fi
+            git restore --source=HEAD --staged --worktree -- .github/workflows .github/release_policy
+            git commit -m "CI: sync upstream while retaining downstream workflow policy"
+            git push origin "HEAD:$TARGET_BRANCH"
           fi
-
-          # 保留 fork 自有提交；代码冲突直接失败，留给人工审查和解决。
-          git merge --no-ff --no-edit "upstream/$TARGET_BRANCH"
-          git push origin "HEAD:$TARGET_BRANCH"
+      - name: Unit-test the lightweight release detector
+        run: python3 -m unittest discover -s .github/release_policy -p 'test_*.py' -v
+      - name: Recognize one new formal release and pin source
+        id: release
+        if: github.event_name == 'schedule' || inputs.action == 'check-releases'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RETRY_ID: ${{ inputs.retry_release_id }}
+        run: python3 .github/release_policy/policy.py prepare --retry-id "$RETRY_ID"
+  build:
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    permissions:
+      contents: read
+      actions: write
+    uses: ./.github/workflows/release-build.yml
+    with:
+      source_ref: ${{ needs.sync.outputs.source_ref }}
+      release_manifest: ${{ needs.sync.outputs.manifest }}
+  finish:
+    needs: [sync, build]
+    if: always() && needs.sync.outputs.build == 'true'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Record exact outcome without publishing
+        env:
+          RELEASE_ID: ${{ needs.sync.outputs.release_id }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python3 .github/release_policy/policy.py finish --release-id "$RELEASE_ID" --result "$BUILD_RESULT"
