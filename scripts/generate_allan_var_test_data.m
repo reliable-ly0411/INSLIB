@@ -1,7 +1,7 @@
 %% ------------------------------------------------------------------
 %  Generate a synthetic static IMU recording in the INSLIB replay
 %  format, with a KNOWN Angle/Velocity Random Walk and Rate Random
-%  Walk, to verify that python/allan_variance.py recovers them.
+%  Walk, to verify that tools/allan_variance.py recovers them.
 %
 %  Format (see datasets/replay_format.py):
 %      t_us, gyr_frd_xyz [rad/s], acc_frd_xyz [m/s^2]

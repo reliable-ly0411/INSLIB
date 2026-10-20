@@ -4,7 +4,7 @@
 Records one continuous session in which the unit is put down in a number
 of arbitrary static poses with rotations in between, then solves for the
 accelerometer and gyroscope calibration and writes the REQ-NAV-037 keys
-into a config.yaml that tools/insrcv.c --config and python/replay.py
+into a config.yaml that tools/insrcv.c --config and tools/replay.py
 consume directly:
 
     imu:
@@ -58,7 +58,7 @@ What is measured:
 The housing alignment (where the IMU sits inside the BOX, as opposed to
 where the sensor sits on the board) needs the unit placed on a level
 surface face by face, which is a guided procedure rather than a recording:
-tools/inslib_calib_gui.py has it.
+inslib_calib_gui.py has it.
 
 The IMU temperature over the whole session is recorded and written as a
 comment together with the date: MEMS biases drift with temperature, so
@@ -80,11 +80,11 @@ as replay-format CSV files (imu.csv, optionally mag.csv, see
 load_csv_recording). It follows the same procedure: rest period first,
 then poses with rotations in between.
 
---udp reads the stream from tools/inslib_hub.py's fan-out instead of
+--udp reads the stream from inslib_hub.py's fan-out instead of
 opening the serial port, so a running session keeps recording and feeding
 insrcv while the unit is being calibrated (see UdpSource).
 
-tools/inslib_calib_gui.py is a graphical front end for the same
+inslib_calib_gui.py is a graphical front end for the same
 measurement and solve code in this file.
 
 Requires pyserial and numpy. PyYAML only when merging into an existing
@@ -300,7 +300,7 @@ def decode_mag(payload):
 
 # --- standard u-blox NAV-PVT decode (pyubx2) --------------------------------
 # The receiver's own fix, arriving on the same link whenever the board
-# passes it through (tools/inslib_hub.py). Only decoded so the GUI can
+# passes it through (inslib_hub.py). Only decoded so the GUI can
 # offer "fill the position in from the receiver" instead of it having to
 # be typed in by hand. Position feeds two lookups: the WMM field strength
 # for the magnetometer and normal gravity for the accelerometer.
@@ -346,7 +346,7 @@ def decode_nav_pvt(frame):
 class UdpSource:
     """The hub's UDP fan-out instead of the serial port.
 
-    tools/inslib_hub.py owns the device (one owner per port), so a
+    inslib_hub.py owns the device (one owner per port), so a
     calibration that opens the port itself cannot run while a session is
     being recorded or fed to insrcv. Reading the fan-out means the board
     keeps streaming to everything else while it is calibrated, which is
@@ -355,7 +355,7 @@ class UdpSource:
 
     Give the hub a second destination for it:
 
-        python3 tools/inslib_hub.py COM4 \\
+        python3 inslib_hub.py COM4 \\
             --fanout 127.0.0.1:29800,127.0.0.1:29801
 
     A separate port, not a second listener on insrcv's: two UDP sockets
@@ -419,7 +419,7 @@ def open_source(port=None, baud=921600, udp=None):
         return serial.Serial(port, baud, timeout=0.05)
     except serial.SerialException as e:
         sys.exit(f"[calib] cannot open {port}: {e}\n"
-                 f"        (tools/inslib_hub.py owns the port when it is "
+                 f"        (inslib_hub.py owns the port when it is "
                  f"running -- use --udp instead)")
 
 
@@ -454,7 +454,7 @@ class ImuStream:
         # business knowing what a caller asked for - only that these
         # frames belong to it and not in the sample stream.
         self._cfg = []
-        # A GNSS receiver passed through the same link (tools/inslib_hub.py)
+        # A GNSS receiver passed through the same link (inslib_hub.py)
         # sends its own NAV-PVT alongside the IMU frames, parked here like
         # the magnetometer.
         self._gnss = []
@@ -844,7 +844,7 @@ class Calibration:
     """Everything one session measured, already in config units.
 
     The single hand-off between measuring and writing, so the console
-    tool and tools/inslib_calib_gui.py produce byte-identical files from
+    tool and inslib_calib_gui.py produce byte-identical files from
     the same numbers."""
     acc_matrix: list                # row-major nested 3x3, M = T*K
     acc_bias: list                  # [m/s^2]
@@ -1127,7 +1127,7 @@ def build_header(cal, merged, magcal=None, housing=None):
                "" if cal.misalignment_estimated
                else "misalignment NOT estimated: scale and bias only\n"))
     else:
-        header = ("calibration update by tools/inslib_calib_gui.py\n"
+        header = ("calibration update by inslib_calib_gui.py\n"
                   "date: %s\n"
                   "%s"
                   "model: corrected = M * (raw - fixed_bias)   (REQ-NAV-037)"
@@ -1498,7 +1498,7 @@ def finish(args, rec, existing):
     print(f"[calib] wrote {args.out}")
     print("Use it with:")
     print(f"  insrcv --udp-port 29800 --config {args.out}   (live receiver)")
-    print(f"  python3 python/replay.py <datadir>            (offline replay)")
+    print(f"  python3 tools/replay.py <datadir>            (offline replay)")
 
 
 if __name__ == "__main__":

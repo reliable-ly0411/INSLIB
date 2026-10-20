@@ -49,6 +49,9 @@
 # All build output (test binaries, replay, insrcv) lands in build/, kept
 # out of the source tree; `make clean` removes it wholesale.
 #
+# Every Python call goes through $(PYTHON), so a specific interpreter can be
+# chosen on the command line, e.g. `make pytest PYTHON=.venv/bin/python`.
+#
 # On Windows use mingw32-make in place of make.
 
 # --- Platform detection -----------------------------------------------------
@@ -70,6 +73,10 @@ ifeq ($(OS),Windows_NT)
         RUN :=
         RM  := del /q
     endif
+    # A Windows venv ships python.exe only, no python3.exe: a bare "python3"
+    # resolves to the Microsoft Store stub (a different interpreter without
+    # the venv's packages) or to nothing at all.
+    PYTHON ?= python
 else
     EXE :=
     SO  := .so
@@ -79,6 +86,7 @@ else
     ifeq ($(UNAME_S),Darwin)
         SO := .dylib
     endif
+    PYTHON ?= python3
 endif
 
 BUILD_DIR := build
@@ -110,6 +118,10 @@ NAV_SRC          := src/ins.c src/geodetic_toolbox.c src/magnetic_model.c src/lo
 MATH_SRC         := src/geodetic_toolbox.c src/magnetic_model.c
 SUITE_SRC        := src/ins.c src/geodetic_toolbox.c src/magnetic_model.c src/ahrs.c src/baro_alt.c src/nav_suite.c src/log.c
 KFCORE_SRC       := KFCore/c/linalg.c KFCore/c/kalman_udu.c KFCore/c/miniblas.c
+# Roll/pitch-only attitude filter (ahrs.c built with AHRS_NO_MAG): everything
+# it needs, and deliberately no magnetic_model.c.
+AHRS_NOMAG_SRC   := src/ahrs.c src/geodetic_toolbox.c
+AHRS_NOMAG_FLAGS := -DAHRS_NO_MAG
 KFCORE_SRC_MATH  := KFCore/c/linalg.c KFCore/c/miniblas.c
 
 # KFCore is a git submodule: a plain `git clone` (without --recursive)
@@ -150,13 +162,27 @@ FW_CFG_SRC  := $(FW_DIR)/Src/inslib_sensor/cfg.c \
 FW_INCLUDES := -I$(FW_DIR)/Inc
 FW_HDR      := $(wildcard $(FW_DIR)/Inc/inslib/*.h)
 
+# Rover side radio ranging (air protocol, session state machine, burst
+# processing), tested on the host against a simulated radio. The test
+# lives under embedded/ itself: it is private firmware, not part of the
+# public export.
+FW_RNG_SRC  := $(FW_DIR)/Src/inslib_sensor/lora_proto.c                $(FW_DIR)/Src/inslib_sensor/ranging.c
+FW_RNG_TEST := embedded/tests/test_ranging.c
+# Rover against real anchors over a simulated air interface. The second
+# anchor is anchor.c compiled once more under other names.
+FW_RNG_E2E_SRC := $(FW_RNG_SRC) $(FW_DIR)/Src/inslib_sensor/anchor.c                   embedded/tests/anchor_second_instance.c
+FW_RNG_E2E  := embedded/tests/test_ranging_e2e.c
+
 TEST_CORE := $(BUILD_DIR)/test_core$(EXE)
 TEST_MATH := $(BUILD_DIR)/test_math$(EXE)
 TEST_AHRS := $(BUILD_DIR)/test_ahrs$(EXE)
+TEST_AHRS_NOMAG := $(BUILD_DIR)/test_ahrs_nomag$(EXE)
 TEST_BARO := $(BUILD_DIR)/test_baro$(EXE)
 TEST_LOG  := $(BUILD_DIR)/test_log$(EXE)
 TEST_YAML := $(BUILD_DIR)/test_yaml$(EXE)
 TEST_CFG  := $(BUILD_DIR)/test_cfg$(EXE)
+TEST_RNG  := $(BUILD_DIR)/test_ranging$(EXE)
+TEST_RNG_E2E := $(BUILD_DIR)/test_ranging_e2e$(EXE)
 REPLAY    := $(BUILD_DIR)/replay$(EXE)
 INSRCV    := $(BUILD_DIR)/insrcv$(EXE)
 
@@ -167,14 +193,22 @@ INSRCV    := $(BUILD_DIR)/insrcv$(EXE)
 # the whole build for everyone else.
 HAVE_EMBEDDED := $(wildcard $(FW_DIR)/Src/inslib_sensor/cfg.c)
 ifneq ($(HAVE_EMBEDDED),)
-ALL_TEST_CFG := $(TEST_CFG)
+# The reference board's host tools (embedded/tools) are tested next to the
+# public ones by `make pytest`.
+PYTEST_DIRS := python/tests embedded/tests
+ALL_TEST_CFG := $(TEST_CFG) $(TEST_RNG) $(TEST_RNG_E2E)
 RUN_TEST_CFG := $(RUN)$(TEST_CFG)
+RUN_TEST_RNG := $(RUN)$(TEST_RNG)
+RUN_TEST_RNG_E2E := $(RUN)$(TEST_RNG_E2E)
 else
+PYTEST_DIRS := python/tests
 ALL_TEST_CFG :=
 # No leading @: Make's @-silencing is resolved on the literal recipe text
 # before variable expansion, so an @ hidden inside this variable would
 # reach the shell literally instead of silencing the line.
 RUN_TEST_CFG := echo "test_cfg: skipped, embedded/ not present (public repo)"
+RUN_TEST_RNG := echo "test_ranging: skipped, embedded/ not present (public repo)"
+RUN_TEST_RNG_E2E := echo "test_ranging_e2e: skipped, embedded/ not present (public repo)"
 endif
 
 # --- Toolchain check (Windows) ----------------------------------------------
@@ -196,10 +230,10 @@ ifneq (1,$(words $(shell gcc -dumpmachine 2>&1)))
 # without a compiler, so only abort for these (no goal at all means the
 # default target, which builds).
 CC_GOALS := all test test-asan check-all coverage readme-coverage \
-            $(TEST_CORE) $(TEST_MATH) $(TEST_AHRS) $(TEST_BARO) $(TEST_LOG) \
-            test_core test_math test_ahrs test_baro test_log \
+            $(TEST_CORE) $(TEST_MATH) $(TEST_AHRS) $(TEST_AHRS_NOMAG) $(TEST_BARO) $(TEST_LOG) \
+            test_core test_math test_ahrs test_ahrs_nomag test_baro test_log \
             $(REPLAY) replay $(INSRCV) insrcv \
-            pylib pytest datasets datasets-fog datasets-kfgins \
+            pylib pytest datasets datasets-fog datasets-kfgins datasets-kfgins-faults \
             datasets-tunnel datasets-tunnel-nhc datasets-tunnel-odometry \
             datasets-pedestrian datasets-inertial-roundtrip simulated crazyflie
 
@@ -236,12 +270,13 @@ endif
 endif
 
 .PHONY: all test clean coverage coverage-clean readme-coverage datasets datasets-kfgins \
+        datasets-kfgins-faults \
         datasets-fog datasets-tunnel datasets-tunnel-nhc datasets-tunnel-odometry \
         datasets-pedestrian datasets-inertial-roundtrip \
-        simulated crazyflie reqs pylib pytest wmm doc doxygen test-asan \
+        simulated crazyflie tutorials reqs pylib pytest wmm doc doxygen test-asan \
         format format-check cppcheck clang-tidy stack readme-stack check-all insrcv \
-        test_core test_math test_ahrs test_baro test_log test_cfg test_yaml \
-        replay
+        test_core test_math test_ahrs test_ahrs_nomag test_baro test_log test_cfg test_yaml \
+        replay inspostgui-exe
 
 # --- Build output directory --------------------------------------------------
 # Order-only prerequisite (the "|" below) on every binary rule: it only
@@ -259,6 +294,7 @@ endif
 test_core: $(TEST_CORE)
 test_math: $(TEST_MATH)
 test_ahrs: $(TEST_AHRS)
+test_ahrs_nomag: $(TEST_AHRS_NOMAG)
 test_baro: $(TEST_BARO)
 test_log:  $(TEST_LOG)
 test_yaml: $(TEST_YAML)
@@ -276,14 +312,16 @@ replay:    $(REPLAY)
 # otherwise drown the terse ok/FAIL output in noise (verified: over
 # 2000 chi2-downweight lines in one run without this). test_log itself
 # is excluded - it specifically exercises level filtering across the
-# full range and needs log.h's default (LOG_LEVEL_INFO) ceiling intact.
+# full range and so pins the INFO ceiling explicitly, since log.h's
+# default is lower.
 # Not applied to $(CFLAGS)/pylib/replay/insrcv: consumers of the
-# library get full logging by default, as documented in log.h - only
-# this repo's own noisy fault-injection tests opt out.
+# library get log.h's default ceiling - only this repo's own noisy
+# fault-injection tests opt out.
 TEST_LOG_LEVEL_CFLAGS := -DLOG_LEVEL=LOG_LEVEL_NONE
+TEST_LOG_INFO_CFLAGS  := -DLOG_LEVEL=LOG_LEVEL_INFO
 
-all: $(TEST_CORE) $(TEST_MATH) $(TEST_AHRS) $(TEST_BARO) $(TEST_LOG) $(TEST_YAML) \
-     $(ALL_TEST_CFG)
+all: $(TEST_CORE) $(TEST_MATH) $(TEST_AHRS) $(TEST_AHRS_NOMAG) $(TEST_BARO) $(TEST_LOG) \
+     $(TEST_YAML) $(ALL_TEST_CFG)
 
 $(TEST_CORE): $(NAV_SRC) $(KFCORE_SRC) tests/test_ins_core.c $(NAV_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
@@ -294,11 +332,16 @@ $(TEST_MATH): $(MATH_SRC) $(KFCORE_SRC_MATH) tests/test_ins_math.c $(NAV_HDR) | 
 $(TEST_AHRS): $(SUITE_SRC) $(KFCORE_SRC) tests/test_ahrs.c $(NAV_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
 
+# Neither magnetic_model.c nor log.c is linked (logging is compiled out), so
+# the build itself proves the magnetometer-free ahrs.c is self-contained.
+$(TEST_AHRS_NOMAG): $(AHRS_NOMAG_SRC) $(KFCORE_SRC) tests/test_ahrs_nomag.c $(NAV_HDR) | $(BUILD_DIR)
+	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(AHRS_NOMAG_FLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
+
 $(TEST_BARO): $(SUITE_SRC) $(KFCORE_SRC) tests/test_baro.c $(NAV_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
 
 $(TEST_LOG): src/log.c tests/test_log.c $(NAV_HDR) | $(BUILD_DIR)
-	$(CC) $(HARNESS_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
+	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_INFO_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
 
 # The config.yaml helpers the two harnesses share (YAML subset reader, IMU
 # mounting). Header only, so this needs nothing but -Itools and the test
@@ -309,16 +352,26 @@ $(TEST_YAML): tests/test_yaml.c tools/mini_yaml.h tools/imu_mount.h | $(BUILD_DI
 $(TEST_CFG): $(FW_CFG_SRC) tests/test_cfg.c $(FW_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(FW_INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
 
+$(TEST_RNG): $(FW_RNG_SRC) $(FW_RNG_TEST) $(FW_HDR) | $(BUILD_DIR)
+	$(CC) $(HARNESS_CFLAGS) $(FW_INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
+
+$(TEST_RNG_E2E): $(FW_RNG_E2E_SRC) $(FW_RNG_E2E) $(FW_HDR) | $(BUILD_DIR)
+	$(CC) $(HARNESS_CFLAGS) $(FW_INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
+
 test: all
 	$(RUN)$(TEST_CORE)
 	$(RUN)$(TEST_MATH)
 	$(RUN)$(TEST_AHRS)
+	$(RUN)$(TEST_AHRS_NOMAG)
 	$(RUN)$(TEST_BARO)
 	$(RUN)$(TEST_LOG)
 	$(RUN)$(TEST_YAML)
 	$(RUN_TEST_CFG)
+	$(RUN_TEST_RNG)
+	$(RUN_TEST_RNG_E2E)
 	@$(MAKE) --no-print-directory simulated
 	@$(MAKE) --no-print-directory crazyflie
+	@$(MAKE) --no-print-directory tutorials
 	@$(MAKE) --no-print-directory datasets
 
 tests: test
@@ -339,18 +392,24 @@ test-asan: | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(SAN_FLAGS) $(INCLUDES) $(NAV_SRC) $(KFCORE_SRC) tests/test_ins_core.c $(LDLIBS) -o $(BUILD_DIR)/test_core_asan
 	$(CC) $(HARNESS_CFLAGS) $(SAN_FLAGS) $(INCLUDES) $(MATH_SRC) $(KFCORE_SRC_MATH) tests/test_ins_math.c $(LDLIBS) -o $(BUILD_DIR)/test_math_asan
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(SAN_FLAGS) $(INCLUDES) $(SUITE_SRC) $(KFCORE_SRC) tests/test_ahrs.c $(LDLIBS) -o $(BUILD_DIR)/test_ahrs_asan
+	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(AHRS_NOMAG_FLAGS) $(SAN_FLAGS) $(INCLUDES) $(AHRS_NOMAG_SRC) $(KFCORE_SRC) tests/test_ahrs_nomag.c $(LDLIBS) -o $(BUILD_DIR)/test_ahrs_nomag_asan
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(SAN_FLAGS) $(INCLUDES) $(SUITE_SRC) $(KFCORE_SRC) tests/test_baro.c $(LDLIBS) -o $(BUILD_DIR)/test_baro_asan
-	$(CC) $(HARNESS_CFLAGS) $(SAN_FLAGS) $(INCLUDES) src/log.c tests/test_log.c $(LDLIBS) -o $(BUILD_DIR)/test_log_asan
+	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_INFO_CFLAGS) $(SAN_FLAGS) $(INCLUDES) src/log.c tests/test_log.c $(LDLIBS) -o $(BUILD_DIR)/test_log_asan
 ifneq ($(HAVE_EMBEDDED),)
 	$(CC) $(HARNESS_CFLAGS) $(SAN_FLAGS) $(FW_INCLUDES) $(FW_CFG_SRC) tests/test_cfg.c $(LDLIBS) -o $(BUILD_DIR)/test_cfg_asan
+	$(CC) $(HARNESS_CFLAGS) $(SAN_FLAGS) $(FW_INCLUDES) $(FW_RNG_SRC) $(FW_RNG_TEST) $(LDLIBS) -o $(BUILD_DIR)/test_ranging_asan
+	$(CC) $(HARNESS_CFLAGS) $(SAN_FLAGS) $(FW_INCLUDES) $(FW_RNG_E2E_SRC) $(FW_RNG_E2E) $(LDLIBS) -o $(BUILD_DIR)/test_ranging_e2e_asan
 endif
 	./$(BUILD_DIR)/test_core_asan
 	./$(BUILD_DIR)/test_math_asan
 	./$(BUILD_DIR)/test_ahrs_asan
+	./$(BUILD_DIR)/test_ahrs_nomag_asan
 	./$(BUILD_DIR)/test_baro_asan
 	./$(BUILD_DIR)/test_log_asan
 ifneq ($(HAVE_EMBEDDED),)
 	./$(BUILD_DIR)/test_cfg_asan
+	./$(BUILD_DIR)/test_ranging_asan
+	./$(BUILD_DIR)/test_ranging_e2e_asan
 else
 	@echo "test_cfg_asan: skipped, embedded/ not present (public repo)"
 endif
@@ -374,7 +433,7 @@ STACK_CFLAGS := -std=c11 -O2 -D_GNU_SOURCE -U_FORTIFY_SOURCE -fno-stack-protecto
                 $(KFCORE_LIMITS) $(INCLUDES)
 
 stack: $(SUITE_SRC) $(KFCORE_SRC) $(NAV_HDR) scripts/stack_usage.cfg scripts/stack_usage.py | $(BUILD_DIR)
-	python3 scripts/stack_usage.py --config scripts/stack_usage.cfg --cc $(STACK_CC) \
+	$(PYTHON) scripts/stack_usage.py --config scripts/stack_usage.cfg --cc $(STACK_CC) \
 	    --cflags="$(STACK_CFLAGS)" --build-dir $(BUILD_DIR)/stack \
 	    --json $(BUILD_DIR)/stack/stack_usage.json $(SUITE_SRC) $(KFCORE_SRC)
 
@@ -385,7 +444,7 @@ stack: $(SUITE_SRC) $(KFCORE_SRC) $(NAV_HDR) scripts/stack_usage.cfg scripts/sta
 # `make stack` stay an embedded/ concern. Release process step 4 in
 # CLAUDE.md.
 readme-stack: stack
-	python3 scripts/update_readme_stack.py
+	$(PYTHON) scripts/update_readme_stack.py
 
 # --- Requirements database (see requirements/README.md) ----------------------
 # requirements/ is internal-only (see scripts/public_export.exclude in the
@@ -395,7 +454,7 @@ reqs:
 ifeq ($(wildcard requirements/check_reqs.py),)
 	@echo "reqs: skipped, requirements/ not present (public repo)"
 else
-	python3 requirements/check_reqs.py
+	$(PYTHON) requirements/check_reqs.py
 endif
 
 # --- Code formatting (clang-format, style rules in .clang-format) ------------
@@ -481,8 +540,8 @@ doxygen:
 # fresh look at every epoch. It reports rather than passes or fails, hence a
 # separate manual step and not a recipe line here.
 wmm:
-	python3 magneticmodel/generate_wmm_grid.py
-	python3 magneticmodel/generate_test_vectors.py
+	$(PYTHON) magneticmodel/generate_wmm_grid.py
+	$(PYTHON) magneticmodel/generate_test_vectors.py
 
 # --- Real-world replay tests -------------------------------------------------
 # Dataset bundle contract: doc/INSLIB_manual.tex, section "config.yaml"
@@ -491,8 +550,9 @@ wmm:
 # the list below. Every dataset here is committed and deterministic, so
 # `make test` runs the whole list as a regression gate -- a new entry
 # below is picked up by `make test` without a second edit.
-datasets: datasets-fog datasets-kfgins datasets-tunnel datasets-tunnel-nhc \
-          datasets-tunnel-odometry datasets-pedestrian datasets-inertial-roundtrip
+datasets: datasets-fog datasets-kfgins datasets-kfgins-faults datasets-tunnel \
+          datasets-tunnel-nhc datasets-tunnel-odometry datasets-pedestrian \
+          datasets-inertial-roundtrip
 
 $(REPLAY): $(SUITE_SRC) $(KFCORE_SRC) tools/replay.c tools/imu_mount.h $(NAV_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
@@ -519,6 +579,18 @@ PYLIB_SRC := $(SUITE_SRC) $(KFCORE_SRC) python/csrc/ins_capi.c
 
 pylib: $(PYLIB)
 
+# Windows folder with tools/inspostgui.py and everything it needs, no Python
+# installation required: build/dist/inspostgui/inspostgui.exe. Needs
+# `pip install -r scripts/requirements-exe.txt`, see
+# scripts/inspostgui.spec. Not part of `make test`.
+inspostgui-exe: $(PYLIB)
+	@$(PYTHON) -c "import PyInstaller" 2>/dev/null || { \
+	    echo "PyInstaller is missing in: $$($(PYTHON) -c 'import sys; print(sys.executable)')"; \
+	    echo "Install it with: $(PYTHON) -m pip install -r scripts/requirements-exe.txt"; \
+	    echo "(or pick another interpreter: make inspostgui-exe PYTHON=<path>)"; \
+	    exit 1; }
+	$(PYTHON) -m PyInstaller --noconfirm --distpath $(BUILD_DIR)/dist --workpath $(BUILD_DIR)/pyinstaller scripts/inspostgui.spec
+
 # $(NAV_HDR) and the capi header are prerequisites like everywhere else:
 # without them a header-only change (a tuning constant in sensor_defaults.h,
 # say) leaves a stale .dll behind, and every Python consumer -
@@ -534,14 +606,14 @@ $(PYLIB): $(PYLIB_SRC) $(NAV_HDR) python/csrc/ins_capi.h
 # cannot silently go unrun on a machine without pytest. It keeps going after
 # a failure and reports every failing file, then exits non-zero.
 pytest: $(PYLIB)
-	@if python3 -c "import pytest" 2>/dev/null; then \
-	    python3 -m pytest python/tests -q; \
+	@if $(PYTHON) -c "import pytest" 2>/dev/null; then \
+	    $(PYTHON) -m pytest $(PYTEST_DIRS) -q; \
 	else \
 	    echo "(pytest not installed - running standalone runner)"; \
 	    failed=""; \
-	    for t in python/tests/test_*.py; do \
+	    for t in $(foreach d,$(PYTEST_DIRS),$(wildcard $(d)/test_*.py)); do \
 	        echo "--> $$t"; \
-	        python3 "$$t" || failed="$$failed $$t"; \
+	        $(PYTHON) "$$t" || failed="$$failed $$t"; \
 	    done; \
 	    if [ -n "$$failed" ]; then \
 	        echo "standalone runner failures:$$failed"; \
@@ -549,6 +621,12 @@ pytest: $(PYLIB)
 	    fi; \
 	    echo "standalone runner: all test files passed"; \
 	fi
+
+# The code in tutorial/*.md, built and run as the text says and compared with
+# the printed expected output (REQ-VER-042). The C programs need only the
+# compiler, the Python scripts the binding, so the library is built first.
+tutorials: $(PYLIB)
+	CC="$(CC)" $(PYTHON) python/tests/test_tutorials.py
 
 # Real MEMS ADAHRS vs. an independent FOG strapdown attitude reference, real
 # GNSS position/velocity aiding (see datasets/fog/config.yaml).
@@ -558,6 +636,31 @@ datasets-fog: $(REPLAY)
 # KF-GINS Dataset: Leador-A15 FOG + RTK-GNSS (https://github.com/i2Nav-WHU/KF-GINS/dataset).
 datasets-kfgins: $(REPLAY)
 	$(RUN)$(REPLAY) datasets/kfgins/config.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_vel.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_vel_outage.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_vel_outage_nhc.yaml
+
+# The same trial with synthetic GNSS faults and L1 single point fixes
+# (REQ-VER-050): spikes, a wrong RTK fix, multipath, honest degradation,
+# velocity spikes, lasting steps and 500 m blunders, written by
+# tools/gnss_faults.py with fixed seeds (python/tests/test_gnss_faults.py
+# checks that the committed files are what it writes). INSLIB runs with its
+# chi2 gate on, so these gate the outlier handling.
+datasets-kfgins-faults: $(REPLAY)
+	$(RUN)$(REPLAY) datasets/kfgins/config_fault_spike.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_fault_wrong_fix.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_fault_multipath.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_fault_degraded.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_fault_vel_spike.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_fault_step.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_fault_big_step.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_fault_gross.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_spp.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_spp_spike.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_spp_multipath.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_spp_vel_spike.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_spp_step.yaml
+	$(RUN)$(REPLAY) datasets/kfgins/config_spp_gross.yaml
 
 # Car through a road tunnel: real u-blox fixes across a 94 s total GNSS
 # blackout, the only recording here that drives the coasting expiry, the
@@ -610,7 +713,7 @@ datasets-inertial-roundtrip: $(REPLAY)
 # sub-filters vs the true reference. The Python harness
 # (datasets/check_simulated.py) re-scores ins through the ctypes binding
 # AND checks it stays within a factor of the Groves textbook LC filter's own
-# accuracy. That harness drives python/replay.py and owns the pass/fail gates itself.
+# accuracy. That harness drives tools/replay.py and owns the pass/fail gates itself.
 # Deterministic synthetic data.
 SIMULATED_DATASETS := datasets/simulated/profile_1_car \
                       datasets/simulated/profile_3_aircraft
@@ -619,17 +722,28 @@ SIMULATED_DATASETS := datasets/simulated/profile_1_car \
 # Groves textbook LC filter, which the profiles above are built for and
 # these are not.
 #
-# B_drone/config_coasting.yaml replays the B_drone flight with a coasting
-# window (4 s) SHORTER than its 62-72 s GNSS outage, so the filter goes
+# A_ideal is a noise-free flight (IMU, no sensor noise): the filter error has
+# to stay near zero, so any false stillness trigger or modelling fault shows
+# up directly in its tight limits.
+#
+# B_drone is gated twice. Its config.yaml keeps the whole 62-72 s GNSS outage
+# inside the coasting window, starts from the reference and scores the
+# ARS/AHRS sub-filters. B_drone/config_coasting.yaml replays the same flight
+# with a coasting window (4 s) SHORTER than the outage, so the filter goes
 # inert mid-gap and re-acquires at the far end (REQ-NAV-064, REQ-NAV-065,
-# REQ-NAV-066). Its own config.yaml deliberately keeps the whole outage
-# inside the window, so without this second config nothing gates the
-# freeze on data with an independent truth.
-SIMULATED_C_ONLY := datasets/simulated/B_drone/config_coasting.yaml
+# REQ-NAV-066). Without the second config nothing gates the freeze on data
+# with an independent truth.
+#
+# E_gnss_delay fuses GNSS fixes arriving 500 ms after their time of validity
+# (history-anchored delayed fusion) at 2 Hz on a drone climb/circle/descent.
+SIMULATED_C_ONLY := datasets/simulated/A_ideal \
+                    datasets/simulated/B_drone \
+                    datasets/simulated/B_drone/config_coasting.yaml \
+                    datasets/simulated/E_gnss_delay
 
 # Part of `make test` (the default stability gate): the C harness always
 # runs (pure C, committed data). check_simulated.py runs additionally when
-# python3 + PyYAML + numpy are available (gracefully skipped otherwise, like
+# $(PYTHON) + PyYAML + numpy are available (gracefully skipped otherwise, like
 # the pytest target). numpy is pulled in transitively via replay.py ->
 # geodetic_toolbox.py, so it is checked here too, not just yaml. The Python
 # side stays optional for the C-only workflow.
@@ -639,15 +753,15 @@ simulated: $(REPLAY)
 	    echo "=== replay.c: $$d ==="; \
 	    $(RUN)$(REPLAY) $$d; \
 	done; \
-	if python3 -c "import yaml, numpy" >/dev/null 2>&1; then \
+	if $(PYTHON) -c "import yaml, numpy" >/dev/null 2>&1; then \
 	    $(MAKE) --no-print-directory pylib; \
 	    for d in $(SIMULATED_DATASETS); do \
 	        echo "=== check_simulated.py: $$d ==="; \
-	        python3 datasets/check_simulated.py $$d; \
+	        $(PYTHON) datasets/check_simulated.py $$d; \
 	    done; \
 	    echo "simulated: all datasets passed (replay.c + check_simulated.py)"; \
 	else \
-	    echo "simulated: replay.c passed; check_simulated.py SKIPPED (no python3/PyYAML/numpy)"; \
+	    echo "simulated: replay.c passed; check_simulated.py SKIPPED (no python/PyYAML/numpy)"; \
 	fi
 
 # --- Crazyflie regression datasets (Lighthouse ground truth) -----
@@ -709,7 +823,9 @@ COV_OBJDIR := $(COV_DIR)/obj
 COV_KFCORE_OBJDIR := $(COV_DIR)/obj-kfcore
 # -MMD -MP: per-object header dependency files (coverage/obj/**/*.d, included
 # below), so a changed header invalidates every coverage .o that included it.
-COV_CFLAGS := $(HARNESS_CFLAGS) -O0 -g --coverage -MMD -MP
+# The full INFO ceiling is pinned so the LOG_* call sites stay compiled in
+# and measured, independent of log.h's (lower) default.
+COV_CFLAGS := $(HARNESS_CFLAGS) $(TEST_LOG_INFO_CFLAGS) -O0 -g --coverage -MMD -MP
 
 # Branch coverage: the --rc option was renamed in lcov 2.x
 # (1.x: lcov_branch_coverage, 2.x: branch_coverage) -- with the wrong

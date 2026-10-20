@@ -3,7 +3,7 @@
 
 Counterpart to tools/replay.c for the committed synthetic Groves-profile
 datasets under datasets/simulated/. It drives one dataset through ins via
-python/replay.py (the analysis tool) and then applies the pass/fail gates:
+tools/replay.py (the analysis tool) and then applies the pass/fail gates:
 
   * ins's own accuracy vs the true reference -- scored-epoch count and the
     roll/pitch/yaw error mean/std + position RMS gates from the dataset's
@@ -17,7 +17,7 @@ python/replay.py (the analysis tool) and then applies the pass/fail gates:
 Exits non-zero on any failed gate (this is what `make simulated` fails on).
 The ARS/AHRS sub-filter gates stay in tools/replay.c, which scores those.
 
-The split is deliberate: python/replay.py is a pure analysis/visualization
+The split is deliberate: tools/replay.py is a pure analysis/visualization
 tool with NO thresholds or verdict of its own -- it just emits its accuracy
 summary as JSON (--summary-json); every gate, the Groves comparison and the
 exit code live here.
@@ -41,9 +41,10 @@ import tempfile
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_REPO, "python"))
+sys.path.insert(0, os.path.join(_REPO, "tools"))
 from replay import load_config, load_ref   # noqa: E402  (analysis-tool lib fns)
 
-_REPLAY_PY = os.path.join(_REPO, "python", "replay.py")
+_REPLAY_PY = os.path.join(_REPO, "tools", "replay.py")
 
 
 def groves_pos_rms_vs_truth(sol_path, ref, t_warmup_end_us):
@@ -104,7 +105,7 @@ def groves_pos_rms_vs_truth(sol_path, ref, t_warmup_end_us):
 
 
 def run_replay_summary(dataset):
-    """Run python/replay.py on the dataset (no telemetry) and return its
+    """Run tools/replay.py on the dataset (no telemetry) and return its
     accuracy-summary JSON as a dict. replay.py's console output is inherited
     so the replay progress/summary still shows. Raises on a non-zero exit."""
     fd, tmp = tempfile.mkstemp(suffix=".json", prefix="ins_summary_")

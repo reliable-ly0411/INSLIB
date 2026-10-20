@@ -1,0 +1,92 @@
+# Source: KF-GINS Leador-A15/RTK-GNSS car trial, with a SYNTHETIC GNSS
+# velocity, and 60 s GNSS outages every 300 s (gnss_vel_outage.csv, the
+# fixes in those windows removed). The setup of the outage part of the
+# INSLIB vs KF-GINS vs EKF3 table in readme.md. Everything else as
+# config_vel_outage.yaml, plus the NHC with the IMU mounting known.
+name: kfgins-leador-a15-vel-outage-nhc
+aiding: gnss    # real RTK positions plus a synthetic velocity, see gnss_vel.csv
+init: ref
+# Non-holonomic lateral constraint (REQ-NAV-077), needs automotive_mode.
+# Its course-over-ground yaw is weakened to nothing (it costs accuracy with a
+# GNSS velocity, and inside an outage there is no course anyway).
+automotive_mode: 1
+automotive_min_yaw_stddev_deg: 90
+automotive_lateral_constraint: 1
+# Coast through the whole outage instead of freezing after the default
+# dead-reckoning budget, the same for EKF3 in the comparison
+allow_unlimited_deadreckoning: 1
+chi2_disable: 1             # 1: disable outlier downweighting (diagnostics)
+# Covariance prediction at the IMU rate, as KF-GINS does it (REQ-VER-049).
+# Costs runtime (about 3x for this replay) and changes nothing measurable
+# for this navigation-grade IMU, but keeps the run identical to the
+# published comparison, where it does matter for the MEMS datasets.
+kalman_update_dt_sec: 0.005
+gyro_bias_window_sec: 10    # vehicle idle from starttime to ~+60s, see truth.nav
+
+init_stddev:                # kf-gins.yaml initposstd/initvelstd (max
+  pos_init_stddev_m: 0.008  # component) and initattstd roll,pitch / yaw
+  vel_init_stddev_mps: 0.004
+  rpy_init_stddev_rad_deg: 0.003
+  yaw_init_stddev_rad_deg: 0.023
+
+imu:
+   gyr_psd: 7.61543549e-13    # (rad/s)^2/Hz, from kf-gins.yaml imunoise.arw (ARW^2, deg/sqrt(hr) -> rad/sqrt(s))
+   acc_psd: 2.5e-07    # (m/s^2)^2/Hz, imunoise.vrw (VRW^2)
+   gyr_bias_rw: 1.54266769e-09    # rad/s/sqrt(s), imunoise.gbstd + corrtime (GM sigma^2=q*T/2)
+   acc_bias_rw: 1.76776695e-06    # m/s^2/sqrt(s), imunoise.abstd + corrtime
+   rpy_pred_stddev_rad_sqrts: 1.0e-05
+   auto_zupt_static_gyr_stddev_deg: 0.10
+   auto_zupt_static_acc_stddev_mps2: 0.15
+   auto_zupt_dwell_sec: 3.0
+   # The IMU sits 1.283 deg yawed against the car's axis, measured from the
+   # truth on straight driving (velocity direction in the IMU frame). Without
+   # it the NHC forces 0.2 m/s of real lateral IMU velocity to zero. Known
+   # mounting, not estimated by the filter. The filter body frame is the car
+   # then, so the attitude scores below are offset by this yaw.
+   mount_rpy_deg: [0, 0, 1.283]
+
+
+gnss:
+  leverarm_frd: [0.1427, -0.2979, -0.184]    # kf-gins.yaml antlever, rotated into the car frame
+  pos_stddev_fallback_m: [1, 2]
+  # RTK fixes: gnss.csv reports ~1 cm horizontal / 2 cm vertical, and the
+  # standstill spread of the fixes is smaller still. The floor sits below
+  # the reported sigmas so they are fused as reported, as KF-GINS fuses
+  # them (a floor of 0.05/0.15 m cost 3 mm horizontal RMS once the fixes
+  # were fused at their time of validity, REQ-NAV-092).
+  pos_stddev_floor_hor_m: 0.005
+  pos_stddev_floor_ver_m: 0.005
+  # The synthetic velocity is white noise of exactly its reported 1-sigma,
+  # so it is fused as reported: no floor, no manoeuvre dependent inflation
+  # (EKF3 gets the same sigma in the comparison).
+  vel_stddev_floor_hor_mps: -1
+  vel_stddev_floor_ver_mps: -1
+  vel_noise_acc_scale_hor: -1
+  vel_noise_acc_scale_ver: -1
+
+score:
+  leverarm_frd: [0, 0, 0.0001]    # truth.nav/navresult.nav refer to the IMU center, same as the filter state
+  ahrs: 0    # the IMU-only ARS is not part of this comparison
+  # Scored from 60 s after the car first moves, the window of the readme.md
+  # comparison table, so this replay prints that table's INSLIB row. Counted
+  # from the first fix in gnss.csv, which is 50 s older than the first IMU
+  # sample.
+  warmup_sec: 171.8
+  min_epochs: 3000
+  # Every gap in gnss_vel_outage.csv longer than this is scored by the
+  # position error when the first fix after it arrives (REQ-VER-029)
+  coast_gap_min_sec: 30
+  # Regression guard-rails vs. ground truth: observed + max(5 %, 0.003),
+  # rounded up. A trip means inspect, then retune to known-good. The
+  # attitude here is the car's (mount_rpy_deg), the truth the IMU's: the
+  # yaw bias is the mounting yaw, the roll bias the unmodelled mounting roll.
+  lim_att_bias_deg: 0.040           # observed 0.037 (roll)
+  lim_att_std_deg: 0.020            # observed 0.016 (roll)
+  lim_yaw_bias_deg: 1.44            # observed 1.367
+  lim_yaw_std_deg: 0.190            # observed 0.180
+  lim_pos_rms_m: 0.623              # observed 0.593, the outages included
+  lim_coast_exit_err_m: 7.51        # observed 7.150 (gap 1), mean 1.48 over 11 gaps
+
+inputs:
+  gnss: gnss_vel_outage.csv
+  ref: ref.csv

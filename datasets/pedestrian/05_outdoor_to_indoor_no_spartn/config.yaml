@@ -43,12 +43,12 @@ score:
   attitude: 1    # ref carries a real attitude (a second estimator's, see info_*.txt)
   # regression gates, about twice a known-good run -- not accuracy
   # claims: the reference is a second estimator
-  lim_att_bias_deg: 0.5
-  lim_att_std_deg: 0.6
-  lim_yaw_bias_deg: 14
-  lim_yaw_std_deg: 14
-  lim_pos_rms_m: 0.4
-  lim_ellipsoid_rms_m: 0.2
+  lim_att_bias_deg: 0.035    # observed 0.031 (pitch)
+  lim_att_std_deg: 0.304     # observed 0.289 (roll)
+  lim_yaw_bias_deg: 6.68     # observed 6.362 (AHRS on true north, REQ-SUITE-029)
+  lim_yaw_std_deg: 7.04      # observed 6.767
+  lim_pos_rms_m: 0.206       # observed 0.196
+  lim_ellipsoid_rms_m: 0.11  # observed 0.104
 
 inputs:
   ref: ref_ardupilot.csv

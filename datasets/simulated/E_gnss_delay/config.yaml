@@ -10,6 +10,10 @@ allow_unlimited_deadreckoning: 0  # 1: never expire the IMU-only coasting window
 max_deadreckoning_sec: 0.0  # IMU-only coasting budget [s]; 0 -> default 10 s
 gyro_bias_window_sec: 3.0   # static window to seed the initial gyro bias
 imu:
+  # Starts in a steady climb with no GNSS velocity for the first fix delay,
+  # and the vibration-free simulated IMU looks static there: an auto-ZUPT
+  # would pin the climb rate and leave the height channel biased.
+  auto_zupt_disable: 1
   rpy_pred_stddev_rad_sqrts: 1.745329252e-05    # rigid mount
   gyr_psd: 2.5e-09    # rad^2/s, gyro_noise_PSD
   acc_psd: 4.0e-06    # (m/s^2)^2/Hz, accel_noise_PSD
@@ -24,6 +28,25 @@ score:
   ahrs: 1
   warmup_sec: 5
   min_epochs: 100
+  # Regression guard-rails just above the known-good run, not accuracy
+  # claims. Deterministic synthetic data, so these stay tight. A false
+  # stillness trigger in the climb once biased the height channel by ~7 m
+  # (sawtooth between the 2 Hz fixes), the ellipsoid limits catch that.
+  # The run matches the same flight fused without delay (GNSS_nodelay.csv),
+  # most of the position RMS is the simulated GNSS position error itself.
+  # After an intentional change inspect, then retune.
+  lim_att_bias_deg: 0.074           # observed 0.070 (roll)
+  lim_att_std_deg: 0.269            # observed 0.256 (pitch)
+  lim_yaw_bias_deg: 0.204           # observed 0.194
+  lim_yaw_std_deg: 0.392            # observed 0.373
+  lim_pos_rms_m: 0.61               # observed 0.580
+  lim_ellipsoid_rms_m: 0.123        # observed 0.117
+  lim_ellipsoid_bias_m: 0.03        # observed 0.024
+  lim_ellipsoid_max_m: 0.253        # observed 0.241
+  lim_ars_att_bias_deg: 1.246       # observed 1.186 (roll)
+  lim_ars_roll_std_deg: 1.292       # observed 1.230
+  lim_ars_pitch_std_deg: 2.761      # observed 2.629
+  lim_ars_yaw_drift_deg_min: 8.79   # observed 8.371
 
 init_stddev:                         # initial-state 1-sigma (each 0 -> built-in default)
   pos_init_stddev_m: 0             # [m]

@@ -1,0 +1,93 @@
+name: Release GUI (Windows exe)
+
+# Builds tools/inspostgui.py as a self-contained Windows folder
+# (scripts/inspostgui.spec) when a version tag is pushed, and attaches it to
+# that tag's GitHub release as a draft for review.
+#
+# The repository check on the job keeps this from running in the private
+# development repository, which carries the same file and tags its releases
+# too. Run by hand (workflow_dispatch) it only builds and keeps the zip as a
+# workflow artifact, so the build can be tried without tagging anything.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write        # create/upload the release
+  id-token: write        # build provenance attestation
+  attestations: write
+
+jobs:
+  inspostgui-exe:
+    name: inspostgui.exe
+    if: github.repository == 'jnz/INSLIB'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Toolchain (gcc + make for the shared library)
+        shell: bash
+        run: |
+          choco install make -y --no-progress
+          gcc --version
+          make --version
+
+      - name: Build libINSLIB.dll
+        shell: bash
+        run: make pylib
+
+      - name: Install bundle requirements
+        run: python -m pip install -r scripts/requirements-exe.txt
+
+      - name: PyInstaller
+        run: python -m PyInstaller --noconfirm --distpath build/dist --workpath build/pyinstaller scripts/inspostgui.spec
+
+      # Headless replay through the bundled exe: proves the Python runtime, Qt
+      # and libINSLIB.dll are all in the folder. Fails the job on a non-zero
+      # exit code.
+      - name: Smoke test
+        shell: bash
+        run: build/dist/inspostgui/inspostgui.exe --batch datasets/fog
+
+      # Code signing would go here (signtool on build/dist/inspostgui/inspostgui.exe
+      # and libINSLIB.dll), before the folder is zipped.
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "inspostgui-${{ github.ref_name }}-windows-x64"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path build/dist/inspostgui -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
+          "ZIP=dist/$name.zip" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: inspostgui-windows-x64
+          path: dist/*
+
+      - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: ${{ env.ZIP }}
+
+      - name: Attach to the release (draft if it does not exist yet)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.ref_name }}"
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --draft --title "$tag" --notes "See CHANGELOG.md."
+          gh release upload "$tag" dist/*.zip dist/*.sha256 --clobber

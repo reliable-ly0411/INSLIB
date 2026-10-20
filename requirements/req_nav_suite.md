@@ -15,11 +15,11 @@ to the AHRS instances.
 
 - **Status:** verified
 - **Parent:** REQ-SYS-002
-- **Verification:** Test: tests/test_ahrs.c:scenario_nav_suite; Test: tests/test_ahrs.c:scenario_suite_init_att_hint
+- **Verification:** Test: tests/test_ahrs.c:scenario_nav_suite; Test: tests/test_ahrs.c:scenario_suite_init_att_hint; Test: tests/test_ahrs.c:scenario_suite_prescribed_start
 
 The wrapper shall initialize the AHRS instances from the measurement
-stream: roll/pitch from accelerometer leveling on the first valid IMU
-epoch; the magnetometer instance shall wait for the first valid
+stream: roll/pitch from accelerometer leveling over the leveling window
+once it is full (REQ-SUITE-028); the magnetometer instance shall wait for the first valid
 magnetometer sample and bootstrap its heading from it. The ARS's
 initial yaw shall be 0, UNLESS a known initial heading was supplied --
 either as a prescribed initial attitude (`opt.auto_init == false`) or
@@ -29,10 +29,21 @@ shall bootstrap from that known yaw instead of an arbitrary 0 --
 so the suite's best-available attitude (`nav_suite_get_rpy`) already
 reflects the true heading during the ATTITUDE_ONLY window before ins
 becomes ready, not a placeholder. The hint's roll/pitch shall NOT seed
-the ARS (its accelerometer leveling is available from the first epoch
-and beats a static assumption). The magnetometer instance is
-unaffected (independent heading reference, still waits for a real
-sample).
+the ARS (its accelerometer leveling beats a static assumption). The
+magnetometer instance is unaffected (independent heading reference,
+still waits for a real sample).
+
+Under a prescribed initial attitude (`opt.auto_init == false`) the first
+start shall not estimate what is already given: the ARS shall start on
+the first IMU epoch from the prescribed roll/pitch (with its own
+cold-start 1-sigma), without leveling, and the magnetometer instance,
+once its first magnetometer sample arrives, from the roll/pitch and
+1-sigma the ARS holds by then, with its heading from that sample. Any
+later start (re-bootstrap, IMU loss) levels as above. Rationale: a
+prescribed start is a known state, typically a simulation or a reference
+recording that starts in motion, where leveling would test an auto-init
+nobody asked for and makes the attitude references depend on where in
+the motion the stream happens to begin.
 
 ## REQ-SUITE-003 — Self-healing attitude references
 
@@ -136,7 +147,10 @@ not hold mid-mission: the barometer has drifted against the fix by then
 carried origin onto that reading would push the accumulated disagreement
 into the origin -- relocating every local coordinate the consumer holds,
 which is precisely what carrying the origin exists to prevent. A carried
-origin already is the datum and needs no reading to find it.
+origin already is the datum and needs no reading to find it. ins carries
+its barometric anchor along with that origin (REQ-NAV-088), so it restarts
+on the same drifted barometric height baro_alt reported during the outage,
+and the reported height does not step when the 3D solution returns.
 
 ## REQ-SUITE-008 — Offset filter integration and height accessors
 
@@ -146,9 +160,14 @@ origin already is the datum and needs no reading to find it.
 
 The wrapper shall define a local height reference: the height above
 the NED origin from the source that survives a GNSS outage -- baro_alt
-if it is running, else the ins local height (which is then driven by
-local position aiding, or by GNSS itself when there is no other
-source). The reference shall be used both to feed the offset filter
+if it is running, else the ins local height once a local position
+sample has been seen (an external system then drives it). Under GNSS
+alone there shall be no reference: ins's height is then itself a GNSS
+height, so the offset would only re-estimate the datum origin's
+ellipsoid height, which ins knows exactly, and add the offset filter's
+noise to the absolute height during an outage. The offset filter stays
+idle (reports no offset) and a coasting ins provides the absolute
+height. The reference shall be used both to feed the offset filter
 and to evaluate the absolute height, so that offset and height always
 refer to the same source.
 
@@ -158,7 +177,7 @@ GNSS ellipsoid height from the fix, vertical standard deviation from
 its NED covariance (pairs without a positive vertical variance are
 skipped), and the local height reference -- extrapolated to the GNSS
 time of validity with the estimated climb rate when the measurement is
-delayed (gnss_delay_ms). The fix's height shall first be moved from the
+delayed (gnss_delay_ms plus gnss_delay_us). The fix's height shall first be moved from the
 antenna to the IMU point, the point both ins and a barometer on the
 sensor board report, by the down component of the measurement's GNSS
 lever arm rotated with the suite's best available attitude
@@ -593,11 +612,13 @@ nav_suite_predict_step() was never called.
 
 - **Status:** verified
 - **Parent:** REQ-SYS-001
-- **Verification:** Test: tests/test_ahrs.c:scenario_suite_yaw_carry
+- **Verification:** Test: tests/test_ahrs.c:scenario_suite_yaw_carry; Test: tests/test_ahrs.c:scenario_suite_yaw_carry_reacquire
 
 On every epoch where ins is ready and its own yaw 1-sigma is at most 15
 degrees, the wrapper shall latch that heading together with the ARS yaw
-of the same epoch. While ins is NOT initialized and REQ-SUITE-016's
+of the same epoch. While ins is not ready (not initialized, or
+initialized with its coasting window expired, REQ-NAV-022, so that the
+next usable fix re-acquires, REQ-NAV-023) and REQ-SUITE-016's
 resolved hint carries no absolute yaw (the case without a magnetometer
 AHRS), the wrapper shall supply as the hint yaw the latched heading
 advanced by the yaw the ARS has integrated since the latch, at a 1-sigma
@@ -628,6 +649,14 @@ needs: the last 3D heading plus that change is a real prior. The two
 gates keep it one: nothing is carried unless ins had genuinely resolved
 its heading, and the carry retires itself once the accumulated drift has
 eaten the information, falling back to the honest "unknown".
+
+A re-acquisition after an expired coasting window is the same situation
+with ins still initialized: its state was frozen for the rest of the
+outage, so the vehicle may have turned by any amount, and without a
+hinted heading the re-acquisition resets the yaw to "unknown"
+(REQ-NAV-059). With a position-only receiver nothing brings it back
+quickly, least of all at standstill. The ARS tracked the turn, so the
+carried heading applies there as well.
 
 ## REQ-SUITE-023 — ins/AHRS heading cross-check
 
@@ -686,3 +715,124 @@ when the wrapper moves the local origin (REQ-SUITE-007), so no datum
 correction applies to them. Ranges that count as position aiding
 (REQ-NAV-085) keep the suite in FULL mode (REQ-SUITE-005) through a
 GNSS outage.
+
+## REQ-SUITE-026 — IMU outage of several hundred ms
+
+- **Status:** verified
+- **Parent:** REQ-SYS-002
+- **Verification:** Test: tests/test_ahrs.c:scenario_imu_outage_700ms
+
+After an IMU outage of 0.2 s or more (the test: 700 ms, during which the
+platform turns by tens of degrees), whether or not other sensors
+(barometer, GNSS, magnetometer) keep arriving in the gap:
+
+- the suite shall publish no attitude and no height solution (mode NONE)
+  from the epoch the outage is detected (REQ-SUITE-027) until the filters
+  have re-bootstrapped, no stale value from before the gap;
+- each of ARS, AHRS and baro_alt shall restart exactly once and ins shall
+  re-arm exactly once;
+- the carried biases shall come back: the ARS gyro bias x/y, the ins
+  accelerometer and gyroscope bias and the baro_alt accelerometer bias
+  shall be close to their values before the gap;
+- after the re-bootstrap the tilt error of each attitude filter, and the
+  heading error of ins, shall stay within three times its own reported
+  1-sigma (a 1-sigma below 0.3 deg counts as 0.3 deg) and the tilt shall
+  be recovered to 1.5 deg within 3 s;
+- the height shall not jump at the re-bootstrap (the datum is kept),
+  baro_alt shall not learn an accelerometer bias from the restart, and
+  its chi2 detector shall not reject the barometer.
+
+An IMU gap below 0.2 s is ordinary jitter and shall restart nothing.
+
+Rationale: an IMU outage of this length leaves no filter with a usable
+attitude, and no assumption about the motion in the gap can stand in
+for the missing samples. Stopping every IMU-driven filter, keeping only
+the biases and the vertical datum, and re-bootstrapping from the stream
+is the only answer that neither publishes a stale attitude nor claims a
+covariance nothing supports. The accelerometer bias cannot have changed
+in 700 ms, so it is the quantity that shows whether the restart was
+clean.
+
+## REQ-SUITE-027 — IMU loss handling in the wrapper
+
+- **Status:** verified
+- **Parent:** REQ-SUITE-026
+- **Verification:** Test: tests/test_ahrs.c:scenario_imu_outage_700ms
+
+The wrapper shall check on every epoch, whether or not it carries an
+IMU sample, the time since the last IMU epoch against the configured
+opt.imu_loss_timeout_sec, which it shall also hand to the ARS, AHRS and
+baro_alt configurations, so every filter uses the same threshold. Once
+the IMU is lost:
+
+- the ARS, AHRS and baro_alt shall be stopped on that same epoch (they
+  see no epoch without IMU, so they cannot detect it themselves inside
+  the suite), each latching its bias carry (REQ-AHRS-029,
+  REQ-BARO-027); ins stops itself (REQ-NAV-089);
+- the solution mode shall drop to NONE and the attitude and height
+  getters shall report no solution until the respective filter has
+  re-bootstrapped;
+- the heading carry-over (REQ-SUITE-022) shall be invalidated, since the
+  ARS yaw it integrates is broken by the same gap;
+- the leveling window of REQ-SUITE-028 shall be emptied, its samples
+  predate the gap;
+- the event shall be counted once (nav_suite_t.n_imu_loss).
+
+When the IMU returns, the self-healing bootstrap (REQ-SUITE-003,
+REQ-SUITE-002) shall restart the ARS and AHRS seeded with their gyro bias
+carry, ins re-bootstraps on its own with its carry and the hint of the
+restarted ARS/AHRS (REQ-SUITE-016), and baro_alt shall restart on the
+existing vertical datum: the same pressure-to-height reference as before
+the loss, the starting height derived from the current pressure under
+it, and a_b seeded from its carry. The datum is kept on every baro_alt
+re-bootstrap, not only after an IMU loss: it never moves
+(REQ-SUITE-007). The offset filter (REQ-SUITE-008)
+does not run on the IMU and shall be left alone.
+
+## REQ-SUITE-028 — Attitude bootstrap under motion
+
+- **Status:** verified
+- **Parent:** REQ-SUITE-002
+- **Verification:** Test: tests/test_ahrs.c:scenario_imu_outage_700ms
+
+The ARS/AHRS bootstrap of the wrapper (REQ-SUITE-002, at start and after
+an IMU loss) shall level over a window of IMU samples, the same window,
+median leveling and quasi-static classification ins uses for its
+auto-init (opt.auto_init_window_sec, opt.auto_init_static_gyr_rps,
+opt.auto_init_static_acc_mps2, REQ-NAV-047), and shall bootstrap only
+once the window is full. If the window is not quasi-static, the initial
+roll and pitch 1-sigma shall be at least
+opt.auto_init_moving_rpy_stddev_rad, the same floor as REQ-NAV-047, and
+the event shall be counted (nav_suite_t.n_att_boot_moving).
+
+Rationale: one sample is no basis for an attitude, a short window
+delays the start by its length only. The leveling equation takes the
+specific force for gravity.
+A restart after an IMU loss happens wherever the platform is, a drone in
+flight or a vehicle in a turn, where that assumption fails by degrees.
+Reporting the static initial 1-sigma there would make the restarted
+filter overconfident from its first epoch on, the same mistake the
+restart is meant to undo.
+
+## REQ-SUITE-029 — Magnetic model position kept across AHRS starts
+
+- **Status:** verified
+- **Parent:** REQ-AHRS-014
+- **Verification:** Test: tests/test_ahrs.c:scenario_suite_mag_model_before_ahrs_start
+
+The wrapper shall offer one interface that sets the World Magnetic Model
+position (latitude, longitude, decimal year) for both attitude sources:
+ins shall receive it at once (its NED magnetic reference and field
+gate), and the wrapper shall keep the latest position and apply it to
+the magnetometer AHRS (REQ-AHRS-014) whenever that AHRS starts, at the
+first bootstrap and at every restart (REQ-SUITE-027, health check,
+precision watchdog), and at once if the AHRS is already running. A
+position given before the AHRS has started shall therefore reference
+its yaw to true north from the start, and no restart shall fall back
+to magnetic north. nav_suite_init shall forget a kept position.
+
+Rationale: the AHRS only accepts a position while it is running and
+forgets it when it restarts. A caller that sets the position once, the
+natural place being right after nav_suite_init, would otherwise get a
+heading on magnetic north, off by the local declination, without any
+warning.

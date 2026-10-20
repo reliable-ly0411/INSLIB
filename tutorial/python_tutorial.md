@@ -1,47 +1,92 @@
 ---
 title: "INSLIB — Getting Started in Python"
-subtitle: "The navigation filter in a few lines"
+subtitle: "Sensor fusion in a few lines of Python"
 author: "Jan Zwiener"
 date: "2026"
 ---
 
 # INSLIB in Python
 
-The same navigation filter you get in C is available as a small Python
-package, `INSLIB`. It is a thin `ctypes` binding over the compiled library
-plus some conveniences (telemetry to PlotJuggler / MAVLink, a YAML CSV
-runner). This tutorial shows how little code it takes to get a solution.
-
-If you have not read it yet, the concepts (frames, states, the "feed
-measurements, read a solution" loop) are introduced in the companion
-`c_tutorial.md`. Here we focus on the Python surface.
+The navigation filter of the INSLIB C library, as a Python package.
+Install, feed sensor samples, read the result.
+This tutorial shows how to do it.
 
 ## Install
 
-Today the package installs as an **editable** install against a prebuilt
-shared library:
-
 ```sh
-make pylib               # builds python/INSLIB/libINSLIB.so
-pip install -e python/   # now `import INSLIB` works anywhere
+pip install inslib
 ```
 
-**Is `pip install INSLIB` coming?** Yes, that is the intended end state.
-The packaging is already in place (`python/pyproject.toml`), and because
-the binding is `ctypes` over a flat C ABI, a released wheel is *one wheel
-per platform*, not per Python version. The remaining piece is a build
-backend that compiles the C sources into the wheel. Until then, the
-`make pylib` + editable-install path above is the supported way.
+Installation is simple, a prebuilt package with the compiled INSLIB functions
+inside. No compiler needed for Linux (including the Raspberry Pi), Windows and
+macOS, Python 3.8 or newer. The import name is `INSLIB`:
 
-You need Python 3.8 or newer and a C compiler for `make pylib`. Everything in
-this tutorial uses only the standard library plus `INSLIB`.
+```sh
+python3 -c "import INSLIB; print(INSLIB.__version__)"
+```
 
-## Your first script
+## Roll and pitch in a few lines
 
-`Navigator` is the high-level entry point: push whatever sensors you have
-each epoch, then read a unified `Solution`. Here is the Python twin of the
-C tutorial's first program: a stationary IMU at 100 Hz with a
-once-per-second GNSS fix:
+The smallest useful setup needs a gyroscope and an accelerometer:
+roll and pitch, for a tilt sensor, a balancing robot or a gimbal. The
+attitude filter that does this, the ARS (attitude reference system), runs
+inside every `Navigator`, so the IMU data is all you feed it:
+
+```python
+import math
+import random
+from INSLIB import Navigator
+
+D2R = math.pi / 180.0
+
+# Stand-in for a real sensor: an IMU resting at roll 10 deg, pitch -5 deg.
+# Body frame FRD (front/right/down),
+# accelerometer (acc) in m/s^2 (lying flat would read 0, 0, -9.81),
+# gyroscope (gyr) in rad/s.
+# A little noise is added here, like a real sensor.
+def read_imu():
+    r, p, g = 10.0 * D2R, -5.0 * D2R, 9.81
+    acc = (g * math.sin(p), -g * math.sin(r) * math.cos(p),
+           -g * math.cos(r) * math.cos(p))
+    acc = [a + random.gauss(0.0, 0.02) for a in acc]
+    gyr = [random.gauss(0.0, 0.002) for _ in range(3)]
+    return acc, gyr
+
+random.seed(1)
+nav = Navigator()
+
+dt = 0.01                                  # 100 Hz simulated data
+for k in range(1, 501):                    # Simulate for 5 s
+    acc, gyr = read_imu()
+    nav.imu(int(k * dt * 1e6), dt, acc=acc, gyr=gyr)
+    nav.update()                           # Process data
+    rpy = nav.rpy_ars()                    # Get [roll, pitch, yaw] in rad
+    if rpy:
+        if k % 100 == 0:
+            print("t %.0f s  roll %6.2f deg  pitch %6.2f deg"
+                  % (k * dt, rpy[0] / D2R, rpy[1] / D2R))
+```
+
+It prints:
+
+```
+t 1 s  roll   9.97 deg  pitch  -4.98 deg
+t 2 s  roll  10.00 deg  pitch  -5.01 deg
+t 3 s  roll  10.03 deg  pitch  -5.02 deg
+t 4 s  roll  10.03 deg  pitch  -5.00 deg
+t 5 s  roll  10.04 deg  pitch  -4.99 deg
+```
+
+For your own sensor, replace `read_imu()` and use its real time stamps
+(`t_us`, microseconds) and sample interval `dt`. The gyro bias is
+estimated along the way. The yaw is not north referenced: without a
+magnetometer it is just the integrated z gyro and drifts.
+
+## Adding GNSS: position and velocity
+
+Add a GNSS receiver and the same `Navigator` gives you position, velocity
+and a full attitude. Here a stationary IMU at 100 Hz with a once-per-second
+fix:
 
 ```python
 import math
@@ -49,8 +94,8 @@ from INSLIB import Navigator, Config
 
 D2R = math.pi / 180.0
 
-# The (stationary) location: a spot in Munich, 520 m ellipsoidal.
-lat, lon, h = 48.1372 * D2R, 11.5756 * D2R, 520.0
+# The (stationary) location: a spot in Darmstadt, 190 m ellipsoidal.
+lat, lon, h = 49.867378 * D2R, 8.638174 * D2R, 190.0
 
 nav = Navigator(Config(auto_init=True))
 
@@ -73,226 +118,255 @@ print("rpy  %.2f  %.2f  %.2f deg"
       % (sol.roll / D2R, sol.pitch / D2R, sol.yaw / D2R))
 ```
 
-Run it:
-
-```sh
-python3 hello.py
-```
-
 Expected output:
 
 ```
 mode: FULL  ready: True
-lat 48.137200 deg  lon 11.575600 deg  h 520.0 m
+lat 49.867378 deg  lon 8.638174 deg  h 190.0 m
 rpy  -0.00  0.00  0.00 deg
 ```
 
-## The per-epoch loop, in three moves
+`sol.mode` tells you how good the answer is right now: `FULL` with fresh
+GNSS, `COASTING` on the IMU alone through an outage, `ATTITUDE_ONLY` when
+only the attitude is left. `sol` also carries `vel_ned`, `pos_local`
+(NED, metres) and `pos_ecef`.
 
-```python
-nav.imu(t_us, dt, acc, gyr)      # 1. begin the epoch with the IMU sample
-nav.gnss_pos_llh(llh, var_ned)   #    add whatever aiding you have this epoch
-nav.update()                  # 2. run the filter
-sol = nav.solution()          # 3. read the result
-```
+## Height from a barometer
 
-> **The one gotcha:** `nav.solution()` (and `nav.state()`, `nav.rpy()`, ...) are
-> *readers*. They do not run the filter. You must call **`nav.update()`
-> first** each epoch, after pushing the sensors. Forget it and the
-> solution never leaves `mode=NONE`.
-
-Add only the sensors you have, each is a one-liner:
-
-```python
-nav.imu(t_us, dt, acc, gyr)              # begins an epoch (var args optional)
-nav.gnss_pos_llh(llh, var_ned)           # lat/lon/height fix + NED covariance
-nav.gnss_pos_llh(llh, var_ned, delay_ms=80) # ...or a late fix (80 ms, history-anchored)
-nav.gnss_vel(vel_ned, var_ned)           # NED velocity
-nav.mag(mag_uT, mag_var)                 # magnetometer
-nav.baro(pressure_pa)                    # static pressure -> vertical channel
-nav.yaw(yaw_rad, stddev_rad)             # absolute heading (e.g. dual-antenna, pose)
-nav.local_pos(pos_ned, var_ned)          # Lighthouse / UWB / mocap
-nav.zupt(True); nav.zaru(True)           # known standstill / clamp
-```
-
-`var_ned` is either a 3-element NED variance diagonal (as above) or a full
-3×3 covariance (nested rows or flat row-major length 9).
-
-`nav.yaw()` takes **radians** in either convention, `[-pi, pi]` or
-`[0, 2*pi)`. A heading beyond one full turn is treated as a unit or
-unwrapping mistake, dropped, and counted in the filter's
-`n_invalid_input` diagnostic instead of being wrapped into a wrong
-heading.
-
-A dual-antenna receiver measures the azimuth of its antenna baseline,
-which is the yaw only when the antennas sit along the body x axis. For
-any other mounting convert it first:
-
-```python
-from INSLIB import yaw_from_baseline_heading
-roll, pitch, _ = nav.rpy() or (0.0, 0.0, 0.0)
-yaw = yaw_from_baseline_heading(heading_rad, roll, pitch, (0.0, 1.0, 0.0))
-if yaw is not None:                      # None: baseline near vertical
-    nav.yaw(yaw, stddev_rad, delay_ms=200)
-```
-
-## Reading the `Solution`
-
-`nav.solution()` returns a `Solution` dataclass:
-
-```python
-sol.mode          # "FULL" / "COASTING" / "ATTITUDE_ONLY" / "NONE"
-sol.ready         # position/velocity usable?
-sol.roll, sol.pitch, sol.yaw     # best-available attitude [rad]
-sol.pos_ecef, sol.pos_local      # WGS84 ECEF [m], local NED [m]
-sol.vel_ned                      # NED velocity [m/s]
-sol.lat_rad, sol.lon_rad, sol.alt_m
-sol.height_m       # best height above the datum (ins, else baro)
-sol.height_ell_m   # best absolute (ellipsoid) height
-```
-
-The mode tells you how good the answer is right now. `Navigator` degrades
-gracefully: with fresh GNSS you get `FULL`, through an outage it `COASTING`s
-on the IMU, if position is lost entirely, `ATTITUDE_ONLY` still gives you
-roll/pitch/yaw from the attitude-only (AHRS/ARS) fallback.
-
-Reaching `FULL` in the first place takes fixes that are better than merely
-fusable: the entry gate (`Config.gnss_start_max_*`) has to
-hold for `gnss_init_dwell_sec`. Raise those if your receiver reports a
-coarser accuracy, otherwise the filter never leaves `ATTITUDE_ONLY` (the
-log says so once per 30 s). The reverse holds too: if every fix for
-`gnss_stop_dwell_sec` is worse than the exit gate
-(`gnss_stop_max_*`), the mode drops back to
-`ATTITUDE_ONLY` and the filter stops - `pos_local`
-and `pos_ecef` go `None`, so nothing keeps drifting off bad fixes. Only a
-full re-bootstrap through the entry gate brings `FULL` back, carrying the
-IMU biases over at an inflated uncertainty and re-seeding attitude from
-the AHRS. Set `gnss_stop_disable=True` to switch the exit off entirely, or
-`auto_reacquire_disable=True` to keep the filter running and merely have
-`ready` go false.
-
-## Starting without GNSS: Lighthouse / UWB / mocap
-
-No GNSS? Aid the filter with a local NED position instead. Give the lab's
-coarse location once in the `Config` (for gravity and true north only, not
-as an aiding measurement), then push `local_pos` each epoch:
+A barometer gives height and climb rate, fused with the accelerometer in
+the vertical channel filter. No GNSS needed, the height counts from where
+the sensor started:
 
 ```python
 import math
-from INSLIB import Navigator, Config
+import random
+from INSLIB import Navigator
+
+# Stand-in for a real sensor: a drone at rest for 5 s, then a smooth 10 m
+# climb over 10 s. Pressure in Pa, IMU in FRD. A flying drone vibrates,
+# hence the noise.
+def read_sensors(t):
+    w = math.pi / 10.0
+    if 5.0 <= t <= 15.0:
+        h = 5.0 * (1.0 - math.cos(w * (t - 5.0)))       # height [m], up
+        a_up = 5.0 * w * w * math.cos(w * (t - 5.0))    # acceleration [m/s^2], up
+    else:
+        h, a_up = (0.0 if t < 5.0 else 10.0), 0.0
+    acc = (random.gauss(0.0, 0.2), random.gauss(0.0, 0.2),
+           -9.81 - a_up + random.gauss(0.0, 0.2))
+    gyr = [random.gauss(0.0, 0.02) for _ in range(3)]
+    pressure = 101325.0 * (1.0 - (100.0 + h) / 44330.0) ** 5.255
+    return acc, gyr, pressure + random.gauss(0.0, 1.0)
+
+random.seed(1)
+nav = Navigator()
+
+dt = 0.01                                  # 100 Hz IMU
+for k in range(1, 2001):                   # 20 s
+    t = k * dt
+    acc, gyr, pressure = read_sensors(t)
+    nav.imu(int(t * 1e6), dt, acc=acc, gyr=gyr)
+    if k % 4 == 0:                         # 25 Hz barometer
+        nav.baro(pressure)
+    nav.update()
+    alt = nav.baro_alt()                   # (height [m], climb [m/s]), up
+    if alt and k % 250 == 0:
+        print("t %4.1f s  height %6.2f m  climb %5.2f m/s" % (t, alt[0], alt[1]))
+```
+
+Prints the height above the start:
+
+```
+t  2.5 s  height  -0.03 m  climb -0.03 m/s
+t  5.0 s  height  -0.03 m  climb -0.02 m/s
+t  7.5 s  height   1.46 m  climb  1.13 m/s
+t 10.0 s  height   5.04 m  climb  1.59 m/s
+t 12.5 s  height   8.54 m  climb  1.11 m/s
+t 15.0 s  height  10.02 m  climb  0.02 m/s
+t 17.5 s  height   9.97 m  climb -0.03 m/s
+t 20.0 s  height   9.97 m  climb  0.00 m/s
+```
+
+The true heights at 7.5, 10 and 12.5 s are 1.46, 5.00 and 8.54 m, the
+true climb rate peaks at 1.57 m/s after 10 s. With GNSS as well,
+`sol.height_m` reports the best height source of the moment.
+
+## Compass heading (magnetometer)
+
+Add a magnetometer and the AHRS, the second attitude filter inside every
+`Navigator`, gives a heading. Tell it where you are once, and the heading
+refers to true north instead of magnetic north:
+
+```python
+import math
+import random
+from INSLIB import Navigator, wmm_field_ned
 
 D2R = math.pi / 180.0
+lat, lon, year = 49.867378, 8.638174, 2026.5    # Darmstadt [deg]
 
-# Coarse lab anchor - gravity + north reference, not an aiding fix.
-nav = Navigator(Config(auto_init=True,
-                       lat_rad=48.1372 * D2R, lon_rad=11.5756 * D2R,
-                       h_m=520.0))
+# Stand-in for a real sensor: lying flat, pointing 30 deg east of true
+# north. The magnetometer sees the Earth's field (from the World Magnetic
+# Model) turned into the body frame, in uT.
+B = wmm_field_ned(lat, lon, year)                # north, east, down [uT]
+heading = 30.0 * D2R
+def read_sensors():
+    acc = [random.gauss(0.0, 0.02), random.gauss(0.0, 0.02),
+           -9.81 + random.gauss(0.0, 0.02)]
+    gyr = [random.gauss(0.0, 0.002) for _ in range(3)]
+    mag = [B[0] * math.cos(heading) + B[1] * math.sin(heading),
+           -B[0] * math.sin(heading) + B[1] * math.cos(heading), B[2]]
+    mag = [m + random.gauss(0.0, 0.2) for m in mag]
+    return acc, gyr, mag
 
-dt = 0.01
-for k in range(1, 601):
-    nav.imu(int(k * dt * 1e6), dt, acc=(0.0, 0.0, -9.81), gyr=(0.0, 0.0, 0.0))
-    if k % 10 == 0:                        # a 10 Hz indoor tracker
-        nav.local_pos((1.5, 0.0, 0.0), var_ned=(1e-4, 1e-4, 1e-4))  # 1 cm
+random.seed(1)
+nav = Navigator()
+nav.set_magnetic_model(lat * D2R, lon * D2R, year)   # true north, not magnetic
+
+dt = 0.01                                  # 100 Hz IMU
+for k in range(1, 3001):                   # 30 s
+    acc, gyr, mag = read_sensors()
+    nav.imu(int(k * dt * 1e6), dt, acc=acc, gyr=gyr)
+    if k % 10 == 0:                        # 10 Hz magnetometer
+        nav.mag(mag, (0.0, 0.0, 0.0))      # 0 -> library default noise
     nav.update()
-    sol = nav.solution()
-
-print(sol.mode, sol.ready, tuple(round(x, 3) for x in sol.pos_local))
-# -> FULL True (1.5, -0.0, -0.0)
+    rpy = nav.rpy_ahrs()                   # [roll, pitch, yaw] in rad
+    if rpy and k % 500 == 0:
+        sd = nav.rpy_stddev_ahrs()
+        print("t %2.0f s  heading %6.2f deg  +- %.2f deg"
+              % (k * dt, (rpy[2] / D2R) % 360.0, sd[2] / D2R))
 ```
 
-The position you pass must already be in the filter's NED frame (origin =
-the `Config` lat/lon/h). Aligning your tracker's frame to it is up to you.
+Prints the heading:
 
-## Referencing yaw to true north (magnetometer)
+```
+t  5 s  heading  29.80 deg  +- 2.04 deg
+t 10 s  heading  29.92 deg  +- 1.46 deg
+t 15 s  heading  29.98 deg  +- 1.20 deg
+t 20 s  heading  30.06 deg  +- 1.07 deg
+t 25 s  heading  30.01 deg  +- 0.98 deg
+t 30 s  heading  29.91 deg  +- 0.93 deg
+```
 
-If you have a magnetometer, arm the World Magnetic Model once (e.g. on the
-first coarse position) so estimated yaw is relative to true north and the
-magnetic-disturbance gate is active:
+Without `set_magnetic_model()` the heading would settle on magnetic
+north, here 3.7 deg (the local declination) off. A tilted sensor works the
+same way, the heading is tilt compensated. A real magnetometer needs a
+hard- and soft-iron calibration first (`Config(mag_fixed_bias=...,
+mag_misalignment=...)`), an uncalibrated one gives a wrong heading.
+
+## The loop, and the other sensors
+
+Every epoch is the same three moves:
 
 ```python
-nav.set_magnetic_model(lat_rad, lon_rad, 2026.5)   # decimal year
-...
-nav.mag(mag_uT, (0.0, 0.0, 0.0))   # per-axis variance, 0 -> library default
+nav.imu(t_us, dt, acc, gyr)      # 1. start the epoch with the IMU sample
+nav.gnss_pos_llh(llh, var_ned)   #    plus whatever else you have this epoch
+nav.update()                     # 2. run the filter
+sol = nav.solution()             # 3. read the result
 ```
 
-Pass zeros for the variance unless you have characterised the sensor *on
-the target platform*. The library's own default is deliberately weak
-and the fusion is throttled to 1 Hz (`Config(magnetometer_min_delay_ms=...)`,
-negative switches the throttle off). The magnetometer is there to keep yaw from
-drifting away over minutes, over seconds the gyro is the better instrument.
-
-## Calibrating your IMU (no fixture needed)
-
-Bias, scale factor and axis misalignment of a cheap MEMS IMU, and hard and
-soft iron of a magnetometer, can be measured from one recording of your
-own sensor, without a turntable: leave the unit still for about 20 s, then
-put it down in 20 to 30 different attitudes (any, not necessarily level)
-for a few seconds each. Log that as `imu.csv` (`t_us, gyr xyz [rad/s],
-acc xyz [m/s^2]`) and optionally `mag.csv` (`t_us, mag xyz [uT]`), FRD
-axes, one clock, and run
-
-```sh
-python3 tools/inslib_imu_calib.py --csv mysession/ -o config.yaml
-```
-
-The keys it writes map one to one onto `Config`, same model
-`corrected = M * (raw - fixed_bias)`, column-major 3x3:
+`nav.solution()` only reads: without `nav.update()` nothing happens. Add
+only the sensors you have, each one is a single call:
 
 ```python
-cfg = Config(imu_acc_misalignment=(...), imu_acc_fixed_bias=(...),
-             imu_gyr_misalignment=(...), imu_gyr_fixed_bias=(...),
-             mag_misalignment=(...), mag_fixed_bias=(...))
+nav.gnss_vel(vel_ned, var_ned)       # GNSS velocity
+nav.mag(mag_uT, (0.0, 0.0, 0.0))     # magnetometer (0 -> library default noise)
+nav.baro(pressure_pa)                # barometer
+nav.local_pos(pos_ned, var_ned)      # indoor tracker: Lighthouse / UWB / mocap
 ```
 
-`python/replay.py` reads the `config.yaml` directly. In a `python -m INSLIB`
-run file the same values go under `filter:` with the `Config` names
-(`imu_acc_misalignment: [...]` and so on).
-
-## The lean alternative: `Ins`
-
-If you do not need the AHRS/baro fallback, `Ins` is the bare 15-state ESKF
-the same three-move loop, a little leaner. Note it uses `update()` and
-then plain accessors rather than a `Solution`:
-
-```python
-from INSLIB import Ins, Config
-
-nav = Ins(Config(auto_init=True))
-nav.imu(t_us, dt, acc, gyr)
-nav.gnss_pos_llh((lat, lon, h), var_ned=(4.0, 4.0, 4.0))
-nav.update()
-print(nav.rpy(), nav.is_ready(), nav.position_local(), nav.position_llh())
-```
-
-Conventions match the C library exactly: body frame FRD, nav frame NED,
-Hamilton quaternion `q = [w, x, y, z]`, time in `int64` microseconds,
+With a magnetometer, call `nav.set_magnetic_model(lat_rad, lon_rad, 2026.5)`
+once (decimal year) so the yaw refers to true north. Conventions match the
+C library: body frame FRD, nav frame NED, time in `int64` microseconds,
 angles in radians.
 
-## Watching it live
+## Advanced: tuning the ARS to your sensor
 
-`INSLIB` can stream the estimate straight into
-[PlotJuggler](https://plotjuggler.io) (UDP/JSON) and to any MAVLink GCS:
+Out of the box the ARS assumes a generic consumer MEMS IMU. With your
+sensor's own figures its uncertainty matches reality: smaller for a good
+sensor, larger in a harsh environment. Set them once, right after creating
+the `Navigator` and before the first `update()`:
 
 ```python
-from INSLIB import Telemetry
-tele = Telemetry(plotjuggler=True, mavlink=False)
-...
-nav.update(); tele.publish(nav.state())
+nav = Navigator()
+# Gyro noise density [rad/s/sqrt(Hz)]
+nav.set_ahrs_gyr_noise(math.radians(0.004))
+# Gyro bias random walk [rad/s^2/sqrt(Hz)]
+nav.set_ahrs_gyr_bias_rw(math.radians(0.0005))
+# Accelerometer noise [m/s^2]: not the datasheet white noise, it has
+# to cover the vibration and maneuver accelerations too
+nav.set_ahrs_acc_noise(0.3)
 ```
 
-For a full end-to-end demo against a real dataset (with a suggested
-PlotJuggler layout), see `python/DEMO.md`. To run your own CSV logs
-without writing any code at all, there is a YAML-configured runner:
+The numbers above are examples. The gyro noise density is in the
+datasheet (often in deg/s/sqrt(Hz), hence the conversion), the bias random
+walk rarely is: measure both from a long static recording of your sensor
+with the repository's `tools/allan_variance.py`, ideally mounted in its
+final place, with the vibration it will see. The accelerometer value is
+different: the ARS levels on gravity, and every vibration or acceleration
+of the vehicle looks like an error of that gravity reading, so this is a
+margin for the target environment, far above the sensor's own noise. Too
+small and the attitude follows every bump. `nav.rpy_stddev_ars()` reports
+how sure the filter is, after tuning that number means something.
+
+## Common pitfalls in Python
+
+* **Wall-clock time stamps.** `time.time()` jumps when the system clock is
+  set (NTP, manual changes). Use a monotonic clock, ideally stamped when
+  the sample was taken, and derive `dt` from consecutive stamps:
+
+  ```python
+  t_us = time.monotonic_ns() // 1000
+  nav.imu(t_us, (t_us - t_prev_us) * 1e-6, acc=acc, gyr=gyr)
+  t_prev_us = t_us
+  ```
+
+  A sensor's own hardware time stamp is even better, as long as all
+  sensors share the same clock.
+* **Wrong units.** Gyro in rad/s, accelerometer in m/s^2. Many drivers
+  deliver deg/s and g: convert with `math.radians()` and `* 9.81`.
+* **Wrong axes.** Body frame FRD (x forward, y right, z down). Lying flat
+  and still the accelerometer has to read about `(0, 0, -9.81)`. If z shows
+  +9.81, your sensor's z axis points up: flip it (and y with it, to keep
+  the frame right-handed).
+* **Gaps in the IMU stream.** Feed every sample. If the loop stalls (a
+  slow plot, a blocking read), a gap longer than the IMU-loss timeout
+  stops and restarts the filters, and `rpy_ars()` returns `None` for a
+  moment. Keep slow work out of the sensor loop.
+* **Tuning too late.** The `set_ahrs_*` calls take effect when the filter
+  starts. Call them before the first `update()`.
+
+## Post-processing your recordings
+
+To run the filter over recorded data, tune it and look at the result, use
+the post-processing GUI `inspostgui`:
+
+![The post-processing GUI inspostgui](../doc/figures/inspostgui_screenshot.png)
+
+It opens a dataset's `config.yaml` (the filter settings, pointing to the
+recorded `.csv` files), replays it, plots the solution against a reference
+and writes a PDF report. On Windows there is a ready-to-run version
+without Python: download `inspostgui-<version>-windows-x64.zip` from the
+[latest release](https://github.com/jnz/INSLIB/releases/latest), unzip it
+and start `inspostgui.exe`. Everywhere else run it from a clone of the
+repository, which also brings the example datasets:
 
 ```sh
-python3 -m INSLIB myrun.yaml        # or: inslib-run myrun.yaml
+git clone --recursive https://github.com/jnz/INSLIB.git
+cd INSLIB
+sh python/setup_venv.sh      # one-time: venv, library, GUI dependencies
+. env.sh                     # activate it
+python3 tools/inspostgui.py datasets/fog
 ```
-
-See `python/README.md` and `python/examples/runner.yaml` for that path.
 
 ## Where to look next
 
-* `python/README.md` - the full binding reference (telemetry, runner,
-  Allan-variance tool, post-processing GUI).
-* `python/DEMO.md` - live replay + PlotJuggler walkthrough.
-* `c_tutorial.md` - the underlying library and its conventions.
+* [API reference](https://jnz.github.io/INSLIB/): every class, method and
+  `Config` field of the package.
+* [python/README.md](https://github.com/jnz/INSLIB/blob/main/python/README.md):
+  the full Python reference (every sensor input, telemetry to PlotJuggler
+  and MAVLink, IMU calibration, the command line tools).
+* [C tutorial](https://github.com/jnz/INSLIB/blob/main/tutorial/c_tutorial.md):
+  the library underneath and its concepts.
+* [INSLIB manual](https://github.com/jnz/INSLIB/blob/main/doc/INSLIB_manual.pdf):
+  filter design, every `config.yaml` setting.

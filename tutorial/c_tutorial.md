@@ -29,14 +29,14 @@ The core filter (`INS`) is a **15-state error-state Kalman filter (ESKF)**.
 | 9–11   | accelerometer bias | body |
 | 12–14  | gyroscope bias | body |
 
-You do not touch those internals. You feed measurements in and read a
+No need to touch the internals. You feed measurements in and read a
 position/velocity/attitude solution out.
 
-## Design in one breath
+## Design
 
 * **No heap, no OS.** The whole filter is one caller-owned `struct`
   (`ins_t`). You zero it, initialise it, and feed it. It never calls
-  `malloc`. That is what makes it a drop-in library for microcontrollers.
+  `malloc`. That is basically a drop-in library for microcontrollers.
 * **Conventions.** Body frame is **FRD** (x forward, y right, z down),
   navigation frame is **NED**. Quaternions are Hamilton with `q[0] = w`.
   Timestamps are `int64` microseconds. Angles are radians.
@@ -44,9 +44,9 @@ position/velocity/attitude solution out.
   treats `0` as "pick a sensible default", so a zeroed options struct
   already gives you a working (but not optimal) filter.
 
-## Your first program
+## First program
 
-Here is a complete program. It creates a filter, feeds it three seconds of
+Here is a complete program. It creates a filter, feeds it ten seconds of
 a (stationary, level) IMU at 100 Hz with a once-per-second GNSS fix, and
 prints the resulting position and attitude.
 
@@ -64,9 +64,9 @@ int main(void)
     /* 1. The filter lives in one caller-owned struct. Zero it first. */
     ins_t ins = {0};
 
-    /* Example data: a random spot in Munich, 520 m ellipsoidal. The
+    /* Example data: a spot in Darmstadt, 190 m ellipsoidal. The
      * filter works in a local NED frame, this is where its origin sits. */
-    const double lat = DEG2RAD(48.1372), lon = DEG2RAD(11.5756), h = 520.0;
+    const double lat = DEG2RAD(49.867378), lon = DEG2RAD(8.638174), h = 190.0;
 
     /* 2. Initial values and noise assumptions. Zeros pick sane consumer
      *    MEMS defaults, so we only set what we care about. The position fixes the
@@ -98,11 +98,11 @@ int main(void)
         return 1;
     }
 
-    /* 4. Feed measurements. 100 Hz IMU for 6 s, a 1 Hz GNSS fix on top.
+    /* 4. Feed measurements. 100 Hz IMU for 10 s, a 1 Hz GNSS fix on top.
      *    At rest and level the accelerometer measures specific force
      *    f = -g: in body FRD (z down) that is +g pointing "up" == -z. */
     const float dt = 0.01f; /* 100 Hz */
-    for (int k = 1; k <= 600; ++k) {
+    for (int k = 1; k <= 1000; ++k) {
         ins_time_us_t t_us = (ins_time_us_t)(1.0 * 1e6 * k * dt);
 
         ins_measurements_t m = {0};
@@ -120,7 +120,8 @@ int main(void)
         m.gyr.data[2]  = 0.0f;
 
         /* GNSS once per second: position + a diagonal NED covariance
-         * (here 2 m horizontal, 4 m vertical 1-sigma -> variance in m^2).
+         * (here 1.5 m horizontal, 2.5 m vertical 1-sigma -> variance in m^2,
+         * inside the 3D entry gate, see "Warm-up" below).
          * The fix goes in as the receiver reports it, latitude, longitude
          * and height, which is the form the filter fuses in. A source that
          * is natively ECEF converts once with ins_ecef_to_latlonh(). */
@@ -129,9 +130,9 @@ int main(void)
             m.gnss_pos.llh[0]     = lat;
             m.gnss_pos.llh[1]     = lon;
             m.gnss_pos.llh[2]     = h;
-            m.gnss_pos.Qll_ned[0] = 2.0f * 2.0f; /* var N */
-            m.gnss_pos.Qll_ned[4] = 2.0f * 2.0f; /* var E */
-            m.gnss_pos.Qll_ned[8] = 4.0f * 4.0f; /* var D */
+            m.gnss_pos.Qll_ned[0] = 1.5f * 1.5f; /* var N */
+            m.gnss_pos.Qll_ned[4] = 1.5f * 1.5f; /* var E */
+            m.gnss_pos.Qll_ned[8] = 2.5f * 2.5f; /* var D */
         }
 
         ins_update(&ins, &m);
@@ -149,9 +150,9 @@ int main(void)
     ins_get_rpy(&ins, &roll, &pitch, &yaw);
 
     printf("position : lat %.6f deg  lon %.6f deg  h %.1f m\n",
-           llh[0] / D2R, llh[1] / D2R, llh[2]);
+           RAD2DEG(llh[0]), RAD2DEG(llh[1]), llh[2]);
     printf("attitude : roll %.2f  pitch %.2f  yaw %.2f deg\n",
-           roll / D2R, pitch / D2R, yaw / D2R);
+           RAD2DEG(roll), RAD2DEG(pitch), RAD2DEG(yaw));
     return 0;
 }
 ```
@@ -165,7 +166,7 @@ alongside your project. From the repository root:
 cc -std=c11 -D_GNU_SOURCE \
    -Isrc -IKFCore/c -IKFCore/c/navigation_tools \
    hello_ins.c \
-   src/ins.c src/geodetic_toolbox.c src/magnetic_model.c \
+   src/ins.c src/log.c src/geodetic_toolbox.c src/magnetic_model.c \
    KFCore/c/linalg.c KFCore/c/kalman_udu.c KFCore/c/miniblas.c \
    -lm -o hello_ins
 ./hello_ins
@@ -174,12 +175,17 @@ cc -std=c11 -D_GNU_SOURCE \
 Expected output:
 
 ```
-position : lat 48.137200 deg  lon 11.575600 deg  h 520.0 m
-attitude : roll -0.01  pitch 0.00  yaw 0.02 deg
+position : lat 49.867378 deg  lon 8.638174 deg  h 190.0 m
+attitude : roll 0.00  pitch 0.00  yaw 0.00 deg
 ```
 
 The position matches the fix and the attitude comes out level, the filter
-levelled itself from the accelerometer during warm-up.
+levelled itself from the accelerometer during warm-up.^[A real gyro never
+measures exactly zero, the Earth's rotation alone is 15 deg/h.]
+The log also prints a few warnings (`initial heading unknown`, `gyro sample
+identical ...`, `yaw not aided ...`). They are expected here: the example has
+no magnetometer or GNSS velocity, so the heading is unobservable, and the
+synthetic IMU is noise-free. The `yaw` value is not meaningful.
 
 > `-D_GNU_SOURCE` is only needed so the standard headers expose `M_PI` to
 > the library sources, it is not an INSLIB requirement of your own code.
@@ -303,7 +309,11 @@ have:
 * **`m.gnss_delay_ms`, `m.local_pos_delay_ms`, `m.yaw_delay_ms`** - if a
   fix is a known number of milliseconds old (latency) the filter anchors
   the correction at the right point in its state history. This is essential
-  for agile vehicles.
+  for agile vehicles. `m.gnss_delay_us`, `m.local_pos_delay_us`,
+  `m.yaw_delay_us` and `m.speed_delay_us` add a
+  microsecond part on top: if you attach a fix to the next IMU sample after
+  it arrived, pass how much older it is than that sample, otherwise the
+  solution trails the truth by speed times that age.
 
 Every field is documented in `src/ins.h` - this header is the reference
 for the whole API.
@@ -342,7 +352,10 @@ path works with any IMU.
 attitude-only filters (ARS/AHRS) and a barometric vertical channel in parallel,
 and arbitrates the best available answer: `FULL` -> `COASTING` ->
 `ATTITUDE_ONLY` -> `NONE`. If you want graceful degradation out of the box,
-start there, the measurement struct and conventions are identical.
+start there, the measurement struct and conventions are identical. With a
+magnetometer, call `nav_suite_set_magnetic_model_position(&suite, lat, lon,
+year)` instead of the `ins` function: it reaches the AHRS as well, at any
+time, right after `nav_suite_init()` included.
 
 ## Where to look next
 

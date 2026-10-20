@@ -1,27 +1,33 @@
-"""ins: Python bindings and telemetry for the INSLIB navigation library.
+"""Python binding of the INSLIB navigation filter (``pip install inslib``).
 
-Two levels of API:
+The compiled C library ships inside the package, this is a thin ``ctypes``
+layer over it. The entry point is :class:`Navigator`: feed it your sensor
+samples each epoch and read the best available solution back. Every epoch
+is the same three moves:
 
-* :class:`Navigator`: the high-level "best available solution". Push
-  whatever sensors you have each epoch and read a unified :class:`Solution`
-  (nav_suite mode arbitration with AHRS attitude fallback).
-* :class:`Ins`: the lean 15-state ESKF alone.
+    from INSLIB import Navigator
 
-Plus :class:`Telemetry` to stream the estimate to PlotJuggler (JSON) and
-MAVLink.
+    nav = Navigator()
+    nav.imu(t_us, dt, acc, gyr)       # 1. start the epoch with the IMU sample
+    nav.gnss_pos_llh(llh, var_ned)    #    plus whatever else you have
+    nav.update()                      # 2. run the filter
+    sol = nav.solution()              # 3. read the result
 
-    from INSLIB import Navigator, Config, Telemetry
-    nav = Navigator(Config(auto_init=True))
-    tele = Telemetry(plotjuggler=True)
-    nav.imu(t_us, dt, acc, gyr); nav.gnss_pos_llh(llh, var_ned)
-    nav.baro(pressure_pa); nav.mag(mag_uT, mag_var)
-    nav.update()                         # run the epoch, then read it back
-    sol = nav.solution(); tele.publish(nav.state())
-    sol.mode, sol.yaw, sol.height_m      # best available, always
+* :class:`Navigator` runs the full suite: the INS plus the ARS/AHRS
+  attitude filters and the barometric vertical channel, with automatic
+  fallback (``sol.mode``: FULL, COASTING, ATTITUDE_ONLY, NONE).
+* :class:`Ins` is the bare 15/18-state error-state Kalman filter alone.
+* :class:`Config` holds the setup, an empty ``Config()`` works.
+* :class:`Telemetry` streams the estimate to PlotJuggler and MAVLink.
 
-The shared library (built by ``make pylib``) is loaded from inside the
-package. Conventions: body FRD, nav NED, Hamilton quaternion [w,x,y,z],
-int64 microsecond time, radians.
+Conventions: body frame FRD (x forward, y right, z down), navigation frame
+NED, Hamilton quaternion ``[w, x, y, z]``, time in int64 microseconds,
+angles in radians, accelerometer in m/s^2, gyro in rad/s.
+
+Getting started: the `Python tutorial
+<https://github.com/jnz/INSLIB/blob/main/tutorial/python_tutorial.md>`_.
+Source, datasets and the post-processing GUI:
+`github.com/jnz/INSLIB <https://github.com/jnz/INSLIB>`_.
 
 (c) Jan Zwiener (jan@zwiener.org)
 """
@@ -38,4 +44,4 @@ __all__ = [
     "telemetry", "ecef_to_llh", "llh_to_ecef", "rpy_to_quat",
     "wmm_field_ned", "yaw_from_baseline_heading",
 ]
-__version__ = "0.1.0"
+__version__ = "1.4.0"

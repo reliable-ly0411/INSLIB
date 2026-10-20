@@ -806,15 +806,37 @@ static void scenario_baro_time_anomaly(void)
     baro_alt_update(&b, t, f_b, q, pressure_from_altitude(base_alt), 0.0f, false);
     CHECK_TRUE(b.is_initialized, "continues after re-anchor");
 
-    /* Forward gap > 0.2 s: the propagation is skipped (an absurd
-       specific force over the gap must NOT be integrated), baro fusion
-       still runs. */
+    /* Forward gap of 0.15 s: ordinary jitter, integrated as usual. */
+    t += (baro_alt_time_us_t)(0.15 * US_PER_SEC);
+    baro_alt_update(&b, t, f_b, q, pressure_from_altitude(base_alt), 0.0f, true);
+    float h, ab, ab_sd;
+    CHECK_TRUE(baro_alt_get_height(&b, &h), "0.15 s gap: still running");
+    CHECK_TRUE(!baro_alt_get_bias_carry(&b, &ab, &ab_sd), "0.15 s gap: no carry");
+
+    /* Forward gap of 1 s: an accelerometer loss (REQ-BARO-027). The filter
+       stops instead of integrating an absurd specific force over the gap,
+       and keeps its a_b for the restart. */
+    b.x[2]                  = 0.07f; /* recognizable a_b */
     const float f_absurd[3] = {0.0f, 0.0f, -(GRAVITY + 10.0f)};
-    t += US_PER_SEC; /* 1 s gap */
+    t += US_PER_SEC;
     baro_alt_update(&b, t, f_absurd, q, pressure_from_altitude(base_alt), 0.0f, true);
-    float h;
-    CHECK_TRUE(baro_alt_get_height(&b, &h), "healthy after gap");
-    CHECK_NEAR(h, 0.0, 0.2, "gap epoch not integrated");
+    CHECK_TRUE(!baro_alt_get_height(&b, &h), "1 s gap: filter stopped");
+    CHECK_TRUE(baro_alt_get_bias_carry(&b, &ab, &ab_sd), "1 s gap: a_b carried");
+    CHECK_NEAR(ab, 0.07, 1e-6, "carried a_b = estimate before the gap");
+    CHECK_TRUE(ab_sd > 0.0f && ab_sd <= b.cfg.acc_bias_init_stddev_mps2,
+               "carried 1-sigma clamped to the cold-start prior");
+
+    /* Restart on the old datum, seeded from the carry. */
+    const float h0_before         = b.h0_baro_m;
+    const float p_now             = pressure_from_altitude(base_alt);
+    cfg.acc_bias_init_mps2        = ab;
+    cfg.acc_bias_init_stddev_mps2 = ab_sd;
+    CHECK_TRUE(baro_alt_init(&b, &cfg, t, p_now, baro_alt_pressure_to_altitude(p_now) - h0_before,
+                             0.0f) == 0,
+               "restart");
+    CHECK_NEAR(b.h0_baro_m, h0_before, 1e-3, "restart keeps the datum");
+    CHECK_TRUE(baro_alt_get_acc_bias(&b, &ab), "a_b after the restart");
+    CHECK_NEAR(ab, 0.07, 1e-6, "restart starts from the carried a_b");
 }
 
 /* ---------------------------------------------------------------------------
@@ -2156,7 +2178,10 @@ static void scenario_datum_offset_survives_origin_shift(void)
  * datum, so the only thing an alignment could do is push the accumulated
  * baro-vs-fix disagreement into the origin -- relocating every local
  * coordinate the consumer holds, which is exactly what the origin carry
- * exists to prevent. A re-arm that does anchor a NEW origin (here: the
+ * exists to prevent. Nor may ins restart its height on the fix: the
+ * barometric anchor is carried too (REQ-NAV-088), so the height the
+ * consumer read from baro_alt during the outage does not step when ins
+ * takes over again. A re-arm that does anchor a NEW origin (here: the
  * health-check path, which inherits nothing) must still re-join the datum,
  * so the second half of the scenario covers that direction too.
  * ---------------------------------------------------------------------------
@@ -2249,13 +2274,41 @@ static void scenario_datum_survives_quality_exit(void)
         const float drift = baro_drift_m * (float)(drift_end - i) / 600.0f;
         QEXIT_STEP(s, t, i, 0.0f, baro_drift_m - drift, false, 0.1f);
     }
+    /* Still no fixes, the drift holds. A real barometer drifts over minutes,
+       the 10 m in 6 s above is only there to keep the scenario short, and
+       baro_alt (whose accelerometer saw no motion) needs a while to settle on
+       it. Phase D compares heights across the re-entry, so it has to start
+       from a vertical channel that is no longer catching up. */
+    const int hold_end = i + 2000;
+    for (; i < hold_end; ++i) { QEXIT_STEP(s, t, i, 0.0f, baro_drift_m, false, 0.1f); }
     CHECK_TRUE(!s.ins.is_initialized, "ins is still collecting without fixes");
 
     /* Phase D: the fixes come back. ins re-bootstraps on the carried origin,
-       and the wrapper must leave that origin alone. */
-    const int reboot_end = i + 1500;
-    for (; i < reboot_end; ++i) { QEXIT_STEP(s, t, i, 0.0f, baro_drift_m, true, 0.1f); }
+       and the wrapper must leave that origin alone. Tracked across the
+       re-entry: the height a consumer reads (nav_suite_get_height) is baro_alt
+       while ins is down and ins once it is back, and the switch must not step
+       it (REQ-NAV-088). */
+    const int reboot_end   = i + 1500;
+    float     h_rep_pre    = 0.0f;
+    float     h_rep_post   = 0.0f;
+    bool      reentry_seen = false;
+    for (; i < reboot_end; ++i)
+    {
+        const bool full_before = nav_suite_get_mode(&s) == NAV_SUITE_MODE_FULL;
+        float      h_rep       = 0.0f;
+        const bool have_rep    = nav_suite_get_height(&s, &h_rep);
+        QEXIT_STEP(s, t, i, 0.0f, baro_drift_m, true, 0.1f);
+        if (!reentry_seen && !full_before && have_rep &&
+            nav_suite_get_mode(&s) == NAV_SUITE_MODE_FULL && nav_suite_get_height(&s, &h_rep_post))
+        {
+            h_rep_pre    = h_rep;
+            reentry_seen = true;
+        }
+    }
     CHECK_TRUE(s.ins.is_initialized, "ins re-bootstrapped on the recovered fixes");
+    CHECK_TRUE(reentry_seen, "the 3D solution was re-entered");
+    CHECK_NEAR(h_rep_post, h_rep_pre, 0.5,
+               "the reported height does not step when the 3D solution returns");
 
     CHECK_TRUE(nav_suite_get_baro_alt(&s, &h_baro, (float*)0), "baro running");
     CHECK_TRUE(ins_get_position_local(&s.ins, pos_ned), "ins local position");
@@ -2272,9 +2325,15 @@ static void scenario_datum_survives_quality_exit(void)
                "datum origin longitude kept across the re-arm");
     CHECK_NEAR(s.ins.origin_llh[2], datum_origin[2], 1e-3,
                "datum origin height kept across the re-arm");
-    /* The platform never moved, so the local height a consumer reads has to
-       be the one it read before the outage. */
-    CHECK_NEAR(-pos_ned[2], h_local_before, 1.0, "local height is continuous across the re-arm");
+    /* The barometric datum came along with the origin, so ins restarts on
+       the barometer, drift included, exactly where it would stand had it
+       never left the 3D solution: under the barometric source the datum's
+       drift belongs to the local height (REQ-SUITE-008, corrected in the
+       absolute height only). Not on the fix, which would pull it back to
+       h_local_before and step it by the whole drift. */
+    CHECK_NEAR(-pos_ned[2], h_baro, 1.0, "ins restarts on the carried barometric datum");
+    CHECK_TRUE(fabsf(-pos_ned[2] - h_local_before) > 2.0f,
+               "and not on the fix, which would undo the drift in one step");
 
     /* Phase E: the other direction. A health-check re-arm inherits no origin
        (REQ-NAV-062), so its bootstrap anchors a fresh one -- here 30 m above
@@ -2991,11 +3050,11 @@ static void scenario_height_gnss_noise_outage_cycle(void)
 /* ---------------------------------------------------------------------------
  * Scenario 16b: absolute height without a barometer (REQ-SUITE-008)
  *
- * The offset filter is source-agnostic: with no barometer at all, the
- * local height reference is the ins local height, and the offset must
- * still converge to the ellipsoid height of the datum origin. After the
- * GNSS drops (mode leaves FULL) the absolute height is then formed from
- * the local height + offset rather than from the fix.
+ * Under GNSS alone ins's height is itself a GNSS height, so there is no
+ * GNSS-independent local height reference and the offset filter must stay
+ * idle: it would only re-estimate the datum origin's ellipsoid height,
+ * which ins already knows. After the GNSS drops (mode leaves FULL) the
+ * absolute height comes from the coasting ins.
  * ---------------------------------------------------------------------------
  */
 
@@ -3084,12 +3143,11 @@ static void scenario_height_ellipsoid_no_baro(void)
     }
     CHECK_TRUE(!s.baro_alt.is_initialized, "no barometer involved");
     CHECK_TRUE(nav_suite_get_mode(&s) == NAV_SUITE_MODE_FULL, "FULL mode");
-    CHECK_TRUE(local_gnss_alt_get(&s.local_gnss, &off, (float*)0),
-               "offset filter runs without a barometer");
-    CHECK_NEAR(off, h_ell_fix, 1.5, "offset = ellipsoid height of the datum origin");
+    CHECK_TRUE(!local_gnss_alt_get(&s.local_gnss, &off, (float*)0),
+               "offset filter idle without a GNSS-independent height");
 
     /* GNSS drops. ins stays ready but leaves FULL, so the absolute
-       height now comes from the local height reference + offset. */
+       height now comes from the coasting ins. */
     for (i = 1; i <= 500; ++i)
     {
         t += US_PER_SEC / 100;
@@ -3101,18 +3159,19 @@ static void scenario_height_ellipsoid_no_baro(void)
         m.acc.data[2]      = -GRAVITY;
         nav_suite_update(&s, &m);
     }
-    CHECK_TRUE(nav_suite_get_mode(&s) == NAV_SUITE_MODE_COASTING,
-               "coasting: offset branch is live");
+    CHECK_TRUE(nav_suite_get_mode(&s) == NAV_SUITE_MODE_COASTING, "coasting");
     CHECK_TRUE(nav_suite_get_height(&s, &h), "local height available");
     CHECK_NEAR(h, 0.0, 1.0, "local height still zero at the origin");
     CHECK_TRUE(nav_suite_get_height_ellipsoid(&s, &h_ell), "absolute height without a barometer");
-    CHECK_NEAR(h_ell, h_ell_fix, 2.0, "ellipsoid height from local height + offset");
+    CHECK_NEAR(h_ell, (float)s.ins.latlonh[2], 1e-3, "ellipsoid height from the coasting ins");
+    CHECK_NEAR(h_ell, h_ell_fix, 2.0, "ellipsoid height still the fix's");
 }
 
 /* ---------------------------------------------------------------------------
  * Scenario 16b2: absolute height with the GNSS antenna above the IMU
  *
- * The fix reports the antenna, ins and the local height reference the IMU.
+ * The fix reports the antenna, ins and the local height reference (a
+ * static barometer on the sensor board) the IMU.
  * The offset filter has to be fed the IMU's ellipsoid height, or it absorbs
  * the lever arm and nav_suite_get_height_ellipsoid() jumps by it when it
  * hands over from ins (FULL) to reference + offset (COASTING). Run level
@@ -3191,6 +3250,8 @@ static void run_height_ellipsoid_leverarm(float pitch_deg)
         m.gnss_leverarm_b[0] = la_b[0];
         m.gnss_leverarm_b[1] = la_b[1];
         m.gnss_leverarm_b[2] = la_b[2];
+        m.baro.is_valid      = true;
+        m.baro.pressure_pa   = pressure_from_altitude(300.0f);
         if ((i % 100) == 1)
         {
             m.gnss_pos.is_valid = true;
@@ -3218,6 +3279,8 @@ static void run_height_ellipsoid_leverarm(float pitch_deg)
         m.gyr.is_valid     = true;
         m.acc.data[0]      = GRAVITY * sinf(pitch);
         m.acc.data[2]      = -GRAVITY * cosf(pitch);
+        m.baro.is_valid    = true;
+        m.baro.pressure_pa = pressure_from_altitude(300.0f);
         nav_suite_update(&s, &m);
     }
     CHECK_TRUE(nav_suite_get_mode(&s) == NAV_SUITE_MODE_COASTING, "coasting: offset branch");
@@ -4314,16 +4377,20 @@ static void scenario_nav_suite_mcdc_guards(void)
     memset(&sb, 0, sizeof(sb));
     CHECK_TRUE(nav_suite_init(&sb, &init, &opt) == 0, "init (yaw hint, post-bootstrap)");
     {
-        ins_measurements_t m;
-        memset(&m, 0, sizeof(m));
-        m.timestamp        = t + US_PER_SEC / 100;
-        m.strapdown_dt_sec = 0.01f;
-        m.acc.is_valid     = true;
-        m.gyr.is_valid     = true;
-        m.acc.data[2]      = -GRAVITY;
-        nav_suite_update(&sb, &m);
+        int k;
+        for (k = 1; k <= 20; ++k) /* past the leveling window (REQ-SUITE-028) */
+        {
+            ins_measurements_t m;
+            memset(&m, 0, sizeof(m));
+            m.timestamp        = t + k * (US_PER_SEC / 100);
+            m.strapdown_dt_sec = 0.01f;
+            m.acc.is_valid     = true;
+            m.gyr.is_valid     = true;
+            m.acc.data[2]      = -GRAVITY;
+            nav_suite_update(&sb, &m);
+        }
     }
-    CHECK_TRUE(sb.ars.is_initialized, "ARS bootstrapped on the first epoch");
+    CHECK_TRUE(sb.ars.is_initialized, "ARS bootstrapped once the leveling window is full");
     const float rpy_init_yaw_before = sb.ars_cfg.rpy_init_rad[2];
     nav_suite_set_init_att_hint(&sb, 0.0f, 0.0f, 0.0f, DEG2RAD(42.0f), DEG2RAD(5.0f));
     CHECK_NEAR(sb.ars_cfg.rpy_init_rad[2], rpy_init_yaw_before, 1e-9,

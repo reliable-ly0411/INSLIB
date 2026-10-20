@@ -22,19 +22,29 @@ python/
     libINSLIB.so           built here by `make pylib` (git-ignored)
   csrc/ins_capi.c/.h    thin, stable C ABI shim (ins_core_* bare, ins_suite_* suite)
   examples/runner.yaml    fully commented runner reference config (CSV)
+  pyproject.toml          packaging metadata (PyPI: pip install inslib)
+  setup.py                build hook: compiles libINSLIB into the package
+  PYPI.md                 the package description shown on pypi.org
+```
+
+The programs built on this package live in `tools/`, next to the C tools:
+
+```
+tools/
   replay.py               dataset replay driving the Navigator + telemetry
                           (consumes the datasets dataset directories)
+  replay_core.py          the replay loop both of them run (inputs, feed
+                          order, scoring, recorders, summary)
+  inspostgui.py           Qt post-processing GUI, same replay core as
+                          replay.py (see below)
   allan_variance.py       estimate IMU bias random walk (imu.*_bias_rw)
                           from a long static recording (see below)
-  inspostgui.py           Qt post-processing GUI on top of replay.py's
-                          machinery (see below)
-  f9p_config.py           configure a u-blox receiver persistently
-                          (RAM+BBR+Flash), independent of the MCU firmware
-  spartn_key.py           load PointPerfect dynamic SPARTN keys into the
-                          receiver and poll back what it holds. The keys
-                          are volatile, so this belongs in a startup path,
-                          not in a one-off setup
-  pyproject.toml          packaging metadata (editable install works today)
+  ublox_f9p_config.py     configure a u-blox ZED-F9P persistently
+                          (RAM+BBR+Flash), independent of any MCU firmware
+  ublox_x20p_config.py    same for a u-blox X20P
+  crazyflie_reader.py     live Crazyflie front end
+  ins_plots.py, ins_kml.py, ins_map_*.py, ins_gui_theme.py,
+  geodetic_toolbox.py     helpers of the above
 ```
 
 The C regression harness `tools/replay.c` (the `make datasets`
@@ -45,8 +55,8 @@ contract in `datasets/replay_format.py`) — and drive the *same*
 filter. Pass either the directory or a config YAML path:
 
 ```sh
-python3 python/replay.py datasets/fog
-python3 python/replay.py datasets/fog/config.yaml
+python3 tools/replay.py datasets/fog
+python3 tools/replay.py datasets/fog/config.yaml
 ```
 
 At the end of a run `replay.py` also **suggests the `imu: gyr_psd`/`acc_psd`
@@ -66,9 +76,9 @@ the filter wants (rad/s/√s resp. m/s²/√s). It prints which config value to
 set:
 
 ```sh
-python3 python/allan_variance.py <imu.csv | dataset-dir>
-python3 python/allan_variance.py static_bench.csv --config config.yaml --plot allan.pdf
-python3 python/allan_variance.py static_bench.csv --skip-start 3600 --plot allan.pdf
+python3 tools/allan_variance.py <imu.csv | dataset-dir>
+python3 tools/allan_variance.py static_bench.csv --config config.yaml --plot allan.pdf
+python3 tools/allan_variance.py static_bench.csv --skip-start 3600 --plot allan.pdf
 ```
 
 Feed it a long static log (the sensor sitting still on a bench — hours, not
@@ -78,6 +88,15 @@ which for a MEMS part sits at hundreds of seconds). It reads the same
 `gyr_bias_rw` / `acc_bias_rw` for `config.yaml`, and as a bonus cross-checks
 the white-noise `gyr_psd`/`acc_psd` (which should agree with `replay.py`'s
 estimate). Needs `numpy` (and `matplotlib` for `--plot`).
+
+Handling at the start and end of a bench recording (starting and stopping
+the logger) is cut by default: `--skip-start` (30 s) and `--skip-end` (60 s).
+A record shorter than `--min-duration` (30 min) after trimming is refused,
+and below 2 h it warns that only upper bounds are to be expected. If the
+`imu.csv` has the optional 8th column `imu_temp_c`, the report shows the
+temperature range and the PDF a temperature curve. The PDF also marks the
+bias instability in the plot and gives a rough IMU class (consumer, industrial,
+tactical, navigation grade) from the gyro bias instability, a heuristic only.
 
 Two things it deliberately does *not* do naively:
 
@@ -107,33 +126,54 @@ only the report.
 
 ## inspostgui — post-processing GUI
 
-`inspostgui.py` is an interactive front end over the same machinery:
-open a dataset's config YAML (every YAML of a dataset directory under
-`datasets/` is auto-discovered, several configs can sit next to the same
-CSVs), view/edit/create it in a form (unknown keys like the `score:
+`inspostgui.py` is an interactive front end over the same replay core as
+`replay.py` (`tools/replay_core.py`), so both fuse the same streams (GNSS,
+mag, baro, speed, dual-antenna heading, ranges) and print the same summary:
+open a dataset's config YAML (the toolbar lists the ones opened last, several
+configs can sit next to the same CSVs), view/edit/create it in a form (unknown keys like the `score:
 lim_*` regression gates are preserved on save), replay it in-process
 with a live 3D trajectory view (speed-colored trail, switchable
 ground-truth and GNSS fix overlays, the previous run as a ghost trail
 to judge a config change, attitude model) and evaluate: error plots with the
 filter's own 1-sigma band, the replay.py accuracy/data-quality summary,
-multi-page PDF export (ins_plots) and KML export (ins_kml).
+multi-page PDF export (ins_plots) and KML export (ins_kml). The toolbar's
+*GNSS outage* field takes `start:duration` windows in seconds from the first
+IMU sample (comma-separated) and cuts those fixes before the run, the same as
+`replay.py --gnss-outage`. The previous-run ghost trail is off until its
+checkbox is switched on.
 
 ```sh
-pip install -r python/requirements-inspostgui.txt
+pip install -r python/requirements.txt
 make pylib
-python3 python/inspostgui.py                                  # or:
-python3 python/inspostgui.py datasets/simulated/profile_1_car
-python3 python/inspostgui.py datasets/fog/config_pyahrs.yaml
-python3 python/inspostgui.py --theme light                    # dark/light, also in the toolbar
-python3 python/inspostgui.py --batch datasets/simulated/profile_1_car  # headless smoke test
+python3 tools/inspostgui.py                                  # or:
+python3 tools/inspostgui.py datasets/simulated/profile_1_car
+python3 tools/inspostgui.py datasets/fog/config.yaml
+python3 tools/inspostgui.py --theme light                    # dark/light, also in the toolbar
+python3 tools/inspostgui.py --batch datasets/simulated/profile_1_car  # headless smoke test
+python3 tools/inspostgui.py --batch datasets/fog --gnss-outage 120:60  # with a simulated outage
 ```
 
 ## Build & install
+
+Released versions are on PyPI (prebuilt wheels for Linux x86_64/aarch64/
+armv7l, Windows x64/ARM64 and macOS Intel/Apple silicon, the import name
+stays `INSLIB`):
+
+```sh
+pip install inslib
+```
+
+From the checkout:
 
 ```sh
 make pylib            # builds python/INSLIB/libINSLIB.so
 pip install -e python/   # optional: editable install so `import INSLIB` works anywhere
 ```
+
+The editable install compiles the library into `python/INSLIB/` itself
+(`setup.py`, needs gcc/clang, `$CC` overrides, on Windows MSVC when no
+gcc is on PATH), so `make pylib` first is only needed for use without
+installing.
 
 `replay.py` additionally needs PyYAML and (for `--mavlink`) pymavlink.
 One-time venv setup for that:
@@ -150,13 +190,14 @@ python\setup_venv.bat
 python\.venv\Scripts\activate.bat
 ```
 
-Or without a venv: `pip install -r python/requirements-replay.txt`
-(equivalent extra: `pip install -e "python/[replay]"`).
+Or without a venv: `pip install -r python/requirements.txt`.
 
-Full `pip install INSLIB` (compiling the C sources into per-platform
-wheels) needs a build backend (scikit-build-core / meson-python) and is
-deferred. The ctypes + flat-ABI design means one wheel per *platform*,
-not per Python version.
+The PyPI wheels are built by cibuildwheel
+(`.github/workflows/release-pypi.yml`, settings in `pyproject.toml`).
+The ctypes + flat-ABI design means one `py3-none-<platform>` wheel per
+*platform*, not per Python version. A local wheel:
+`python -m build --wheel python/`. There is no sdist: the C sources
+live outside `python/`, so building needs the full repository checkout.
 
 ## Swiss army knife: run your own CSV data (inslib-run)
 
@@ -253,8 +294,8 @@ quaternion `q=[w,x,y,z]`, time in int64 microseconds, angles in radians.
 ## Live replay + telemetry
 
 ```sh
-python3 python/replay.py datasets/fog --realtime
-python3 python/replay.py datasets/fog --realtime --speed 10 --mavlink
+python3 tools/replay.py datasets/fog --realtime
+python3 tools/replay.py datasets/fog --realtime --speed 10 --mavlink
 ```
 
 The dataset (`fog`, MEMS ADAHRS vs. an independent FOG strapdown

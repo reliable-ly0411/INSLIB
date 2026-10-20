@@ -7,7 +7,7 @@
 # pass/fail gate instead of something only visible on a plot.
 #
 # 160.7 s, ~44.7% in motion (hand-held), ~55.3% auto-ZUPT/ZARU detected
-# stationary. Block-averaged from 797 Hz IMU data to 100 Hz to save Git repo
+# stationary. Block-averaged from 800 Hz IMU data to 100 Hz to save Git repo
 # storage space (tools/inslib_decimate_dataset.py)
 
 name: inertial_roundtrip
@@ -68,10 +68,10 @@ score:
   # these just need to be > 0, not 0, to not fail the check outright).
   lim_att_bias_deg: 999
   lim_att_std_deg: 999
-  # The actual claims of this dataset, ~25%/~15% above the observed
-  # round-trip error of a single deterministic run (build/replay.exe,
-  # MinGW gcc 15.2.0): a change that costs a few cm or a few tenths of a
+  # The actual claims of this dataset, ~5% above the observed round-trip
+  # error of a single deterministic run (the same figures on gcc 11 and
+  # 15 and on clang): a change that costs half a cm or a hundredth of a
   # degree fails this. Retighten after an intentional improvement.
   lim_yaw_std_deg: 1.0
-  lim_yaw_bias_deg: 0.25   # observed 0.205 deg (100 Hz)
-  lim_pos_rms_m: 0.09      # observed 0.072 m (100 Hz)
+  lim_yaw_bias_deg: 0.216  # observed 0.205
+  lim_pos_rms_m: 0.076     # observed 0.072

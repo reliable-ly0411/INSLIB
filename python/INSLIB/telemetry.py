@@ -15,7 +15,7 @@ out. Adapted from a Crazyflie telemetry adapter; the Crazyflie/battery/
 NMPC specifics were dropped and the wire data comes straight from INSLIB
 (already NED / Hamilton, so there is NO frame conversion here).
 
-Both python/replay.py (post-hoc replay) and a live receiver (off
+Both tools/replay.py (post-hoc replay) and a live receiver (off
 the wire) drive this module, so a capture and its replay produce the
 same PlotJuggler tree and the same MAVLink stream. The shared entry
 point is :meth:`Telemetry.publish_suite`, which takes the Navigator

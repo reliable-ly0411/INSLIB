@@ -9,7 +9,7 @@
 
 #include "ins.h"
 #include "nav_suite.h"
-#include "ahrs.h"             /* ahrs_set_position (WMM true north) */
+#include "ahrs.h"             /* ahrs_get_bias_gyr, ahrs_get_rpy_stddev */
 #include "geodetic_toolbox.h" /* ins_latlonh_to_ecef */
 #include "ins_capi.h"
 
@@ -150,6 +150,8 @@ static void cfg_to_init_opt(const ins_cfg_t* cfg, ins_init_t* init, ins_options_
     opt->automotive_lateral_stddev_mps            = cfg->automotive_lateral_stddev_mps;
     opt->automotive_lateral_max_yaw_rate          = cfg->automotive_lateral_max_yaw_rate;
     opt->automotive_lateral_after_sec             = cfg->automotive_lateral_after_sec;
+    opt->range_height_with_baro                   = (cfg->range_height_with_baro != 0);
+    opt->range_aiding_max_hpos_stddev_m           = cfg->range_aiding_max_hpos_stddev_m;
 }
 
 static void meas_baro(ins_measurements_t* m, float pressure_pa, float stddev_m)
@@ -168,6 +170,29 @@ static void meas_speed(ins_measurements_t* m, float speed_mps, float stddev_mps,
     m->speed.speed_mps  = speed_mps;
     m->speed.stddev_mps = stddev_mps;
     m->speed_delay_ms   = delay_ms;
+}
+
+/* One range entry (REQ-NAV-082) into the first free slot of the epoch.
+   -1 when all INS_RANGE_MAX slots are taken. */
+static int meas_range(ins_measurements_t* m, const double anchor_ecef[3], float range_m,
+                      float stddev_m, int delay_ms, uint16_t anchor_id)
+{
+    int i;
+    for (i = 0; i < INS_RANGE_MAX; ++i)
+    {
+        ins_meas_range_t* r = &m->range[i];
+        if (r->is_valid) continue;
+        r->anchor_ecef[0] = anchor_ecef[0];
+        r->anchor_ecef[1] = anchor_ecef[1];
+        r->anchor_ecef[2] = anchor_ecef[2];
+        r->range_m        = range_m;
+        r->stddev_m       = stddev_m;
+        r->delay_ms       = delay_ms;
+        r->anchor_id      = anchor_id;
+        r->is_valid       = true;
+        return 0;
+    }
+    return -1;
 }
 
 static void meas_imu(ins_measurements_t* m, int64_t t_us, float dt, const float acc[3],
@@ -403,6 +428,17 @@ void ins_core_set_speed(void* h, float speed_mps, float stddev_mps, int delay_ms
     ins_core_ctx_t* c = (ins_core_ctx_t*)h;
     if (c) meas_speed(&c->meas, speed_mps, stddev_mps, delay_ms);
 }
+int ins_core_add_range(void* h, const double anchor_ecef[3], float range_m, float stddev_m,
+                       int delay_ms, uint16_t anchor_id)
+{
+    ins_core_ctx_t* c = (ins_core_ctx_t*)h;
+    return c ? meas_range(&c->meas, anchor_ecef, range_m, stddev_m, delay_ms, anchor_id) : -1;
+}
+void ins_core_set_range_leverarm(void* h, const float lever_b[3])
+{
+    ins_core_ctx_t* c = (ins_core_ctx_t*)h;
+    if (c) memcpy(c->meas.range_leverarm_b, lever_b, sizeof(c->meas.range_leverarm_b));
+}
 void ins_core_set_gnss_delay_ms(void* h, int ms)
 {
     ins_core_ctx_t* c = (ins_core_ctx_t*)h;
@@ -417,6 +453,26 @@ void ins_core_set_local_pos_delay_ms(void* h, int ms)
 {
     ins_core_ctx_t* c = (ins_core_ctx_t*)h;
     if (c) c->meas.local_pos_delay_ms = ms;
+}
+void ins_core_set_gnss_delay_us(void* h, int32_t us)
+{
+    ins_core_ctx_t* c = (ins_core_ctx_t*)h;
+    if (c) c->meas.gnss_delay_us = us;
+}
+void ins_core_set_local_pos_delay_us(void* h, int32_t us)
+{
+    ins_core_ctx_t* c = (ins_core_ctx_t*)h;
+    if (c) c->meas.local_pos_delay_us = us;
+}
+void ins_core_set_yaw_delay_us(void* h, int32_t us)
+{
+    ins_core_ctx_t* c = (ins_core_ctx_t*)h;
+    if (c) c->meas.yaw_delay_us = us;
+}
+void ins_core_set_speed_delay_us(void* h, int32_t us)
+{
+    ins_core_ctx_t* c = (ins_core_ctx_t*)h;
+    if (c) c->meas.speed_delay_us = us;
 }
 void ins_core_update(void* h)
 {
@@ -705,6 +761,17 @@ void ins_suite_set_speed(void* h, float speed_mps, float stddev_mps, int delay_m
     ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
     if (c) meas_speed(&c->meas, speed_mps, stddev_mps, delay_ms);
 }
+int ins_suite_add_range(void* h, const double anchor_ecef[3], float range_m, float stddev_m,
+                        int delay_ms, uint16_t anchor_id)
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    return c ? meas_range(&c->meas, anchor_ecef, range_m, stddev_m, delay_ms, anchor_id) : -1;
+}
+void ins_suite_set_range_leverarm(void* h, const float lever_b[3])
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    if (c) memcpy(c->meas.range_leverarm_b, lever_b, sizeof(c->meas.range_leverarm_b));
+}
 /* baro_alt acc-bias drift density [m/s^2/sqrt(Hz)] (<=0 -> baro_alt default).
    Must be called before the first baro sample latches baro_cfg into the
    filter (nav_suite.h contract); a no-op afterwards. */
@@ -836,6 +903,17 @@ void ins_suite_set_ahrs_gyr_bias_rw(void* h, float density_rps2_sqrthz)
         c->suite.ahrs_cfg.gyr_bias_rw = density_rps2_sqrthz;
     }
 }
+/* ARS/AHRS SHARED extra attitude process noise [rad/sqrt(s)] (<=0 -> none);
+   same timing contract as ins_suite_set_ahrs_gyr_noise(). */
+void ins_suite_set_ahrs_rpy_pred_stddev(void* h, float stddev_rad_sqrts)
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    if (c && stddev_rad_sqrts > 0.0f)
+    {
+        c->suite.ars_cfg.rpy_pred_stddev_rad_sqrts  = stddev_rad_sqrts;
+        c->suite.ahrs_cfg.rpy_pred_stddev_rad_sqrts = stddev_rad_sqrts;
+    }
+}
 /* ARS/AHRS SHARED initial gyro-bias uncertainty [rad/s], all 3 axes (<=0 ->
    ahrs default, 1/1/5 deg/s xy/z) -- this is an INITIAL CONDITION, not a
    process-noise rate, but it matters a great deal for how fast yaw
@@ -857,6 +935,40 @@ void ins_suite_set_ahrs_gyr_bias_init_stddev(void* h, float stddev_rps)
         }
     }
 }
+/* ARS/AHRS SHARED accelerometer-leveling and magnetometer tuning, one call
+   for both templates (ahrs_config_t fields of the same names). 0 leaves a
+   field at ahrs's own default. gravity_diff_penalty and acc_reject_gravity_mps2
+   additionally take a negative value through (ahrs.h: penalty -> 0, reject ->
+   disabled), every other field ignores <= 0. Same timing contract as
+   ins_suite_set_ahrs_gyr_noise(). */
+void ins_suite_set_ahrs_tuning(void* h, float acc_freq_hz, float acc_cutoff_freq_hz,
+                               float gravity_diff_penalty, float acc_reject_gravity_mps2,
+                               float chi2_threshold, float kalman_update_dt_sec,
+                               float mag_yaw_stddev_rad, float mag_freq_hz,
+                               float mag_chi2_threshold)
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    ahrs_config_t*   cfgs[2];
+    int              i;
+    if (!c) return;
+    cfgs[0] = &c->suite.ars_cfg;
+    cfgs[1] = &c->suite.ahrs_cfg;
+    for (i = 0; i < 2; ++i)
+    {
+        ahrs_config_t* a = cfgs[i];
+        if (acc_freq_hz > 0.0f) a->acc_freq_hz = acc_freq_hz;
+        if (acc_cutoff_freq_hz > 0.0f) a->acc_cutoff_freq_hz = acc_cutoff_freq_hz;
+        if (gravity_diff_penalty > 0.0f || gravity_diff_penalty < 0.0f)
+            a->gravity_diff_penalty = gravity_diff_penalty;
+        if (acc_reject_gravity_mps2 > 0.0f || acc_reject_gravity_mps2 < 0.0f)
+            a->acc_reject_gravity_mps2 = acc_reject_gravity_mps2;
+        if (chi2_threshold > 0.0f) a->chi2_threshold = chi2_threshold;
+        if (kalman_update_dt_sec > 0.0f) a->kalman_update_dt_sec = kalman_update_dt_sec;
+        if (mag_yaw_stddev_rad > 0.0f) a->mag_yaw_stddev_rad = mag_yaw_stddev_rad;
+        if (mag_freq_hz > 0.0f) a->mag_freq_hz = mag_freq_hz;
+        if (mag_chi2_threshold > 0.0f) a->mag_chi2_threshold = mag_chi2_threshold;
+    }
+}
 void ins_suite_set_gnss_delay_ms(void* h, int ms)
 {
     ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
@@ -871,6 +983,26 @@ void ins_suite_set_local_pos_delay_ms(void* h, int ms)
 {
     ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
     if (c) c->meas.local_pos_delay_ms = ms;
+}
+void ins_suite_set_gnss_delay_us(void* h, int32_t us)
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    if (c) c->meas.gnss_delay_us = us;
+}
+void ins_suite_set_local_pos_delay_us(void* h, int32_t us)
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    if (c) c->meas.local_pos_delay_us = us;
+}
+void ins_suite_set_yaw_delay_us(void* h, int32_t us)
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    if (c) c->meas.yaw_delay_us = us;
+}
+void ins_suite_set_speed_delay_us(void* h, int32_t us)
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    if (c) c->meas.speed_delay_us = us;
 }
 /* A known initial roll/pitch and/or yaw (e.g. the vehicle's heading at
    the start of the log, with no magnetometer/GNSS-course yaw aiding to
@@ -918,12 +1050,10 @@ void ins_suite_set_magnetic_model_position(void* h, double lat_rad, double lon_r
 {
     ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
     if (!c) return;
-    /* Both attitude sources must agree on the yaw datum (true north):
-       ins gets the full NED reference vector + field gate, the
-       magnetometer AHRS gets its declination re-frame. The ARS has no
+    /* nav_suite hands the position to ins and the magnetometer AHRS and
+       keeps it for every later AHRS start (REQ-SUITE-029). The ARS has no
        magnetometer, so its (free) yaw needs no declination. */
-    ins_set_magnetic_model_from_position(&c->suite.ins, lat_rad, lon_rad, year);
-    ahrs_set_position(&c->suite.ahrs, (float)lat_rad, (float)lon_rad, year);
+    nav_suite_set_magnetic_model_position(&c->suite, lat_rad, lon_rad, year);
 }
 
 int ins_suite_get_mode(void* h)
@@ -1084,6 +1214,38 @@ static void copy_speed_diag(const ins_t* f, uint32_t out[3], float* resid)
     out[1]              = d->n_speed_used;
     out[2]              = d->n_speed_skipped;
     if (resid) *resid = d->last_speed_residual_mps;
+}
+static void copy_range_diag(const ins_t* f, uint32_t out[5], float* resid)
+{
+    const ins_diag_t* d = ins_get_diag(f);
+    out[0]              = d->n_range_seen;
+    out[1]              = d->n_range_used;
+    out[2]              = d->n_range_rejected;
+    out[3]              = d->n_range_skipped;
+    out[4]              = d->n_range_pos_aiding;
+    if (resid) *resid = d->last_range_residual_m;
+}
+void ins_core_get_range_diag(void* h, uint32_t out_counts[5], float* out_resid)
+{
+    ins_core_ctx_t* c = (ins_core_ctx_t*)h;
+    if (c)
+    {
+        copy_range_diag(&c->filter, out_counts, out_resid);
+        return;
+    }
+    memset(out_counts, 0, sizeof(uint32_t) * 5);
+    if (out_resid) *out_resid = 0.0f;
+}
+void ins_suite_get_range_diag(void* h, uint32_t out_counts[5], float* out_resid)
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    if (c)
+    {
+        copy_range_diag(&c->suite.ins, out_counts, out_resid);
+        return;
+    }
+    memset(out_counts, 0, sizeof(uint32_t) * 5);
+    if (out_resid) *out_resid = 0.0f;
 }
 void ins_core_get_speed_diag(void* h, uint32_t out_counts[3], float* out_resid)
 {

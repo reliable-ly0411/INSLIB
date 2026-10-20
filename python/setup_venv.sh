@@ -1,6 +1,6 @@
 #!/bin/sh
 # (c) Jan Zwiener (jan@zwiener.org)
-# One-time setup of a venv for python/replay.py (PyYAML + pymavlink) and
+# One-time setup of a venv for tools/replay.py (PyYAML + pymavlink) and
 # the INSLIB package itself (editable install, needs `make pylib` first).
 # POSIX shell (Linux/macOS, or git-bash/MSYS on Windows) -- for a native
 # cmd.exe prompt use setup_venv.bat instead.
@@ -11,7 +11,7 @@
 #
 # Then:
 #   . python/.venv/bin/activate          # (or: python/.venv/Scripts/activate on Windows)
-#   python3 python/replay.py datasets/fog --realtime
+#   python3 tools/replay.py datasets/fog --realtime
 set -e
 cd "$(dirname "$0")/.."   # repo root
 
@@ -37,4 +37,4 @@ echo
 echo "done. activate with:"
 printf '  . %s/bin/activate   (Windows: %s\\Scripts\\activate)\n' "$VENV" "$VENV"
 echo "then e.g.:"
-echo "  python3 python/replay.py datasets/fog --realtime"
+echo "  python3 tools/replay.py datasets/fog --realtime"

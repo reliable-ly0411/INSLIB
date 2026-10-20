@@ -2,7 +2,7 @@
  * @author Jan Zwiener (jan@zwiener.org)
  *
  * @brief Geodetic / navigation math toolbox (C port of
- *        python/geodetic_toolbox.py).
+ *        tools/geodetic_toolbox.py).
  *
  * Contains quaternion operations, geodesy (WGS84) utilities and
  * small helper functions. All matrices are in column-major order
@@ -15,7 +15,7 @@
  *  - All angles in radians unless otherwise noted.
  *  - lat/lon in radians, height in meters above ellipsoid.
  *
- * Name mapping to the Python reference (python/geodetic_toolbox.py).
+ * Name mapping to the Python reference (tools/geodetic_toolbox.py).
  *
  *   Python                        C
  *   quat_from_rpy                 ins_quat_from_rpy

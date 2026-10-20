@@ -6,7 +6,7 @@
 # expect drift. Adjust the imu noise model to your sensor.
 #
 # Live:   build/insrcv.exe --config config_local_inertial.yaml
-# Replay: python/replay.py, python/inspostgui.py or build/replay with this
+# Replay: tools/replay.py, tools/inspostgui.py or build/replay with this
 #         file as the dataset's config.yaml
 
 aiding: none                       # replay only: no gnss.csv needed (insrcv ignores it)

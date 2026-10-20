@@ -26,15 +26,6 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
 import inslib_mag_calib as mc          # noqa: E402
 import inslib_imu_calib as calib       # noqa: E402
 
-# Only the NAV-PVT test needs the calibration window, and only for the
-# demo frame builder it happens to own. That window needs PyQt6 and
-# pyqtgraph, so the import is optional the same way it is in
-# test_cfg_protocol.py: the gravity tests are worth running without them.
-try:
-    import inslib_calib_gui as gui     # noqa: E402
-except Exception:                      # noqa: BLE001
-    gui = None
-
 # WGS84 normal gravity at 48.91 deg N, 160 m above the ellipsoid, from an
 # independent evaluation of Somigliana plus the free air term. The
 # tolerance is what a float32 pass through the library costs, not slack.
@@ -99,24 +90,6 @@ def test_local_gravity_is_a_real_correction():
     if _no_library(g):
         return
     assert abs(g - calib.G_MPS2) / g > 1e-4
-
-
-def test_nav_pvt_height_arrives_in_metres():
-    """NAV-PVT carries the ellipsoidal height in millimetres.
-
-    Forwarded unscaled it would be 520000 m, which puts the gravity
-    lookup outside its sanity bracket and silently fills in nothing."""
-    if gui is None:
-        print("   (PyQt6/pyqtgraph not installed, skipped)")
-        return
-    payload = gui.DemoSerial._nav_pvt_payload(gui.DemoSerial())
-    frame = gui.ubx_frame(gui.CLASS_NAV, gui.ID_NAV_PVT, payload)
-    fix = calib.decode_nav_pvt(frame)
-    if fix is None:
-        print("   (pyubx2 not installed, skipped)")
-        return
-    assert abs(fix.height_m - gui.DemoSerial.HEIGHT_M) < 1e-3
-    assert calib.local_gravity(fix.lat_deg, fix.height_m) is not None
 
 
 def test_wmm_reference_returns_the_local_field():

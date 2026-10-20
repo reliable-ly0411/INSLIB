@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""imu: mount_rpy_deg in config.yaml (REQ-VER-036), python/replay.py side.
+"""imu: mount_rpy_deg in config.yaml (REQ-VER-036), tools/replay.py side.
 
 The board's attitude in the vehicle frame is composed onto the acc, gyr and
 mag calibration matrices where the calibration is handed to the filter
@@ -18,6 +18,7 @@ import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, "python"))
+sys.path.insert(0, os.path.join(REPO, "tools"))
 
 import yaml       # noqa: E402
 import replay     # noqa: E402

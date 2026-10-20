@@ -22,7 +22,28 @@ score:
   ahrs: 1
   warmup_sec: 10
   min_epochs: 100
-init_stddev:                         # initial-state 1-sigma (each 0 -> built-in default)
+  # Regression guard-rails just above one known-good run, not accuracy
+  # claims. This is the config that scores the ARS/AHRS sub-filters and the
+  # init: ref start. The whole 62-72 s outage is coasted inside the
+  # max_deadreckoning_sec window, config_coasting.yaml covers the freeze
+  # across that window. Deterministic synthetic data, so these stay tight.
+  # Retune to a new known-good run after an intentional change.
+  lim_att_bias_deg: 0.395           # observed 0.375 (pitch)
+  lim_att_std_deg: 0.226            # observed 0.215 (pitch)
+  lim_yaw_bias_deg: 0.845           # observed 0.804
+  lim_yaw_std_deg: 0.9              # observed 0.853
+  lim_pos_rms_m: 2.57               # observed 2.445
+  lim_baro_rms_m: 0.385             # observed 0.366
+  lim_baro_bias_m: 0.115            # observed 0.109
+  lim_baro_max_m: 0.88              # observed 0.835
+  lim_ellipsoid_rms_m: 1.43         # observed 1.359
+  lim_ellipsoid_bias_m: 0.243       # observed 0.231
+  lim_ellipsoid_max_m: 2.15         # observed 2.050
+  lim_ars_att_bias_deg: 0.99        # observed 0.944 (roll)
+  lim_ars_roll_std_deg: 0.485       # observed 0.460
+  lim_ars_pitch_std_deg: 0.69       # observed 0.656
+  lim_ars_yaw_drift_deg_min: 0.065  # observed 0.060
+init_stddev:                        # initial-state 1-sigma (each 0 -> built-in default)
   pos_init_stddev_m: 0             # [m]
   vel_init_stddev_mps: 0           # [m/s]
   rpy_init_stddev_rad_deg:  0      # [deg]

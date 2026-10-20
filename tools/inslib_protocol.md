@@ -164,6 +164,12 @@ was lost on the GNSS UART, when the receiver restarted its time solution,
 or at a genuine discontinuity. Treat such pairs as outliers in the clock
 fit rather than discarding the frame.
 
+`UTC_BASE` follows the receiver's time pulse grid (u-blox
+`CFG-TP-TIMEGRID_TPx`), whose default is UTC: `tow_ms`/`week` are then a
+UTC time of week, off GPS time by the leap seconds. `tools/ublox_x20p_config.py`
+and `tools/ublox_f9p_config.py` set the grid to GPS. Consumers take the time
+as GPS time and do not correct a UTC-grid capture.
+
 ### 0x40 / 0x0D IMU health
 
 Diagnostics for the IMU acquisition chain: 19 u32 in the order below, all
@@ -742,7 +748,7 @@ why it carries two timestamps:
 1. The **producer** potentially runs on a host PC and has no access to the MCU counter,
    and fills `t_unix_us`, `delay_ms`, `speed_mps`, `stddev_mps`, `kind`
    and the direction bits. It leaves `t_us` at 0 and `T_US_VALID` clear.
-2. The **hub** (`tools/inslib_hub.py`) is the only process that observes
+2. The **hub** (`inslib_hub.py`) is the only process that observes
    both clocks: it reads the IMU stream (MCU timer) and receives these
    frames (host wall clock), so it can pair them. It fills `t_us`, sets
    `T_US_VALID`, and emits the completed frame into the sensor stream.
@@ -831,7 +837,7 @@ Ids below `0x80` are the **firmware's**. Documented above are `0x01`, `0x02`,
 `0x05` and `0x06` as sensor data, `0x0D` as IMU diagnostics, and `0x07`
 through `0x0C` as the configuration interface; `0x04` is additionally
 emitted as a status-counter block (tx_dropped, imu_overruns and similar,
-see `tools/inslib_convert_ubx_to_csv.py`), and further ids may be added
+see `inslib_convert_ubx_to_csv.py`), and further ids may be added
 there. `0x03` is retired and must not be reused.
 
 `0x08`, `0x09` and `0x0C` travel from host to device and are the only ids

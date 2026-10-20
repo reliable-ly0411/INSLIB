@@ -9,7 +9,7 @@
 #
 # Then:
 #   . env.sh                             # activate the venv
-#   python3 python/replay.py datasets/fog --realtime
+#   python3 tools/replay.py datasets/fog --realtime
 set -e
 cd "$(dirname "$0")"   # repo root
 

@@ -18,7 +18,8 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 ".."))
 
-from INSLIB import Ins, Navigator, Config, ecef_to_llh, rpy_to_quat  # noqa: E402
+from INSLIB import (Ins, Navigator, Config, ecef_to_llh, rpy_to_quat,  # noqa: E402
+                    wmm_field_ned)
 
 _G = 9.81
 _LAT, _LON, _H = math.radians(48.783), math.radians(9.181), 300.0
@@ -56,6 +57,21 @@ def test_ecef_roundtrip():
     assert abs(lat - _LAT) < 1e-10
     assert abs(lon - _LON) < 1e-10
     assert abs(h - _H) < 1e-4
+
+
+def test_config_defers_defaults_to_c():
+    """Config keeps no tuning numbers of its own: every numeric default is
+    0, which the C library resolves to its own default. A number here would
+    be a second copy of an ins.c constant, silently diverging from it."""
+    import dataclasses
+    for f in dataclasses.fields(Config):
+        v = f.default
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, tuple):
+            assert all(x == 0 for x in v), f"{f.name} defaults to {v}"
+        elif isinstance(v, (int, float)):
+            assert v == 0, f"{f.name} defaults to {v}"
 
 
 def test_rpy_to_quat_identity():
@@ -446,8 +462,63 @@ def test_automotive_yaw_from_gnss_course():
     assert abs(yaw_off) < math.radians(3.0)  # unobserved -> stays at init 0
 
 
+def test_default_config_when_omitted():
+    """Navigator()/Ins() without an argument must behave exactly like
+    Navigator(Config())/Ins(Config()). An uninitialized handle used to
+    treat every epoch as an IMU loss and never got ready, not even with
+    GNSS fixes."""
+    dt = 0.01
+    for cls in (Navigator, Ins):
+        with cls() as bare, cls(Config()) as explicit:
+            for k in range(1, 1201):            # 12 s, fix at 1 Hz
+                t = int(k * dt * 1e6)
+                for h in (bare, explicit):
+                    h.imu(t, dt, (0.0, 0.0, -_G), (0.0, 0.0, 0.0))
+                    if k % 100 == 0:
+                        h.gnss_pos_llh((_LAT, _LON, _H),
+                                       var_ned=(4.0, 4.0, 4.0))
+                    h.update()
+            assert explicit.is_ready(), cls.__name__
+            assert bare.is_ready(), cls.__name__
+            assert bare.rpy() == explicit.rpy(), cls.__name__
+
+def _rot_n_to_b(v, roll, pitch, yaw):
+    """NED vector into the FRD body frame of a ZYX roll/pitch/yaw attitude."""
+    x1 = math.cos(yaw) * v[0] + math.sin(yaw) * v[1]
+    y1 = -math.sin(yaw) * v[0] + math.cos(yaw) * v[1]
+    x2 = math.cos(pitch) * x1 - math.sin(pitch) * v[2]
+    z2 = math.sin(pitch) * x1 + math.cos(pitch) * v[2]
+    return (x2, math.cos(roll) * y1 + math.sin(roll) * z2,
+            -math.sin(roll) * y1 + math.cos(roll) * z2)
+
+
+def test_magnetic_model_before_ahrs_start():
+    """set_magnetic_model() right after construction, long before the AHRS
+    starts, must still give a true-north AHRS heading (REQ-SUITE-029). It
+    used to be dropped, leaving the heading on magnetic north."""
+    lat, lon, year = 49.867378, 8.638174, 2026.5
+    r, p, y = math.radians(10.0), math.radians(-5.0), math.radians(30.0)
+    b_ned = wmm_field_ned(lat, lon, year)
+    decl = math.degrees(math.atan2(b_ned[1], b_ned[0]))
+    assert abs(decl) > 3.0
+    acc = _rot_n_to_b((0.0, 0.0, -_G), r, p, y)
+    mag = _rot_n_to_b(b_ned, r, p, y)
+    with Navigator() as nav:
+        nav.set_magnetic_model(math.radians(lat), math.radians(lon), year)
+        dt = 0.01
+        for k in range(1, 3001):                 # 30 s
+            nav.imu(int(k * dt * 1e6), dt, acc, (0.0, 0.0, 0.0))
+            if k % 10 == 0:
+                nav.mag(mag, (0.0, 0.0, 0.0))
+            nav.update()
+        rpy = nav.rpy_ahrs()
+    assert rpy is not None
+    assert abs(math.degrees(rpy[2]) - 30.0) < 1.0, math.degrees(rpy[2])
+
+
 _TESTS = [
     test_ecef_roundtrip,
+    test_config_defers_defaults_to_c,
     test_rpy_to_quat_identity,
     test_ins_level_convergence,
     test_predict_correct_equivalence,
@@ -464,6 +535,8 @@ _TESTS = [
     test_gnss_pos_cov_scale_height,
     test_gnss_delay_kwarg,
     test_automotive_yaw_from_gnss_course,
+    test_default_config_when_omitted,
+    test_magnetic_model_before_ahrs_start,
 ]
 
 

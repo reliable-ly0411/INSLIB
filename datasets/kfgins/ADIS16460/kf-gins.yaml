@@ -1,0 +1,27 @@
+# KF-GINS config
+imupath: "./ADIS16460.txt"
+gnsspath: "./GNSS_RTK.pos"
+outputpath: "./"
+imudatalen: 7
+imudatarate: 200
+starttime: 357473.0121
+endtime: -1
+initpos: [ 30.4604282595, 114.472504542, 22.75838 ]
+initvel: [ 0.00139, -0.0064, 0.00287 ]
+initatt: [ 1.57339, 0.69979, 278.55357 ]
+initgyrbias: [ 0, 0, 0 ]
+initaccbias: [ 0, 0, 0 ]
+initgyrscale: [ 0, 0, 0 ]
+initaccscale: [ 0, 0, 0 ]
+initposstd: [ 0.1, 0.1, 0.2 ]
+initvelstd: [ 0.05, 0.05, 0.05 ]
+initattstd: [ 0.5, 0.5, 1 ]
+imunoise:
+  arw: [ 0.2, 0.2, 0.2 ]
+  vrw: [ 0.1, 0.1, 0.1 ]
+  gbstd: [ 20, 20, 20 ]
+  abstd: [ 100, 100, 100 ]
+  gsstd: [ 1000, 1000, 1000 ]
+  asstd: [ 1000, 1000, 1000 ]
+  corrtime: 1
+antlever: [ 0.045, 0.46, -0.238 ]

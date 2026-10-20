@@ -1,0 +1,13 @@
+# Exactly what the inspostgui.exe bundle is built from (scripts/inspostgui.spec,
+# .github/workflows/release-exe.yml). Kept small on purpose: PyInstaller bundles
+# whatever it finds installed and imported, so this is also the list of what
+# ends up in the download.
+pyyaml
+numpy
+PyQt6
+pyqtgraph
+PyOpenGL
+matplotlib
+simplekml
+Pillow
+pyinstaller

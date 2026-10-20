@@ -13,7 +13,8 @@ import tempfile
 
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "..", "tools"))
 
 import allan_variance as av  # noqa: E402
 
@@ -49,11 +50,12 @@ def _synthesize(path):
     gyr = np.column_stack([channel() for _ in range(3)])
     acc = np.column_stack([channel() for _ in range(3)])
     acc[:, 2] -= _G
+    temp = 24.0 + 4.0 * np.arange(n) / n          # slow warm-up, 24 - 28 degC
     with open(path, "w", encoding="utf-8") as f:
-        f.write("# t_us, gyr_frd_xyz [rad/s], acc_frd_xyz [m/s^2]\n")
+        f.write("# t_us, gyr_frd_xyz [rad/s], acc_frd_xyz [m/s^2], imu_temp_c [degC]\n")
         for i in range(n):
             f.write(f"{t_us[i]},{gyr[i,0]:.6e},{gyr[i,1]:.6e},{gyr[i,2]:.6e},"
-                    f"{acc[i,0]:.6e},{acc[i,1]:.6e},{acc[i,2]:.6e}\n")
+                    f"{acc[i,0]:.6e},{acc[i,1]:.6e},{acc[i,2]:.6e},{temp[i]:.3f}\n")
 
 
 def test_allan_recovers_bias_rw():
@@ -61,7 +63,29 @@ def test_allan_recovers_bias_rw():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "imu.csv")
         _synthesize(path)
-        r = av.analyze(path)
+        r = av.analyze(path, skip_start_sec=av.DEFAULT_SKIP_START_SEC,
+                       skip_end_sec=av.DEFAULT_SKIP_END_SEC,
+                       min_duration_sec=av.DEFAULT_MIN_DURATION_SEC)
+        # A record under the minimum is refused.
+        try:
+            av.analyze(path, min_duration_sec=2.0 * _DUR_S)
+            raise AssertionError("short record was not refused")
+        except SystemExit:
+            pass
+
+    # Start/end trimmed, temperature range read from the 8th column.
+    assert abs(r["duration"] - (_DUR_S - 90.0)) < 1.0
+    lo, hi = r["temp_range"]
+    assert 24.0 < lo < 24.1 and 27.9 < hi < 28.0, r["temp_range"]
+    assert r["grade"] and r["bias_trace"]["temp_mean"] is not None
+    assert any("only" in w and "record" in w for w in r["warnings"])  # < 2 h
+
+    # Plausibility net: silent on sane values, loud on a deg/s-as-rad/s mix-up.
+    assert not any("implausible" in w or "differs" in w for w in r["warnings"]), r["warnings"]
+    wrong = dict(r)
+    wrong["arw"] = {"gyr": [v * 57.3 for v in r["arw"]["gyr"]], "acc": r["arw"]["acc"]}
+    assert any("implausible gyro noise density" in w
+               for w in av._plausibility_warnings(wrong))
 
     # Headline: the suggested bias_rw (worst axis) recovers the injected RRW.
     # The bound is deliberately tight enough that reading the curve at
@@ -79,6 +103,27 @@ def test_allan_recovers_bias_rw():
 
     # A clean synthetic static record must not trip the motion warnings.
     assert not any("not be static" in w for w in r["warnings"]), r["warnings"]
+
+    # Bias instability: the Allan minimum / 0.664. Without a flicker term the
+    # minimum sits where white noise and random walk cross, so it can be
+    # checked against the two injected terms: never below either asymptote
+    # at the reported tau, and inside the trustworthy averaging times.
+    for name in ("gyr", "acc"):
+        for b, tau_b in zip(r["bi"][name], r["bi_tau"][name]):
+            floor = max(_N_ARW / math.sqrt(tau_b), _K_RRW * math.sqrt(tau_b / 3.0))
+            assert 0.5 * floor < b * av.BIAS_INSTABILITY_FACTOR < 2.0 * floor, \
+                f"{name} bias instability {b:.2e} at tau={tau_b:.0f} s"
+            assert tau_b <= r["tau_fit_max"]
+
+    # The console report stays ASCII (a Windows console may not encode the
+    # unicode units the PDF uses).
+    av.format_report(r).encode("ascii")
+
+    # The PDF renders (curves, report, bias trace with temperature, formulas).
+    with tempfile.TemporaryDirectory() as d:
+        pdf = os.path.join(d, "allan.pdf")
+        av.plot_curves(r, pdf)
+        assert os.path.getsize(pdf) > 0
 
 
 if __name__ == "__main__":

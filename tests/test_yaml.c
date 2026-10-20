@@ -5,7 +5,7 @@
  * tools/insrcv.c: the YAML subset reader (tools/mini_yaml.h) and the IMU
  * mounting (tools/imu_mount.h).
  *
- * A dataset directory is read by this reader and by python/replay.py
+ * A dataset directory is read by this reader and by tools/replay.py
  * (PyYAML) alike, so what the two disagree about is not caught anywhere:
  * both harnesses run, each on its own idea of the configuration. That is
  * the failure REQ-VER-028 is about and what these scenarios pin down.

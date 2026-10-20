@@ -23,7 +23,7 @@ Usage::
     inslib-run config.yaml                 # with pip install -e python/
 
 This is deliberately NOT the regression harness (see datasets/ and
-python/replay.py for dataset replays scored against ground truth). It
+tools/replay.py for dataset replays scored against ground truth). It
 is the "just run my data" front end.
 
 (c) Jan Zwiener (jan@zwiener.org)

@@ -22,6 +22,8 @@
  *   baro.csv     t_us, static pressure [Pa]      (optional)
  *   speed.csv    t_us, ground speed [m/s]        (optional)
  *   heading.csv  t_us, baseline azimuth [deg], 1-sigma [deg], carr_soln
+ *   ranges.csv   t_us, anchor_id, anchor ECEF x/y/z [m], range [m],
+ *                1-sigma [m]                             (optional)
  *                                                (optional)
  *
  * Usage: replay <config.yaml | datadir> [errdump.csv]
@@ -85,6 +87,7 @@ typedef struct
     char in_baro[256];
     char in_speed[256];
     char in_heading[256];
+    char in_ranges[256];
 
     int   automotive_mode;               /* 0/1: yaw from GNSS course over ground (REQ-NAV-034) */
     float automotive_min_speed_mps;      /* 0 -> default */
@@ -105,6 +108,8 @@ typedef struct
     int allow_unlimited_deadreckoning; /* 0/1: never expire the IMU-only
                                           coasting window (position drifts) */
     float max_deadreckoning_sec;       /* IMU-only coasting budget [s] */
+    float kalman_update_dt_sec;        /* ins covariance-prediction period [s],
+                                          0 -> ins's own default (REQ-VER-049) */
 
     int baro_height_disable; /* 0/1: never select the barometric height source
                                  at bootstrap (REQ-NAV-053), even with a
@@ -137,7 +142,7 @@ typedef struct
     /* Auto-ZUPT/ZARU pseudo-measurement stddev, 0 -> this harness's own
        default (0.05 m/s, 0.1 deg/s -- NOT ins.c's own built-in default of
        0.05 m/s, 0.5 deg/s for the rotation channel; shared with
-       python/replay.py's DEFAULTS for years, see build_config() there). */
+       tools/replay.py's DEFAULTS for years, see build_config() there). */
     float zero_vel_stddev_mps;
     float zero_rot_stddev_deg;
     /* Stillness detection, ONE set for the whole suite (REQ-SUITE-020,
@@ -304,6 +309,16 @@ typedef struct
     float heading_stddev_min_deg;  /* floor after scaling (0 -> none) */
     int   heading_delay_ms;        /* how old a row is at its timestamp */
 
+    /* ranges: ranges to anchors at known positions (REQ-NAV-082). The
+       1-sigma is a per-row column like heading's, scaled and floored here,
+       and each row is history-anchored at its own age (REQ-VER-038). */
+    int   ranges_enable;
+    float ranges_leverarm_frd[3];          /* ranging antenna, body FRD [m] */
+    float ranges_stddev_scale;             /* multiplies the row's 1-sigma (0 -> 1.0) */
+    float ranges_stddev_min_m;             /* floor after scaling (0 -> none) */
+    int   ranges_height_with_baro;         /* 0/1, ins_options_t */
+    float ranges_aiding_max_hpos_stddev_m; /* 0 -> ins default (REQ-NAV-085) */
+
     /* baro: */
     int   baro_enable;
     float baro_stddev_m;              /* 0 -> consumer default */
@@ -331,9 +346,24 @@ typedef struct
     float ahrs_gyr_noise_psd;            /* [rad/s/sqrt(Hz)] */
     float ahrs_gyr_bias_rw;              /* [rad/s^2/sqrt(Hz)] */
     float ahrs_acc_noise_mps2;           /* [m/s^2] */
+    float ahrs_rpy_pred_stddev_rad_sqrts; /* [rad/sqrt(s)], extra attitude
+                                   noise, 0 -> none (REQ-AHRS-027) */
     float ahrs_gyr_bias_init_stddev_deg; /* [deg/s], 0 -> the static-window
                                    seed's own stddev (or ahrs.c's built-in
                                    default if the window found nothing) */
+    /* ahrs_config_t accelerometer-leveling and magnetometer tuning, same
+       names and units as ahrs.h (mag_yaw_stddev in degrees). 0 -> ahrs's own
+       default; gravity_diff_penalty and acc_reject_gravity_mps2 also take a
+       negative value (penalty -> 0, reject -> disabled). */
+    float ahrs_acc_freq_hz;
+    float ahrs_acc_cutoff_freq_hz;
+    float ahrs_gravity_diff_penalty;
+    float ahrs_acc_reject_gravity_mps2;
+    float ahrs_chi2_threshold;
+    float ahrs_kalman_update_dt_sec;
+    float ahrs_mag_yaw_stddev_deg;
+    float ahrs_mag_freq_hz;
+    float ahrs_mag_chi2_threshold;
 
     /* init_hint: known initial roll/pitch and/or yaw for ins's auto-init
        bootstrap (init: auto only), see nav_suite_set_init_att_hint().
@@ -423,6 +453,7 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
     else if (!strcmp(full, "inputs.baro")) { snprintf(c->in_baro, sizeof(c->in_baro), "%s", val); }
     else if (!strcmp(full, "inputs.speed")) { snprintf(c->in_speed, sizeof(c->in_speed), "%s", val); }
     else if (!strcmp(full, "inputs.heading")) { snprintf(c->in_heading, sizeof(c->in_heading), "%s", val); }
+    else if (!strcmp(full, "inputs.ranges")) { snprintf(c->in_ranges, sizeof(c->in_ranges), "%s", val); }
     else if (!strcmp(full, "automotive_mode")) { c->automotive_mode = (int)d; }
     else if (!strcmp(full, "automotive_min_speed_mps")) { c->automotive_min_speed_mps = (float)d; }
     else if (!strcmp(full, "automotive_lateral_constraint"))
@@ -453,6 +484,7 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
         c->allow_unlimited_deadreckoning = (int)d;
     }
     else if (!strcmp(full, "max_deadreckoning_sec")) { c->max_deadreckoning_sec = (float)d; }
+    else if (!strcmp(full, "kalman_update_dt_sec")) { c->kalman_update_dt_sec = (float)d; }
     else if (!strcmp(full, "baro_height_disable")) { c->baro_height_disable = (int)d; }
     else if (!strcmp(full, "gyro_bias_window_sec")) { c->gyro_bias_window_sec = d; }
     else if (!strcmp(full, "imu.gyr_psd")) { c->gyr_psd = (float)d; }
@@ -648,6 +680,12 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
     else if (!strcmp(full, "heading.stddev_scale")) { c->heading_stddev_scale = (float)d; }
     else if (!strcmp(full, "heading.stddev_min_deg")) { c->heading_stddev_min_deg = (float)d; }
     else if (!strcmp(full, "heading.delay_ms")) { c->heading_delay_ms = (int)d; }
+    else if (!strcmp(full, "ranges.enable")) { c->ranges_enable = (int)d; }
+    else if (!strcmp(full, "ranges.leverarm_frd")) { if (mini_yaml_list(val, c->ranges_leverarm_frd, 3) != 0) return -2; }
+    else if (!strcmp(full, "ranges.stddev_scale")) { c->ranges_stddev_scale = (float)d; }
+    else if (!strcmp(full, "ranges.stddev_min_m")) { c->ranges_stddev_min_m = (float)d; }
+    else if (!strcmp(full, "ranges.height_with_baro")) { c->ranges_height_with_baro = (int)d; }
+    else if (!strcmp(full, "ranges.aiding_max_hpos_stddev_m")) { c->ranges_aiding_max_hpos_stddev_m = (float)d; }
     else if (!strcmp(full, "baro.enable")) { c->baro_enable = (int)d; }
     else if (!strcmp(full, "baro.stddev_m")) { c->baro_stddev_m = (float)d; }
     else if (!strcmp(full, "baro.acc_bias_rw")) { c->baro_acc_bias_rw = (float)d; }
@@ -676,10 +714,26 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
     else if (!strcmp(full, "ahrs.gyr_noise_psd")) { c->ahrs_gyr_noise_psd = (float)d; }
     else if (!strcmp(full, "ahrs.gyr_bias_rw")) { c->ahrs_gyr_bias_rw = (float)d; }
     else if (!strcmp(full, "ahrs.acc_noise_mps2")) { c->ahrs_acc_noise_mps2 = (float)d; }
+    else if (!strcmp(full, "ahrs.rpy_pred_stddev_rad_sqrts"))
+    {
+        c->ahrs_rpy_pred_stddev_rad_sqrts = (float)d;
+    }
     else if (!strcmp(full, "ahrs.gyr_bias_init_stddev_rps_deg"))
     {
         c->ahrs_gyr_bias_init_stddev_deg = (float)d;
     }
+    else if (!strcmp(full, "ahrs.acc_freq_hz")) { c->ahrs_acc_freq_hz = (float)d; }
+    else if (!strcmp(full, "ahrs.acc_cutoff_freq_hz")) { c->ahrs_acc_cutoff_freq_hz = (float)d; }
+    else if (!strcmp(full, "ahrs.gravity_diff_penalty")) { c->ahrs_gravity_diff_penalty = (float)d; }
+    else if (!strcmp(full, "ahrs.acc_reject_gravity_mps2"))
+    {
+        c->ahrs_acc_reject_gravity_mps2 = (float)d;
+    }
+    else if (!strcmp(full, "ahrs.chi2_threshold")) { c->ahrs_chi2_threshold = (float)d; }
+    else if (!strcmp(full, "ahrs.kalman_update_dt_sec")) { c->ahrs_kalman_update_dt_sec = (float)d; }
+    else if (!strcmp(full, "ahrs.mag_yaw_stddev_deg")) { c->ahrs_mag_yaw_stddev_deg = (float)d; }
+    else if (!strcmp(full, "ahrs.mag_freq_hz")) { c->ahrs_mag_freq_hz = (float)d; }
+    else if (!strcmp(full, "ahrs.mag_chi2_threshold")) { c->ahrs_mag_chi2_threshold = (float)d; }
     else if (!strcmp(full, "init_hint.roll_deg")) { c->init_hint_roll_deg = (float)d; }
     else if (!strcmp(full, "init_hint.pitch_deg")) { c->init_hint_pitch_deg = (float)d; }
     else if (!strcmp(full, "init_hint.rpy_stddev_deg")) { c->init_hint_rpy_stddev_deg = (float)d; }
@@ -714,7 +768,7 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
        are accepted and ignored here rather than rejected. Rejecting them
        would force a dataset to pick one of its tools; deleting them from the
        file to satisfy this parser would silently disarm the other tool.
-       python/replay.py carries the identical list (FOREIGN_SECTIONS + the
+       tools/replay.py carries the identical list (FOREIGN_SECTIONS + the
        score key below).
 
          score.lim_groves_pos_rms_factor  datasets/check_simulated.py's gate
@@ -725,7 +779,7 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
          origin.*                         local-frame anchor for a platform
                                           with no absolute position source,
          crazyflie.*                      link settings for the same reader.
-                                          Both python/crazyflie_reader.py.
+                                          Both tools/crazyflie_reader.py.
 
        A section only earns a place here once a tool actually reads it:
        something no tool reads is not a foreign section, it is documentation,
@@ -780,6 +834,7 @@ static int load_config(const char* path, replay_cfg_t* c)
     snprintf(c->in_baro, sizeof(c->in_baro), "baro.csv");
     snprintf(c->in_speed, sizeof(c->in_speed), "speed.csv");
     snprintf(c->in_heading, sizeof(c->in_heading), "heading.csv");
+    snprintf(c->in_ranges, sizeof(c->in_ranges), "ranges.csv");
     /* The mounting where the baseline azimuth IS the yaw, and only fixed
        headings: a float one can be degrees off while claiming better. */
     c->heading_baseline_frd[0] = 1.0f;
@@ -886,6 +941,15 @@ typedef struct
 
 typedef struct
 {
+    int64_t  t_us;           /* time the range refers to */
+    double   anchor_ecef[3]; /* [m] */
+    float    range_m;
+    float    stddev_m;
+    uint16_t anchor_id;
+} range_epoch_t;
+
+typedef struct
+{
     double sum, sum2, max_abs;
     int    n;
 } stat_t;
@@ -912,6 +976,29 @@ static double wrap_pi_d(double a)
     while (a > M_PI) a -= 2.0 * M_PI;
     while (a < -M_PI) a += 2.0 * M_PI;
     return a;
+}
+
+/* Reference rows further apart than this are not interpolated between. */
+#define REPLAY_REF_ATT_INTERP_MAX_US 1000000
+
+/* Reference attitude at IMU epoch t_us (REQ-VER-047). The row is scored at
+ * the first IMU epoch at or after its timestamp, so it is up to one IMU
+ * period older than the estimate, and a turning platform has rotated in
+ * between. The attitude is therefore interpolated towards the next row,
+ * never across a gap in the reference. */
+static void ref_rpy_at(const ref_epoch_t* ref, const ref_epoch_t* next, int64_t t_us,
+                       double rpy[3])
+{
+    rpy[0] = ref->roll_rad;
+    rpy[1] = ref->pitch_rad;
+    rpy[2] = ref->yaw_rad;
+    if (next == (const ref_epoch_t*)0 || t_us <= ref->t_us || next->t_us <= t_us) { return; }
+    const int64_t span = next->t_us - ref->t_us;
+    if (span > REPLAY_REF_ATT_INTERP_MAX_US) { return; }
+    const double f = (double)(t_us - ref->t_us) / (double)span;
+    rpy[0] += f * wrap_pi_d((double)next->roll_rad - rpy[0]);
+    rpy[1] += f * wrap_pi_d((double)next->pitch_rad - rpy[1]);
+    rpy[2] += f * wrap_pi_d((double)next->yaw_rad - rpy[2]);
 }
 
 static void stat_print(const char* name, const stat_t* s, const char* unit)
@@ -1093,7 +1180,7 @@ static int load_baro(const char* path, baro_epoch_t** out)
 
 /* speed.csv: "t_us, speed_mps" plus any further columns the producer chose
    to keep. Only those two are read here -- uncertainty and delay come from
-   the config as constants, matching python/replay.py's load_speed(). */
+   the config as constants, matching tools/replay.py's load_speed(). */
 static int load_speed(const char* path, speed_epoch_t** out)
 {
     *out    = NULL;
@@ -1149,6 +1236,46 @@ static int load_heading(const char* path, heading_epoch_t** out)
     return n;
 }
 
+/* ranges.csv: "t_us, anchor_id, x, y, z, range_m, stddev_m" plus the
+   producer's own trailing columns, which are not read. A row with a
+   non-positive 1-sigma or a negative range is dropped here, the filter
+   would refuse it anyway. */
+static int load_ranges(const char* path, range_epoch_t** out)
+{
+    *out    = NULL;
+    FILE* f = fopen(path, "r");
+    if (!f) { return -1; }
+    char           line[512];
+    int            n   = 0;
+    int            cap = 0;
+    range_epoch_t* r   = NULL;
+    while (fgets(line, sizeof(line), f))
+    {
+        long long    t;
+        unsigned int id;
+        double       x, y, z;
+        float        rng, sd;
+        if (line[0] == '#') continue;
+        if (sscanf(line, "%lld,%u,%lf,%lf,%lf,%f,%f", &t, &id, &x, &y, &z, &rng, &sd) != 7)
+        {
+            continue;
+        }
+        if (!(sd > 0.0f) || !(rng >= 0.0f) || id > 0xFFFFu) continue;
+        r                 = grow_or_die(r, n, &cap, sizeof(*r), path);
+        r[n].t_us         = (int64_t)t;
+        r[n].anchor_id    = (uint16_t)id;
+        r[n].anchor_ecef[0] = x;
+        r[n].anchor_ecef[1] = y;
+        r[n].anchor_ecef[2] = z;
+        r[n].range_m      = rng;
+        r[n].stddev_m     = sd;
+        n++;
+    }
+    fclose(f);
+    *out = r;
+    return n;
+}
+
 /* Why a heading row did not become a yaw measurement. */
 typedef enum
 {
@@ -1160,7 +1287,7 @@ typedef enum
 } heading_reason_t;
 
 /* One heading.csv row -> the yaw measurement ins consumes. Mirrors
-   heading_measurement() in python/replay.py: gate on the carrier-phase
+   heading_measurement() in tools/replay.py: gate on the carrier-phase
    solution, scale and floor the receiver's 1-sigma, then undo the antenna
    mounting with the attitude the suite holds right now (level when it holds
    none yet, which is exact for a baseline along x). */
@@ -1266,20 +1393,29 @@ static mag_epoch_t*   g_mag;
 static baro_epoch_t*  g_baro;
 static speed_epoch_t* g_speed;
 static heading_epoch_t* g_heading;
+static range_epoch_t*   g_ranges;
 
 /* 3D position error of the ins solution against one reference epoch, with the
  * scoring lever arm mapping the filter position onto the truth point. Returns
  * 0 when the filter has no position to offer, which is an answer of its own
  * for the coasting metric (REQ-VER-029). */
-static int nav_pos_error_m(const ref_epoch_t* ref, const float leverarm_frd[3], double* err_m)
+/* Position error of the filter at IMU epoch t_us against reference row ref.
+ * The estimate is carried back to the row's timestamp with the filter's own
+ * velocity first (REQ-VER-047): the row is scored at the first IMU epoch at or
+ * after its timestamp, so it is up to one IMU period older than the estimate.
+ * The filter velocity, not the row's, since not every ref.csv carries one. */
+static int nav_pos_error_m(const ref_epoch_t* ref, int64_t t_us, const float leverarm_frd[3],
+                           double* err_m, double* err_hor_m, double* err_up_m)
 {
     double llh[3];
     double dllh[3];
     float  R[9];
     float  la_n[3] = {0.0f, 0.0f, 0.0f};
     float  dned_f[3];
+    float  v_est[3];
     double dn, de, dd;
     if (!ins_is_ready(&g_suite.ins)) return 0;
+    if (!ins_get_velocity_ned(&g_suite.ins, v_est)) return 0;
     /* The anchor as the filter holds it (REQ-NAV-078): going out through
        ins_get_position_ecef() and back would run two conversions to land on
        the same three numbers. */
@@ -1294,10 +1430,13 @@ static int nav_pos_error_m(const ref_epoch_t* ref, const float leverarm_frd[3], 
     dllh[1] = llh[1] - ref->lon_rad;
     dllh[2] = llh[2] - ref->h_m;
     ins_dlatlonh_to_dned(dllh, ref->lat_rad, ref->h_m, dned_f);
-    dn     = dned_f[0] + la_n[0];
-    de     = dned_f[1] + la_n[1];
-    dd     = dned_f[2] + la_n[2];
+    const double dt_ref = (double)(t_us - ref->t_us) * 1e-6;
+    dn = (double)(dned_f[0] + la_n[0]) - (double)v_est[0] * dt_ref;
+    de = (double)(dned_f[1] + la_n[1]) - (double)v_est[1] * dt_ref;
+    dd = (double)(dned_f[2] + la_n[2]) - (double)v_est[2] * dt_ref;
     *err_m = sqrt(dn * dn + de * de + dd * dd);
+    if (err_hor_m != (double*)0) { *err_hor_m = sqrt(dn * dn + de * de); }
+    if (err_up_m != (double*)0) { *err_up_m = -dd; }
     return 1;
 }
 
@@ -1362,8 +1501,9 @@ static int estimate_gyro_bias(FILE* fimu, double window_sec, float bias[3])
     return 0;
 }
 
-/* Timestamp of the first IMU sample (-1 if none); rewinds the stream. */
-static int64_t first_imu_time_us(FILE* fimu)
+/* Timestamp of the first IMU sample at or after t_min (-1 if none); rewinds
+ * the stream. */
+static int64_t first_imu_time_at_or_after_us(FILE* fimu, int64_t t_min)
 {
     char    line[512];
     int64_t t = -1;
@@ -1374,7 +1514,8 @@ static int64_t first_imu_time_us(FILE* fimu)
         float     g[3], a[3];
         if (line[0] == '#') continue;
         if (sscanf(line, "%lld,%f,%f,%f,%f,%f,%f", &tt, &g[0], &g[1], &g[2], &a[0], &a[1], &a[2]) ==
-            7)
+                7 &&
+            (int64_t)tt >= t_min)
         {
             t = (int64_t)tt;
             break;
@@ -1383,6 +1524,9 @@ static int64_t first_imu_time_us(FILE* fimu)
     (void)fseek(fimu, 0, SEEK_SET);
     return t;
 }
+
+/* Timestamp of the first IMU sample (-1 if none); rewinds the stream. */
+static int64_t first_imu_time_us(FILE* fimu) { return first_imu_time_at_or_after_us(fimu, INT64_MIN); }
 
 /* Replace zero (unknown) diagonal entries by the fallback variance;
  * returns 0 if the result still has a non-positive diagonal entry
@@ -1530,6 +1674,17 @@ int main(int argc, char** argv)
         }
     }
 
+    int n_ranges = 0;
+    if (cfg.ranges_enable)
+    {
+        snprintf(path, sizeof(path), "%s/%s", datadir, cfg.in_ranges);
+        n_ranges = load_ranges(path, &g_ranges);
+        if (n_ranges <= 0)
+        {
+            fprintf(stderr, "ranges: enable but no usable %s\n", path);
+            return 1;
+        }
+    }
     int n_heading = 0;
     if (cfg.heading_enable)
     {
@@ -1572,23 +1727,40 @@ int main(int argc, char** argv)
            it (REQ-NAV-033). Handing it an older truth epoch bakes a
            permanent -v*dt position offset into a moving start (2 m East
            on the Groves aircraft profile: one 10-ms IMU period at
-           200 m/s East), which then reads as filter inaccuracy. */
-        const int64_t t_imu0 = first_imu_time_us(fimu);
-        int           i0     = 0;
+           200 m/s East), which then reads as filter inaccuracy.
+
+           With a limited dead-reckoning budget that start epoch is not
+           the first IMU sample but the first IMU epoch carrying a fix
+           (REQ-NAV-033), which is where the main loop below attaches the
+           first GNSS row. With a GNSS latency the first fix only ARRIVES
+           delay_ms after the IMU stream begins: a moving start then
+           missed by 2.8 m of height (5.6 m/s climb, 500 ms delay). */
+        const int64_t t_imu0  = first_imu_time_us(fimu);
+        int64_t       t_start = t_imu0;
+        if (aiding_gnss && cfg.gnss_enable && n_gnss > 0 && !cfg.allow_unlimited_deadreckoning &&
+            !cfg.fi_enable && g_gnss[0].t_us > t_imu0)
+        {
+            const int64_t t_fix_imu = first_imu_time_at_or_after_us(fimu, g_gnss[0].t_us);
+            if (t_fix_imu >= 0) { t_start = t_fix_imu; }
+        }
+        int i0 = 0;
         while (i0 + 1 < n_ref && g_ref[i0].t_us < t_imu0) { i0++; }
-        const ref_epoch_t* r0 = &g_ref[i0];
-        init.time             = r0->t_us;
+        const ref_epoch_t* r0 = &g_ref[i0]; /* start of the gyro bias window */
+        int                is = i0;
+        while (is + 1 < n_ref && g_ref[is].t_us < t_start) { is++; }
+        const ref_epoch_t* rs = &g_ref[is]; /* the epoch ins stamps the init at */
+        init.time             = rs->t_us;
         /* Position and velocity as the reference holds them, which is also
            what the filter works in (REQ-NAV-081). */
-        init.llh[0] = r0->lat_rad;
-        init.llh[1]           = r0->lon_rad;
-        init.llh[2]           = r0->h_m;
-        init.rpy_init_rad[0]  = r0->roll_rad;
-        init.rpy_init_rad[1]  = r0->pitch_rad;
-        init.rpy_init_rad[2]  = r0->yaw_rad;
-        init.vel_ned[0]       = r0->vel_ned[0];
-        init.vel_ned[1]       = r0->vel_ned[1];
-        init.vel_ned[2]       = r0->vel_ned[2];
+        init.llh[0] = rs->lat_rad;
+        init.llh[1]           = rs->lon_rad;
+        init.llh[2]           = rs->h_m;
+        init.rpy_init_rad[0]  = rs->roll_rad;
+        init.rpy_init_rad[1]  = rs->pitch_rad;
+        init.rpy_init_rad[2]  = rs->yaw_rad;
+        init.vel_ned[0]       = rs->vel_ned[0];
+        init.vel_ned[1]       = rs->vel_ned[1];
+        init.vel_ned[2]       = rs->vel_ned[2];
         if (have_bias0)
         {
             /* Remove the modeled non-bias content from the initial-window
@@ -1730,7 +1902,7 @@ int main(int argc, char** argv)
     init.gyr_bias_pred_stddev_rps_sqrts  = cfg.gyr_bias_rw;
     /* Auto-ZUPT/ZARU pseudo-measurement stddev: this harness's own default
        (0.05 m/s, 0.1 deg/s), NOT ins.c's own built-in default (0.05 m/s,
-       0.5 deg/s) -- shared with python/replay.py's build_config() for
+       0.5 deg/s) -- shared with tools/replay.py's build_config() for
        years, see the replay_cfg_t comment above. */
     init.zero_vel_stddev_mps = (cfg.zero_vel_stddev_mps > 0.0f) ? cfg.zero_vel_stddev_mps : 0.05f;
     init.zero_rot_stddev_rps =
@@ -1802,10 +1974,13 @@ int main(int argc, char** argv)
         opt.gnss_stop_disable             = true;
     }
     opt.max_deadreckoning_sec            = cfg.max_deadreckoning_sec;
+    opt.kalman_update_dt_sec             = cfg.kalman_update_dt_sec;
     opt.baro_height_disable              = cfg.baro_height_disable != 0;
     opt.speed_scale                      = cfg.speed_scale;
     opt.speed_stddev_rel                 = cfg.speed_stddev_rel;
     opt.speed_min_mps                    = cfg.speed_min_mps;
+    opt.range_height_with_baro           = cfg.ranges_height_with_baro != 0;
+    opt.range_aiding_max_hpos_stddev_m   = cfg.ranges_aiding_max_hpos_stddev_m;
     opt.estimate_mag_bias                = cfg.mag_estimate_bias != 0;
     opt.magnetometer_min_delay_ms        = cfg.mag_min_delay_ms;
     /* Both are 0 unless the config names them, which is the library's own
@@ -1873,6 +2048,16 @@ int main(int argc, char** argv)
         (cfg.ahrs_gyr_bias_rw > 0.0f) ? cfg.ahrs_gyr_bias_rw : cfg.gyr_bias_rw;
     g_suite.ars_cfg.acc_noise_mps2 =
         (cfg.ahrs_acc_noise_mps2 > 0.0f) ? cfg.ahrs_acc_noise_mps2 : 0.25f;
+    g_suite.ars_cfg.rpy_pred_stddev_rad_sqrts = cfg.ahrs_rpy_pred_stddev_rad_sqrts;
+    g_suite.ars_cfg.acc_freq_hz = cfg.ahrs_acc_freq_hz;
+    g_suite.ars_cfg.acc_cutoff_freq_hz = cfg.ahrs_acc_cutoff_freq_hz;
+    g_suite.ars_cfg.gravity_diff_penalty = cfg.ahrs_gravity_diff_penalty;
+    g_suite.ars_cfg.acc_reject_gravity_mps2 = cfg.ahrs_acc_reject_gravity_mps2;
+    g_suite.ars_cfg.chi2_threshold = cfg.ahrs_chi2_threshold;
+    g_suite.ars_cfg.kalman_update_dt_sec = cfg.ahrs_kalman_update_dt_sec;
+    g_suite.ars_cfg.mag_yaw_stddev_rad = DEG2RAD(cfg.ahrs_mag_yaw_stddev_deg);
+    g_suite.ars_cfg.mag_freq_hz = cfg.ahrs_mag_freq_hz;
+    g_suite.ars_cfg.mag_chi2_threshold = cfg.ahrs_mag_chi2_threshold;
     if (have_bias0)
     {
         int k;
@@ -1897,6 +2082,16 @@ int main(int argc, char** argv)
         g_suite.ahrs_cfg.gyr_noise_psd  = g_suite.ars_cfg.gyr_noise_psd;
         g_suite.ahrs_cfg.gyr_bias_rw    = g_suite.ars_cfg.gyr_bias_rw;
         g_suite.ahrs_cfg.acc_noise_mps2 = g_suite.ars_cfg.acc_noise_mps2;
+        g_suite.ahrs_cfg.rpy_pred_stddev_rad_sqrts = g_suite.ars_cfg.rpy_pred_stddev_rad_sqrts;
+        g_suite.ahrs_cfg.acc_freq_hz = g_suite.ars_cfg.acc_freq_hz;
+        g_suite.ahrs_cfg.acc_cutoff_freq_hz = g_suite.ars_cfg.acc_cutoff_freq_hz;
+        g_suite.ahrs_cfg.gravity_diff_penalty = g_suite.ars_cfg.gravity_diff_penalty;
+        g_suite.ahrs_cfg.acc_reject_gravity_mps2 = g_suite.ars_cfg.acc_reject_gravity_mps2;
+        g_suite.ahrs_cfg.chi2_threshold = g_suite.ars_cfg.chi2_threshold;
+        g_suite.ahrs_cfg.kalman_update_dt_sec = g_suite.ars_cfg.kalman_update_dt_sec;
+        g_suite.ahrs_cfg.mag_yaw_stddev_rad = g_suite.ars_cfg.mag_yaw_stddev_rad;
+        g_suite.ahrs_cfg.mag_freq_hz = g_suite.ars_cfg.mag_freq_hz;
+        g_suite.ahrs_cfg.mag_chi2_threshold = g_suite.ars_cfg.mag_chi2_threshold;
         for (k = 0; k < 3; ++k)
         {
             g_suite.ahrs_cfg.gyr_bias_init_rps[k] = g_suite.ars_cfg.gyr_bias_init_rps[k];
@@ -1945,15 +2140,12 @@ int main(int argc, char** argv)
         g_suite.local_gnss_cfg.stddev_inflation_factor = cfg.local_gnss_stddev_inflation_factor;
     }
 
-    /* Magnetic model: both attitude sources must agree on the yaw datum
-       (true north) - ins gets the full NED reference vector + field
-       gate, the magnetometer AHRS its declination re-frame. */
+    /* Magnetic model: both attitude sources on the same yaw datum (true
+       north). nav_suite keeps it for every later AHRS start (REQ-SUITE-029). */
     if (cfg.mag_enable && cfg.wmm_year > 0.0)
     {
-        ins_set_magnetic_model_from_position(&g_suite.ins, g_ref[0].lat_rad, g_ref[0].lon_rad,
-                                             (float)cfg.wmm_year);
-        ahrs_set_position(&g_suite.ahrs, (float)g_ref[0].lat_rad, (float)g_ref[0].lon_rad,
-                          (float)cfg.wmm_year);
+        nav_suite_set_magnetic_model_position(&g_suite, g_ref[0].lat_rad, g_ref[0].lon_rad,
+                                              (float)cfg.wmm_year);
     }
     else if (cfg.mag_enable)
     {
@@ -1964,7 +2156,7 @@ int main(int argc, char** argv)
         fprintf(stderr,
                 "replay: WARNING mag.enable is set but mag.wmm_year is missing, no magnetic "
                 "reference field is built and the magnetometer will not be fused "
-                "(tools/inslib_convert_ubx_to_csv.py derives it from NAV-PVT)\n");
+                "(inslib_convert_ubx_to_csv.py derives it from NAV-PVT)\n");
     }
 
     char delay_suffix[32];
@@ -2016,6 +2208,7 @@ int main(int argc, char** argv)
 
     /* --- replay ---------------------------------------------------------- */
     stat_t  nav_roll = {0}, nav_pitch = {0}, nav_yaw = {0}, nav_pos = {0};
+    stat_t  nav_pos_hor = {0}, nav_pos_up = {0}; /* horizontal / up part of nav_pos */
     stat_t  ars_roll = {0}, ars_pitch = {0};
     stat_t  baro_h      = {0}; /* baro_alt height-above-start vs. ref height change */
     stat_t  baro_v      = {0}; /* baro_alt vertical velocity vs. ref (up positive) */
@@ -2052,6 +2245,8 @@ int main(int argc, char** argv)
 
     int64_t       t_prev       = 0;
     int           iref = 0, ignss = 0, imag = 0, ibaro = 0, ispeed = 0, iheading = 0;
+    int           iranges = 0;
+    unsigned long n_ranges_offered = 0, n_ranges_carried = 0;
     unsigned long n_heading_reason[HEADING_N_REASONS] = {0};
     int64_t       fi_next_t_us = 0; /* next free_inertial_start offer */
     unsigned long n_fi_offers  = 0;
@@ -2137,7 +2332,8 @@ int main(int argc, char** argv)
             ref_gap_end = coast_ref_near(t, iref, n_ref, max_dt);
             if (ref_gap_end != (const ref_epoch_t*)0)
             {
-                cg->have_err = nav_pos_error_m(ref_gap_end, cfg.score_leverarm_frd, &cg->err_m);
+                cg->have_err = nav_pos_error_m(ref_gap_end, t, cfg.score_leverarm_frd, &cg->err_m,
+                                               (double*)0, (double*)0);
                 cg->resolved = 1;
             }
             i_coast_gap++;
@@ -2174,6 +2370,9 @@ int main(int argc, char** argv)
                     memcpy(m.gnss_vel.Qll_ned, gm->Qvel_ned, sizeof(m.gnss_vel.Qll_ned));
                 }
                 for (i = 0; i < 3; ++i) { m.gnss_leverarm_b[i] = cfg.gnss_leverarm_frd[i]; }
+                /* The fix rides on the first IMU epoch at or after its
+                   timestamp, so it is that much older (REQ-NAV-092). */
+                m.gnss_delay_us = (int32_t)(t - gm->t_us);
             }
         }
         else if (aiding_ref && cfg.gnss_enable && ref != (const ref_epoch_t*)0)
@@ -2202,6 +2401,7 @@ int main(int argc, char** argv)
                 m.gnss_vel.Qll_ned[i * 3 + i] = var_vel_fallback;
                 m.gnss_leverarm_b[i]          = cfg.gnss_leverarm_frd[i];
             }
+            m.gnss_delay_us = (int32_t)(t - ref->t_us); /* as for a real fix above */
         }
         /* free_inertial_start: the declared origin, offered as a position
            measurement until ins has bootstrapped from it and not one epoch
@@ -2281,6 +2481,7 @@ int main(int argc, char** argv)
                 m.speed.speed_mps  = sm->speed_mps;
                 m.speed.stddev_mps = cfg.speed_stddev_mps;
                 m.speed_delay_ms   = cfg.speed_delay_ms;
+                m.speed_delay_us   = (int32_t)(t - sm->t_us); /* REQ-NAV-092 */
             }
         }
         if (cfg.heading_enable)
@@ -2304,7 +2505,45 @@ int main(int argc, char** argv)
                     m.yaw.yaw_rad    = yaw_meas;
                     m.yaw.stddev_rad = sd_meas;
                     m.yaw_delay_ms   = cfg.heading_delay_ms;
+                    m.yaw_delay_us   = (int32_t)(t - hm->t_us); /* REQ-NAV-092 */
                 }
+            }
+        }
+
+        /* --- ranges (REQ-NAV-082, REQ-VER-038) --------------------------
+           Every row up to this epoch, each anchored at its own age. What
+           does not fit the filter's per-epoch maximum is carried to the
+           next epoch, where it is older by one IMU interval, rather than
+           dropped. */
+        if (cfg.ranges_enable)
+        {
+            int k = 0;
+            while (iranges < n_ranges && g_ranges[iranges].t_us <= t)
+            {
+                if (k == INS_RANGE_MAX)
+                {
+                    n_ranges_carried++;
+                    break;
+                }
+                const range_epoch_t* rr = &g_ranges[iranges];
+                float sd = rr->stddev_m * (cfg.ranges_stddev_scale > 0.0f ? cfg.ranges_stddev_scale : 1.0f);
+                if (cfg.ranges_stddev_min_m > 0.0f && sd < cfg.ranges_stddev_min_m)
+                {
+                    sd = cfg.ranges_stddev_min_m;
+                }
+                ins_meas_range_t* mr = &m.range[k++];
+                memcpy(mr->anchor_ecef, rr->anchor_ecef, sizeof(mr->anchor_ecef));
+                mr->range_m   = rr->range_m;
+                mr->stddev_m  = sd;
+                mr->delay_ms  = (int)((t - rr->t_us) / 1000);
+                mr->anchor_id = rr->anchor_id;
+                mr->is_valid  = true;
+                n_ranges_offered++;
+                iranges++;
+            }
+            if (k > 0)
+            {
+                for (i = 0; i < 3; ++i) { m.range_leverarm_b[i] = cfg.ranges_leverarm_frd[i]; }
             }
         }
 
@@ -2317,17 +2556,21 @@ int main(int argc, char** argv)
         double    e_ars[3] = {0, 0, 0};    /* roll,pitch,yaw [deg] */
         int       have_nav = 0, have_ars = 0;
 
+        double ref_rpy[3];
+        ref_rpy_at(ref, (iref < n_ref) ? &g_ref[iref] : (const ref_epoch_t*)0, t, ref_rpy);
         float roll, pitch, yaw;
         if (ins_is_ready(&g_suite.ins) && nav_suite_get_rpy_ins(&g_suite, &roll, &pitch, &yaw))
         {
-            e_nav[0] = RAD2DEG(wrap_pi_d(roll - ref->roll_rad));
-            e_nav[1] = RAD2DEG(wrap_pi_d(pitch - ref->pitch_rad));
-            e_nav[2] = RAD2DEG(wrap_pi_d(yaw - ref->yaw_rad));
+            e_nav[0] = RAD2DEG(wrap_pi_d(roll - ref_rpy[0]));
+            e_nav[1] = RAD2DEG(wrap_pi_d(pitch - ref_rpy[1]));
+            e_nav[2] = RAD2DEG(wrap_pi_d(yaw - ref_rpy[2]));
             /* The scoring lever arm maps the filter position onto the
                ground-truth point (zero when the truth refers to the IMU
                center). Same helper the coasting metric uses, so the two can
                never drift apart. */
-            (void)nav_pos_error_m(ref, cfg.score_leverarm_frd, &e_nav[3]);
+            double     e_hor = 0.0, e_up = 0.0;
+            const int  have_pos =
+                nav_pos_error_m(ref, t, cfg.score_leverarm_frd, &e_nav[3], &e_hor, &e_up);
             have_nav = 1;
             if (scored)
             {
@@ -2335,6 +2578,11 @@ int main(int argc, char** argv)
                 stat_add(&nav_pitch, e_nav[1]);
                 stat_add(&nav_yaw, e_nav[2]);
                 stat_add(&nav_pos, e_nav[3]);
+                if (have_pos)
+                {
+                    stat_add(&nav_pos_hor, e_hor);
+                    stat_add(&nav_pos_up, e_up);
+                }
             }
         }
 
@@ -2378,9 +2626,9 @@ int main(int argc, char** argv)
 
         if (cfg.score_ahrs && ahrs_get_rpy(&g_suite.ars, &roll, &pitch, &yaw))
         {
-            e_ars[0] = RAD2DEG(wrap_pi_d(roll - ref->roll_rad));
-            e_ars[1] = RAD2DEG(wrap_pi_d(pitch - ref->pitch_rad));
-            e_ars[2] = RAD2DEG(wrap_pi_d(yaw - ref->yaw_rad));
+            e_ars[0] = RAD2DEG(wrap_pi_d(roll - ref_rpy[0]));
+            e_ars[1] = RAD2DEG(wrap_pi_d(pitch - ref_rpy[1]));
+            e_ars[2] = RAD2DEG(wrap_pi_d(yaw - ref_rpy[2]));
             have_ars = 1;
             if (scored)
             {
@@ -2427,6 +2675,13 @@ int main(int argc, char** argv)
                n_fi_offers, cfg.fi_lat_deg, cfg.fi_lon_deg, cfg.fi_height_m,
                (double)cfg.fi_stddev_m);
     }
+    if (cfg.ranges_enable)
+    {
+        printf("range aiding: %d rows, %lu offered (%lu epochs full), %u fused, %u rejected,"
+               " %u skipped, %u epochs counted as position aiding\n",
+               n_ranges, n_ranges_offered, n_ranges_carried, diag->n_range_used,
+               diag->n_range_rejected, diag->n_range_skipped, diag->n_range_pos_aiding);
+    }
     if (cfg.heading_enable)
     {
         printf("heading aiding: %d rows, %lu offered as yaw, %lu not fixed, %lu bad 1-sigma,"
@@ -2454,6 +2709,8 @@ int main(int argc, char** argv)
         printf("  (attitude not scored: this dataset declares no attitude reference)\n");
     }
     stat_print("pos error", &nav_pos, "m  ");
+    stat_print("  horizontal", &nav_pos_hor, "m  ");
+    stat_print("  vertical (up)", &nav_pos_up, "m  ");
 
     if (cfg.baro_enable)
     {
@@ -2470,7 +2727,9 @@ int main(int argc, char** argv)
 
     if (n_coast_gap > 0)
     {
-        int k;
+        int    k;
+        int    n_scored = 0;
+        double err_sum = 0.0, err_max = 0.0;
         printf("\ncoasting re-acquisition (aiding gaps > %.0f s, error when each one "
                "ends):\n",
                cfg.coast_gap_min_sec);
@@ -2482,10 +2741,18 @@ int main(int argc, char** argv)
             else if (!cg->have_err) { printf("NO SOLUTION (filter gave the coast up)\n"); }
             else
             {
-                printf("%8.1f m", cg->err_m);
+                printf("%8.2f m", cg->err_m);
                 if (cg->chord_m > 1.0) { printf("  (%.1f %% of the distance)", 100.0 * cg->err_m / cg->chord_m); }
                 printf("\n");
+                err_sum += cg->err_m;
+                if (cg->err_m > err_max) { err_max = cg->err_m; }
+                n_scored++;
             }
+        }
+        if (n_scored > 0)
+        {
+            printf("  re-acquisition error over %d gaps: mean %.2f m, max %.2f m\n", n_scored,
+                   err_sum / n_scored, err_max);
         }
     }
 
@@ -2532,7 +2799,7 @@ int main(int argc, char** argv)
        and the one datasets/check_simulated.py already implements. This one
        used to be checked unconditionally, so a 0 meant "must be below zero"
        and failed every run: the way to leave it ungated was an arbitrary
-       large number (datasets/fog/config_pyahrs.yaml still carries a 999). */
+       large number. */
     if (cfg.lim_pos_rms_m > 0.0)
     {
         CHECK_LIMIT(stat_rms(&nav_pos), cfg.lim_pos_rms_m, "ins pos rms [m]");

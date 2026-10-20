@@ -54,18 +54,18 @@ score:
   ahrs: 1
   warmup_sec: 30
   min_epochs: 5000
-  # Regression guard-rails (~2x one known-good run), not accuracy claims
+  # Regression guard-rails (observed + ~5%), not accuracy claims
   # a trip means "we drifted further from the FOG solution than before",
   # not "this is the true error budget". Deterministic real-data replay
   # (no RNG), so these stay tight; retune to a new known-good baseline
   # after an intentional change. lim_pos_rms_m gates self-consistency
   # (see NOTE above), not independent position accuracy.
-  lim_att_bias_deg: 0.6        # observed 0.312 (pitch)
-  lim_att_std_deg: 0.4         # observed 0.190 (roll)
-  lim_yaw_bias_deg: 1.5        # observed 0.766
-  lim_yaw_std_deg: 2.8         # observed 1.396
-  lim_pos_rms_m: 0.4           # observed 0.181
-  lim_ars_att_bias_deg: 0.9    # observed 0.721 (roll), 0.263 (pitch)
-  lim_ars_roll_std_deg: 2.2    # observed 1.098
-  lim_ars_pitch_std_deg: 3.6   # observed 1.772
-  lim_ars_yaw_drift_deg_min: 5.5  # observed 4.397 (see the ARS note above)
+  lim_att_bias_deg: 0.259           # observed 0.246 (pitch)
+  lim_att_std_deg: 0.186            # observed 0.177 (roll)
+  lim_yaw_bias_deg: 0.845           # observed 0.804
+  lim_yaw_std_deg: 1.15             # observed 1.086
+  lim_pos_rms_m: 0.151              # observed 0.143
+  lim_ars_att_bias_deg: 0.341       # observed 0.325 (pitch)
+  lim_ars_roll_std_deg: 1.03        # observed 0.980
+  lim_ars_pitch_std_deg: 1.72       # observed 1.637
+  lim_ars_yaw_drift_deg_min: 0.781  # observed 0.744 (see the ARS note above)

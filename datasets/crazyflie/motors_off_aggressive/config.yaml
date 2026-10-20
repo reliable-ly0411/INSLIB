@@ -43,11 +43,15 @@ score:
   min_epochs: 700
   # Regression guard-rails vs. Lighthouse ground truth: observed + margin,
   # NOT accuracy claims. Trip means inspect and retune.
-  lim_att_bias_deg: 0.45    # observed 0.305
-  lim_att_std_deg: 1.70    # observed 1.258
-  lim_yaw_bias_deg: 0.35    # observed 0.182
-  lim_yaw_std_deg: 2.40    # observed 1.775
-  lim_pos_rms_m: 0.05    # observed 0.025
+  # Attitude limits remeasured once the reference attitude was interpolated
+  # to the estimate's epoch (REQ-VER-047): the scatter no longer carries
+  # rotation rate times the age of the reference row, the bias shifts by
+  # its mean over the run.
+  lim_att_bias_deg: 0.212  # observed 0.201 (pitch)
+  lim_att_std_deg: 0.987   # observed 0.939 (roll)
+  lim_yaw_bias_deg: 0.023  # observed 0.019
+  lim_yaw_std_deg: 1.27    # observed 1.201
+  lim_pos_rms_m: 0.036     # observed 0.032
   leverarm_frd: [0, 0, 0]
 
 origin:

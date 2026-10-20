@@ -6,11 +6,10 @@
  * Scenarios:
  *   1. default level: the runtime threshold starts at the compile-time
  *                      LOG_LEVEL ceiling (LOG_LEVEL_INFO for this file,
- *                      the header default -- this file does not
- *                      override it).
+ *                      set by the build).
  *   2. runtime filter: log_set_level() gates which LOG_* calls reach
  *                      the sink; all four macros are compiled in here
- *                      (LOG_LEVEL defaults to LOG_LEVEL_INFO), so this
+ *                      (the build sets LOG_LEVEL_INFO), so this
  *                      exercises the runtime half of the filter only.
  *   3. clamp:          log_set_level() clamps to [NONE, LOG_LEVEL].
  *   4. formatting:     the message reaching the sink matches a plain

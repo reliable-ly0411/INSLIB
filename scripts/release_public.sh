@@ -16,7 +16,10 @@
 #     its own git history - this script never touches the private repo's
 #     git history or remotes.
 #
-# The script does NOT push. Review the diff and push yourself.
+# The script does NOT push. Review the diff and push yourself, in two
+# steps: main first, the tag only once the wheel build on main is green.
+# The tag starts the PyPI upload, and a PyPI version can never be
+# replaced (CLAUDE.md, release process step 7).
 #
 # Verifies readme.md's coverage block is current for this exact commit
 # (see CLAUDE.md release process step 4), then runs `make check-all`
@@ -221,5 +224,10 @@ git rev-parse HEAD > "$SYNC_MARKER"
 
 echo
 echo "Committed and tagged ${VERSION} in $PUBLIC_REPO_PATH."
-echo "Review the commit, then push yourself:"
-echo "  git -C \"$PUBLIC_REPO_PATH\" push origin main --follow-tags"
+echo "Review the commit, then push yourself, in two steps:"
+echo "  1. main only:  git -C \"$PUBLIC_REPO_PATH\" push origin main"
+echo "  2. In the public repo's Actions tab run \"Release Python package (PyPI)\""
+echo "     by hand on main (optionally with TestPyPI) and wait until it is green."
+echo "  3. the tag:    git -C \"$PUBLIC_REPO_PATH\" push origin ${VERSION}"
+echo "If step 2 fails: fix it here, export again and move the unpushed tag"
+echo "(git -C \"$PUBLIC_REPO_PATH\" tag -f -a ${VERSION} -m \"Release ${VERSION}\")."

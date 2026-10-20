@@ -64,13 +64,16 @@ score:
   ahrs: 1
   warmup_sec: 10
   min_epochs: 100
-  lim_att_bias_deg: 0.1    # observed 0.072 (pitch)
-  lim_att_std_deg: 0.07    # observed 0.050 (pitch)
-  lim_yaw_bias_deg: 0.16    # observed 0.121
-  lim_yaw_std_deg: 0.28    # observed 0.216
-  lim_pos_rms_m: 0.90    # observed 0.880
-  lim_ars_att_bias_deg: 2.0    # observed 1.554 (pitch)
-  lim_ars_roll_std_deg: 2.2    # observed 1.778
-  lim_ars_pitch_std_deg: 0.9    # observed 0.706
-  lim_ars_yaw_drift_deg_min: 0.7    # observed 0.539
-  lim_groves_pos_rms_factor: 0.7    # observed 0.56 (0.880 m vs 1.572 m)
+  lim_att_bias_deg: 0.048           # observed 0.044 (pitch)
+  lim_att_std_deg: 0.049            # observed 0.045 (roll)
+  lim_yaw_bias_deg: 0.079           # observed 0.074
+  lim_yaw_std_deg: 0.099            # observed 0.093
+  lim_pos_rms_m: 0.9                # observed 0.871
+  # ARS limits remeasured once ins_auto_zupt_active stopped reporting
+  # stillness during the dwell time (REQ-NAV-013): pitch scatter up, the
+  # other three down.
+  lim_ars_att_bias_deg: 0.354       # observed 0.337 (pitch)
+  lim_ars_roll_std_deg: 0.627       # observed 0.597
+  lim_ars_pitch_std_deg: 0.379      # observed 0.361
+  lim_ars_yaw_drift_deg_min: 0.016  # observed 0.0124
+  lim_groves_pos_rms_factor: 0.58   # observed 0.554 (0.871 m vs 1.572 m)

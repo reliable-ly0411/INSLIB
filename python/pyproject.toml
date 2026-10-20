@@ -1,50 +1,68 @@
-# Packaging metadata for the INSLIB Python binding.
-#
-# STATUS: editable install works today against a PREBUILT shared library:
-#     make pylib               # builds python/INSLIB/libINSLIB.so
-#     pip install -e python/   # links the package (ships the built .so)
-#
-# The remaining step for a real `pip install INSLIB` (building the C sources
-# into per-platform wheels) needs a compiling backend such as
-# scikit-build-core or meson-python -- deliberately deferred. The ctypes +
-# flat-C-ABI design means one wheel per platform (not per Python version).
+# Packaging metadata for the INSLIB Python binding (PyPI: pip install inslib,
+# the import name stays INSLIB). setup.py compiles the C library into the
+# package, so both a wheel build and an editable install need a C compiler
+# and the full repository checkout (the sources come from src/ and KFCore/):
+#     pip install -e python/            # development, library built in place
+#     python -m build --wheel python/   # one py3-none-<platform> wheel
+# The release wheels for Linux/Windows/macOS come from cibuildwheel in
+# .github/workflows/release-pypi.yml. The ctypes + flat-C-ABI design means
+# one wheel per platform (not per Python version).
 
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=70.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "INSLIB"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Python bindings and telemetry for the INSLIB navigation filter"
-readme = "README.md"
+readme = "PYPI.md"
 requires-python = ">=3.8"
 authors = [{ name = "Jan Zwiener", email = "jan@zwiener.org" }]
 license = "AGPL-3.0-or-later"
 keywords = ["navigation", "kalman-filter", "ins", "gnss", "imu", "ahrs"]
-
-[project.optional-dependencies]
-mavlink = ["pymavlink"]
-plot = ["matplotlib"]
-kml = ["simplekml", "pyproj"]
-replay = ["pyyaml", "pymavlink", "matplotlib", "simplekml", "pyproj", "Pillow"]
-# The host-side tools in tools/: pyserial for the serial link,
-# pyubx2 for GNSS UBX decode, pymavlink for --mavlink.
-recv = ["pyserial", "pyubx2", "pymavlink"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: C",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Topic :: Scientific/Engineering",
+]
 
 # The YAML-configured CSV runner: inslib-run config.yaml
-# (equivalent: python3 -m INSLIB config.yaml). Needs the 'replay' extra
-# (PyYAML; pymavlink only for MAVLink output).
+# (equivalent: python3 -m INSLIB config.yaml). Needs PyYAML, and pymavlink
+# only for MAVLink output, both installed separately (pip install pyyaml).
 [project.scripts]
 inslib-run = "INSLIB.runner:main"
 
 [project.urls]
 Homepage = "https://github.com/jnz/INSLIB"
+Source = "https://github.com/jnz/INSLIB"
+Issues = "https://github.com/jnz/INSLIB/issues"
+Documentation = "https://jnz.github.io/INSLIB/"
+Tutorial = "https://github.com/jnz/INSLIB/blob/main/tutorial/python_tutorial.md"
+Changelog = "https://github.com/jnz/INSLIB/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
 packages = ["INSLIB"]
+# The shared library is no package data: setup.py's build_inslib writes a
+# freshly compiled one into the build, so a stale or foreign-platform file
+# lying in INSLIB/ never ends up in a wheel.
+include-package-data = false
 
-# Ship the prebuilt shared library (from `make pylib`) as package data so
-# ctypes finds it next to the modules after install.
-[tool.setuptools.package-data]
-INSLIB = ["*.so", "*.dylib", "*.dll"]
+# INSLIB.__version__ is kept equal to the library release (CLAUDE.md
+# release step 2, checked by python/tests/test_version.py).
+[tool.setuptools.dynamic]
+version = { attr = "INSLIB.__version__" }
+
+# The py3-none tag covers every CPython, so one interpreter per platform is
+# enough. Which architectures each runner builds is set by the workflow's
+# matrix (CIBW_ARCHS in .github/workflows/release-pypi.yml).
+[tool.cibuildwheel]
+build = "cp312-*"
+test-command = "python {project}/python/tests/wheel_smoke.py"

@@ -1,8 +1,12 @@
 # test for baro_alt
+# 3D solution is not important here, only the baro_alt solution is tested
 name: baro_uavlab
-aiding: none    # analyze vertical channel only
+aiding: gnss
 init: ref
-allow_unlimited_deadreckoning: 1    # aiding: no GNSS/lighthouse fix available, so without this INS would not start
+# gnss.csv only covers the first seconds, the INS needs it to bootstrap. After
+# that it coasts and is dropped once the window below is up, so its unaided
+# vertical drift never shows up in the output. The baro_alt height keeps going
+max_deadreckoning_sec: 12
 gyro_bias_window_sec: 0.5           # stationary at the start
 
 imu:
@@ -14,6 +18,10 @@ imu:
   gyr_bias_rw: 2.0e-06  # FIXME: generic default, not measured
   acc_bias_rw: 3.0e-05  # FIXME: generic default, not measured
 
+gnss:
+  leverarm_frd: [0, 0, 0]
+  pos_stddev_fallback_m: [0.05, 0.1]
+
 baro:
   enable: 1
   stddev_m: 0.5
@@ -21,16 +29,16 @@ baro:
 score:
   ahrs: 0    # only the baro_alt height channel is the target of this test
   warmup_sec: 2
-  min_epochs: 1000
-  lim_att_bias_deg: 0.5     # observed 0.028
-  lim_att_std_deg: 1.2      # observed 0.569
-  lim_yaw_bias_deg: 14      # observed 6.736
-  lim_yaw_std_deg: 8        # observed 3.431
-  lim_pos_rms_m: 14.0       # observed 6.813
+  min_epochs: 400           # only the epochs while the INS is up count, about 550
+  lim_att_bias_deg: 0.107  # observed 0.101 (pitch)
+  lim_att_std_deg: 0.87    # observed 0.828 (pitch)
+  lim_yaw_bias_deg: 0.147  # observed 0.140
+  lim_yaw_std_deg: 0.361   # observed 0.344
+  lim_pos_rms_m: 0.704     # observed 0.670
   # the actual regression gate: baro_alt height vs. lighthouse ref_z
   # (ref.csv h_m, see the converter's module docstring), ~2x an observed
   # good-run baseline -> a trip means baro_alt got worse, not an absolute
   # accuracy claim.
-  lim_baro_bias_m: 0.2      # observed 0.090
-  lim_baro_max_m: 0.45      # observed 0.214
-  lim_baro_rms_m: 0.22      # observed 0.104
+  lim_baro_bias_m: 0.097  # observed 0.092
+  lim_baro_max_m: 0.203   # observed 0.192
+  lim_baro_rms_m: 0.111   # observed 0.105

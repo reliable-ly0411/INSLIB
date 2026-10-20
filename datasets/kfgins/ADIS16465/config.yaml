@@ -1,0 +1,66 @@
+# Source: KF-GINS ADIS16465 / RTK-GNSS car trial of the i2Nav group (the KF-GINS
+# authors, github.com/i2Nav-WHU/awesome-gins-datasets),
+# ADIS16465 (industrial-grade MEMS). The data files are not in this repository, only the
+# setup config.yaml to run the dataset.
+# Convert the dataset into the replay CSV bundle next to this file:
+#   imu.csv   ADIS16465.txt, dtheta/dvel increments divided by the sample interval,
+#             FRD body frame as delivered, put at the end of the interval
+#   gnss.csv  GNSS_RTK.pos from the first fix after the first IMU sample,
+#             position with its reported 1-sigmas, no velocity (vel_ok 0), at
+#             the receiver's time of validity
+#   ref.csv   truth.nav at its full 200 Hz rate
+# with t_us = GPS seconds of week * 1e6 in all three. kf-gins.yaml next to
+# this file is the matching KF-GINS run.
+# Like KF-GINS, INSLIB starts from the truth state (init: ref) with the
+# 1-sigmas of kf-gins.yaml, the noise model is the dataset's imunoise table.
+name: kfgins-adis16465
+aiding: gnss
+init: ref
+automotive_mode: 1
+automotive_min_yaw_stddev_deg: 5
+chi2_disable: 1             # 1: disable outlier downweighting (diagnostics)
+kalman_update_dt_sec: 0.005  # covariance prediction at the IMU rate, as KF-GINS does it
+gyro_bias_window_sec: 0.9   # initial standstill of the truth, minus a margin
+
+init_stddev:                # kf-gins.yaml initposstd/initvelstd (max
+  pos_init_stddev_m: 0.2    # component) and initattstd roll,pitch / yaw
+  vel_init_stddev_mps: 0.05
+  rpy_init_stddev_rad_deg: 0.5
+  yaw_init_stddev_rad_deg: 1
+
+imu:
+   gyr_psd: 8.46159499e-10    # (rad/s)^2/Hz, imunoise arw 0.1 deg/sqrt(hr) squared
+   acc_psd: 2.77777778e-06    # (m/s^2)^2/Hz, imunoise vrw 0.1 m/s/sqrt(hr) squared
+   gyr_bias_rw: 2.85679201e-06    # rad/s/sqrt(s), imunoise gbstd 25 deg/hr, corrtime 1 hr (GM sigma^2=q*T/2)
+   acc_bias_rw: 4.71404521e-05    # m/s^2/sqrt(s), imunoise abstd 200 mGal, corrtime 1 hr
+   # Extra attitude process noise: anything between 1e-6 and 3e-5 scores the
+   # same, the comparison uses one value for all five IMUs.
+   rpy_pred_stddev_rad_sqrts: 1.0e-05
+   # No stillness threshold separates the standstills from the drive here:
+   # the idling engine shakes this MEMS IMU more than smooth driving does.
+   auto_zupt_disable: 1
+
+gnss:
+  leverarm_frd: [-0.073, 0.302, 0.087]    # kf-gins.yaml antlever (GNSS antenna vs IMU)
+  # RTK fixes, fused with their reported sigmas, as KF-GINS fuses them.
+  pos_stddev_floor_hor_m: 0.005
+  pos_stddev_floor_ver_m: 0.005
+
+score:
+  leverarm_frd: [0, 0, 0.0001]    # truth.nav refers to the IMU center, same as the filter state
+  ahrs: 0    # the IMU-only ARS is not part of this comparison
+  # Scored from 60 s after the car first moves (counted from the first
+  # fix), the window of the readme.md comparison table, so the replay
+  # prints that table's INSLIB row.
+  warmup_sec: 60.5
+  min_epochs: 3000
+  # Regression guard-rails vs. ground truth: observed + max(5 %, 0.003),
+  # rounded up.
+  lim_att_bias_deg: 0.013           # observed 0.0099 (pitch)
+  lim_att_std_deg: 0.017            # observed 0.013 (roll)
+  lim_yaw_bias_deg: 0.046           # observed 0.043
+  lim_yaw_std_deg: 0.103            # observed 0.098
+  lim_pos_rms_m: 0.033              # observed 0.030
+
+inputs:
+  ref: ref.csv

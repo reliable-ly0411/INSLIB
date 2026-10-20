@@ -34,10 +34,10 @@ imu:
   acc_bias_rw: 0.0001
   pos_pred_stddev_m_sqrts: 0.05
   vel_pred_stddev_mps_sqrts: 0.01
-  rpy_pred_stddev_rad_sqrts: 1.745329252e-05    # rigid mount
+  rpy_pred_stddev_rad_sqrts: 1.745329252e-05
   zero_vel_stddev_mps: 0.02
   zero_rot_stddev_deg: 0.5
-  auto_zupt_static_gyr_stddev_deg: 0.8
+  auto_zupt_static_gyr_stddev_deg: 0.35
   auto_zupt_static_acc_stddev_mps2: 0.25
   auto_zupt_static_gyr_deg: 4.0
   auto_zupt_static_acc_mps2: 0.5
@@ -62,6 +62,10 @@ baro:
   stddev_m: 0.8
   acc_bias_init_mps2: 0.08
 score:
+  leverarm_frd:  # ref.csv is the receiver solution, i.e. the antenna point
+  - -0.01
+  - 0.04
+  - -0.015
   warmup_sec: 30.0
   ref_delay_ms: 200.0 # ref.csv has a 200 ms delay
   min_epochs: 2000
@@ -75,8 +79,8 @@ score:
   # whole run moves far less than the exit transient it contains).
   # Reproducible to the millimetre across compilers and optimisation levels
   # (REQ-VER-031), retighten after an intentional improvement.
-  lim_pos_rms_m: 4.05           # observed 3.807
-  lim_ellipsoid_rms_m: 4.0      # observed 3.754
+  lim_pos_rms_m: 4.05           # observed 3.795
+  lim_ellipsoid_rms_m: 4.0      # observed 3.741
   # Report the coasting re-acquisition error (REQ-VER-029) but do not gate
   # it here. This dataset exists to drive the branch where the coasting
   # window expires and the 3D solution is given up, so the filter has no

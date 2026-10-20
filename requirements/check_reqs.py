@@ -13,6 +13,12 @@ Code traceability (`@satisfies REQ-...` tags in src/):
   - every component requirement (REQ-NAV/-AHRS/-BARO/-SUITE) with
     status implemented or verified must be tagged somewhere in src/
 
+Private requirements (embedded/requirements/req_*.md, prefix REQ-EMB)
+are checked the same way against the firmware sources, but only where
+embedded/ exists: the public export does not carry it. They may refer to
+public requirements, never the other way round, which is checked too, so
+that nothing in the public tree can point into the private one.
+
 Run with --matrix to print the full requirement -> code/test matrix.
 
 Exit code 0 if consistent; 1 on any violation. Requirements whose
@@ -27,6 +33,8 @@ import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REQ_DIR = os.path.join(REPO_ROOT, "requirements")
+PRIVATE_REQ_DIR = os.path.join(REPO_ROOT, "embedded", "requirements")
+PRIVATE_PREFIX = "EMB"
 
 ID_RE = re.compile(r"^## (REQ-([A-Z]+)-(\d{3})) — (.+)$")
 FIELD_RE = re.compile(r"^- \*\*(\w+):\*\* (.+)$")
@@ -37,7 +45,10 @@ METHODS = {"Test", "Analysis", "Inspection", "Demonstration"}
 # MUST be tagged in code (component level; system/verification-level
 # requirements have no single code location).
 SRC_GLOBS = ["src/*.c", "src/*.h"]
-CODE_TRACED_PREFIXES = {"NAV", "AHRS", "SUITE", "BARO"}
+PRIVATE_SRC_GLOBS = ["embedded/stm32f429/Core/Src/*.c",
+                     "embedded/stm32f429/Core/Src/inslib_sensor/*.c",
+                     "embedded/stm32f429/Core/Inc/inslib/*.h"]
+CODE_TRACED_PREFIXES = {"NAV", "AHRS", "SUITE", "BARO", PRIVATE_PREFIX}
 TAG_RE = re.compile(r"@satisfies\s+((?:REQ-[A-Z]+-\d{3}[ \t]*)+)")
 
 FILE_PREFIX = {
@@ -50,8 +61,8 @@ FILE_PREFIX = {
 }
 
 
-def parse_file(path, errors):
-    """Return list of dicts: id, title, fields, file, line."""
+def parse_file(path, errors, private=False):
+    """Return list of dicts: id, title, fields, file, line, private."""
     reqs = []
     cur = None
     fname = os.path.basename(path)
@@ -62,9 +73,13 @@ def parse_file(path, errors):
             if m:
                 cur = {"id": m.group(1), "prefix": m.group(2),
                        "title": m.group(4), "fields": {},
-                       "file": fname, "line": lineno}
+                       "file": fname, "line": lineno, "private": private}
                 reqs.append(cur)
-                want = FILE_PREFIX.get(fname)
+                want = PRIVATE_PREFIX if private else FILE_PREFIX.get(fname)
+                if not private and m.group(2) == PRIVATE_PREFIX:
+                    errors.append("%s:%d: %s: prefix %s is reserved for "
+                                  "embedded/requirements"
+                                  % (fname, lineno, m.group(1), m.group(2)))
                 if want and m.group(2) != want:
                     errors.append("%s:%d: %s has prefix %s, expected %s"
                                   % (fname, lineno, m.group(1),
@@ -117,10 +132,10 @@ def check_verification(req, errors, open_reqs):
                               % (req["file"], req["id"], tfunc, tfile))
 
 
-def scan_code_tags(errors, known_ids):
+def scan_code_tags(errors, known_ids, globs):
     """Return dict req_id -> ["file:line", ...] from @satisfies tags."""
     tags = {}
-    for pattern in SRC_GLOBS:
+    for pattern in globs:
         for path in sorted(glob.glob(os.path.join(REPO_ROOT, pattern))):
             rel = os.path.relpath(path, REPO_ROOT)
             with open(path, encoding="utf-8", errors="replace") as f:
@@ -130,6 +145,12 @@ def scan_code_tags(errors, known_ids):
                         continue
                     for rid in m.group(1).split():
                         loc = "%s:%d" % (rel, lineno)
+                        if (rid.startswith("REQ-%s-" % PRIVATE_PREFIX)
+                                and pattern in SRC_GLOBS):
+                            errors.append("%s: public code tagged with "
+                                          "private requirement %s"
+                                          % (loc, rid))
+                            continue
                         if rid not in known_ids:
                             errors.append("%s: @satisfies references "
                                           "unknown requirement %s"
@@ -144,6 +165,11 @@ def main():
     reqs = []
     for path in sorted(glob.glob(os.path.join(REQ_DIR, "req_*.md"))):
         reqs.extend(parse_file(path, errors))
+    have_private = os.path.isdir(PRIVATE_REQ_DIR)
+    if have_private:
+        for path in sorted(glob.glob(os.path.join(PRIVATE_REQ_DIR,
+                                                  "req_*.md"))):
+            reqs.extend(parse_file(path, errors, private=True))
 
     if not reqs:
         print("no requirements found in %s" % REQ_DIR)
@@ -180,8 +206,23 @@ def main():
             errors.append("%s: %s: parent %s does not exist"
                           % (r["file"], r["id"], parent))
 
+        # The public tree must stand on its own: no public requirement
+        # may lean on a private one or on a test that is not exported.
+        if not r["private"]:
+            if parent is not None and \
+               parent.startswith("REQ-%s-" % PRIVATE_PREFIX):
+                errors.append("%s: %s: public requirement with private "
+                              "parent %s" % (r["file"], r["id"], parent))
+            for entry in r["fields"].get("Verification", "").split(";"):
+                entry = entry.strip()
+                if entry.startswith("Test:") and \
+                   entry[len("Test:"):].strip().startswith("embedded/"):
+                    errors.append("%s: %s: public requirement verified by "
+                                  "a private test" % (r["file"], r["id"]))
+
     # Code traceability: @satisfies tags in src/.
-    tags = scan_code_tags(errors, set(seen))
+    globs = SRC_GLOBS + (PRIVATE_SRC_GLOBS if have_private else [])
+    tags = scan_code_tags(errors, set(seen), globs)
     n_locs = sum(len(v) for v in tags.values())
     for r in reqs:
         if r["prefix"] not in CODE_TRACED_PREFIXES:
@@ -189,8 +230,10 @@ def main():
         if r["fields"].get("Status") not in ("implemented", "verified"):
             continue
         if r["id"] not in tags:
-            errors.append("%s: %s: no @satisfies tag in src/ (add one at "
-                          "the implementing code)" % (r["file"], r["id"]))
+            where = "embedded/" if r["private"] else "src/"
+            errors.append("%s: %s: no @satisfies tag in %s (add one at "
+                          "the implementing code)"
+                          % (r["file"], r["id"], where))
     for rid in tags:
         r = next(x for x in reqs if x["id"] == rid)
         if r["fields"].get("Status") == "deleted":

@@ -245,6 +245,12 @@ extern "C"
         float   automotive_lateral_max_yaw_rate; /**< [rad/s], 0 -> default */
         float   automotive_lateral_after_sec;    /**< [s], 0 -> default,
                                                       negative -> no delay */
+        /* Range aiding (REQ-NAV-082, REQ-NAV-085). Appended at the end for
+           ctypes offset stability. */
+        int32_t range_height_with_baro;       /**< 0/1: ranges also correct
+                                                   the height under the
+                                                   barometric height source */
+        float range_aiding_max_hpos_stddev_m; /**< [m], 0 -> default */
     } ins_cfg_t;
 
     /* Solution mode returned by ins_suite_get_mode (mirrors nav_suite_mode_t). */
@@ -295,11 +301,26 @@ extern "C"
      *  NOT stated here, it belongs in the config's speed_scale /
      *  speed_stddev_rel. */
     void ins_core_set_speed(void* h, float speed_mps, float stddev_mps, int delay_ms);
+    /** Range to an anchor (REQ-NAV-082): anchor position ECEF [m], the
+     *  calibrated range [m], its 1-sigma [m], how old it is [ms]
+     *  (history-anchored, like GNSS) and the caller's anchor id. Each call
+     *  adds one entry to the pending epoch, up to INS_RANGE_MAX; returns 0,
+     *  or -1 when the epoch is full. */
+    int ins_core_add_range(void* h, const double anchor_ecef[3], float range_m, float stddev_m,
+                           int delay_ms, uint16_t anchor_id);
+    /** Ranging antenna lever arm, body FRD [m], for the pending epoch. */
+    void ins_core_set_range_leverarm(void* h, const float lever_b[3]);
     /** Measurement ages [ms] for delayed (history-anchored) fusion. Apply
      *  to the pending epoch; call AFTER <prefix>_set_imu(). */
     void ins_core_set_gnss_delay_ms(void* h, int ms);
     void ins_core_set_yaw_delay_ms(void* h, int ms);
     void ins_core_set_local_pos_delay_ms(void* h, int ms);
+    /** Further age [us] on top of the ms delay (REQ-NAV-092), e.g. how much
+     *  older the fix is than the IMU epoch it is handed over with. */
+    void ins_core_set_gnss_delay_us(void* h, int32_t us);
+    void ins_core_set_local_pos_delay_us(void* h, int32_t us);
+    void ins_core_set_yaw_delay_us(void* h, int32_t us);
+    void ins_core_set_speed_delay_us(void* h, int32_t us);
     void ins_core_update(void* h);
 
     /** Time-propagation half of ins_core_update() (see ins_predict_step()):
@@ -362,6 +383,8 @@ extern "C"
     void ins_core_get_diag(void* h, uint32_t out[10]);
     /** Absolute-speed aiding counters, see ins_suite_get_speed_diag. */
     void ins_core_get_speed_diag(void* h, uint32_t out_counts[3], float* out_last_residual_mps);
+    /** Range aiding counters, see ins_suite_get_range_diag. */
+    void ins_core_get_range_diag(void* h, uint32_t out_counts[5], float* out_last_residual_m);
     /** Timestamp-health counters, see ins_suite_get_time_diag. */
     void ins_core_get_time_diag(void* h, uint32_t out_counts[3]);
     /** Overconfidence / covariance-collapse watchdog (REQ-NAV-040): returns
@@ -409,6 +432,10 @@ extern "C"
     void ins_suite_set_baro(void* h, float pressure_pa, float stddev_m);
     /** Absolute speed aiding (REQ-NAV-068), see ins_core_set_speed. */
     void ins_suite_set_speed(void* h, float speed_mps, float stddev_mps, int delay_ms);
+    /** Range aiding (REQ-NAV-082), see ins_core_add_range. */
+    int  ins_suite_add_range(void* h, const double anchor_ecef[3], float range_m, float stddev_m,
+                             int delay_ms, uint16_t anchor_id);
+    void ins_suite_set_range_leverarm(void* h, const float lever_b[3]);
     void ins_suite_set_baro_acc_bias_drift(void* h, float density_mps2_sqrthz);
     /** Set the baro/accel vertical filter's own accel-noise density sigma_a
      *  [m/s^2/sqrt(Hz)] (<=0 -> baro_alt's own default, no-op). Must be
@@ -472,6 +499,11 @@ extern "C"
      *  [rad/s^2/sqrt(Hz)] (<=0 -> ahrs's own default, no-op); same timing
      *  contract as ins_suite_set_ahrs_gyr_noise. */
     void ins_suite_set_ahrs_gyr_bias_rw(void* h, float density_rps2_sqrthz);
+    /** Set the ARS's/AHRS's SHARED extra attitude process noise
+     *  [rad/sqrt(s)], added on top of the gyro noise (<=0 -> none,
+     *  no-op); same timing contract as
+     *  ins_suite_set_ahrs_gyr_noise. */
+    void ins_suite_set_ahrs_rpy_pred_stddev(void* h, float stddev_rad_sqrts);
     /** Set the ARS's/AHRS's SHARED initial gyro-bias uncertainty [rad/s],
      *  all 3 axes (<=0 -> ahrs default, 1/1/5 deg/s xy/z). An INITIAL
      *  CONDITION, not a process-noise rate -- but it dominates yaw's
@@ -479,6 +511,18 @@ extern "C"
      *  if left at the (generous) default. Same timing contract as
      *  ins_suite_set_ahrs_gyr_noise. */
     void ins_suite_set_ahrs_gyr_bias_init_stddev(void* h, float stddev_rps);
+    /** Set the ARS's/AHRS's SHARED accelerometer-leveling and magnetometer
+     *  tuning (the ahrs_config_t fields of the same names, in the order of
+     *  the arguments): one call sets both ars_cfg and ahrs_cfg. 0 leaves a
+     *  field at ahrs's own default. gravity_diff_penalty and
+     *  acc_reject_gravity_mps2 also take a negative value through (penalty
+     *  -> 0, reject -> disabled), all others ignore <= 0. Same timing
+     *  contract as ins_suite_set_ahrs_gyr_noise. */
+    void ins_suite_set_ahrs_tuning(void* h, float acc_freq_hz, float acc_cutoff_freq_hz,
+                                   float gravity_diff_penalty, float acc_reject_gravity_mps2,
+                                   float chi2_threshold, float kalman_update_dt_sec,
+                                   float mag_yaw_stddev_rad, float mag_freq_hz,
+                                   float mag_chi2_threshold);
     /** Known initial roll/pitch and/or yaw for ins's auto-init bootstrap
      *  (REQ-NAV-048's att_hint, the static "I just know it" case -- e.g. a
      *  known heading with no mag/GNSS-course yaw aiding to derive it
@@ -493,6 +537,12 @@ extern "C"
     void ins_suite_set_gnss_delay_ms(void* h, int ms);
     void ins_suite_set_yaw_delay_ms(void* h, int ms);
     void ins_suite_set_local_pos_delay_ms(void* h, int ms);
+    /** Further age [us] on top of the ms delay (REQ-NAV-092), e.g. how much
+     *  older the fix is than the IMU epoch it is handed over with. */
+    void ins_suite_set_gnss_delay_us(void* h, int32_t us);
+    void ins_suite_set_local_pos_delay_us(void* h, int32_t us);
+    void ins_suite_set_yaw_delay_us(void* h, int32_t us);
+    void ins_suite_set_speed_delay_us(void* h, int32_t us);
     void ins_suite_update(void* h);
 
     /** Time-propagation half of ins_suite_update() (see
@@ -557,6 +607,11 @@ extern "C"
      *  {seen, used, skipped} and out_last_residual_mps the most recent
      *  ||v_n|| - z. */
     void ins_suite_get_speed_diag(void* h, uint32_t out_counts[3], float* out_last_residual_mps);
+    /** Range aiding counters (REQ-NAV-082, REQ-NAV-085), kept out of the
+     *  fixed get_diag() array like the speed ones: out_counts receives
+     *  {seen, used, rejected, skipped, pos_aiding} and out_last_residual_m
+     *  the most recent predicted minus measured range. */
+    void ins_suite_get_range_diag(void* h, uint32_t out_counts[5], float* out_last_residual_m);
     /** Timestamp-health counters (REQ-NAV-016, REQ-NAV-070), likewise kept
      *  out of the fixed get_diag() array: out_counts receives
      *  {n_time_backward, n_time_dropped, n_time_restart_reset}. A rising

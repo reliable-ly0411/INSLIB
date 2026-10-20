@@ -7,7 +7,7 @@
  * calibration matrix, M := R(roll, pitch, yaw) * M, so the calibrated
  * samples M * (raw - fixed_bias) come out in vehicle axes. R is built like
  * R_b_to_n from a roll/pitch/yaw with the vehicle in place of NED.
- * python/replay.py contains the same calculations (mounted_calibration()).
+ * tools/replay.py contains the same calculations (mounted_calibration()).
  */
 #ifndef IMU_MOUNT_H
 #define IMU_MOUNT_H

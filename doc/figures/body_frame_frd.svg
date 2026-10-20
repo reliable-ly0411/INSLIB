@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 790" width="1000" height="790" font-family="Helvetica, Arial, sans-serif">
+  <title>INSLIB body frame FRD</title>
+  <defs>
+    <marker id="ax" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="context-stroke"/></marker>
+    <marker id="axr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#d62728"/></marker>
+    <marker id="axg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2a9d2a"/></marker>
+    <marker id="axb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1f6fb4"/></marker>
+    <marker id="rot" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="4" markerHeight="4" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#c2410c"/></marker>
+
+    <!-- silhouettes, nose up / nose right / rear view -->
+    <path id="planeTop" d="M0,-72 L9,-40 L9,-12 L78,22 L78,36 L9,22 L9,52 L30,66 L30,76 L0,70 L-30,76 L-30,66 L-9,52 L-9,22 L-78,36 L-78,22 L-9,-12 L-9,-40 Z"/>
+    <g id="planeSide">
+      <ellipse cx="0" cy="0" rx="78" ry="13"/>
+      <path d="M-76,-4 L-58,-42 L-42,-42 L-38,-8 Z"/>
+    </g>
+    <g id="planeRear">
+      <circle cx="0" cy="0" r="13"/>
+      <rect x="-88" y="-3" width="176" height="7"/>
+      <rect x="-3" y="-46" width="6" height="40"/>
+    </g>
+  </defs>
+
+  <rect width="1000" height="790" fill="#ffffff"/>
+  <text x="500" y="38" text-anchor="middle" font-size="26" font-weight="bold" fill="#111">INSLIB body frame: FRD (Forward - Right - Down)</text>
+
+  <!-- ============ 3D view ============ -->
+  <g transform="translate(-50,20)">
+    <!-- box: back face, right face, top face -->
+    <polygon points="264.5,282.2 435.5,303.8 435.5,347.8 264.5,326.2" fill="#d1d5db" stroke="#6b7280" stroke-width="1.5"/>
+    <polygon points="535.5,153.8 435.5,303.8 435.5,347.8 535.5,197.8" fill="#bfc5cd" stroke="#6b7280" stroke-width="1.5"/>
+    <polygon points="364.5,132.2 535.5,153.8 435.5,303.8 264.5,282.2" fill="#eceff3" stroke="#6b7280" stroke-width="1.5"/>
+    <!-- front marker -->
+    <polygon points="442.5,169.3 386.9,211 438.2,217.5" fill="#9ca3af" stroke="#6b7280" stroke-width="1.2"/>
+
+    <!-- axes, origin on top face centre -->
+    <line x1="400" y1="233" x2="400" y2="395" stroke="#1f6fb4" stroke-width="4" marker-end="url(#axb)"/>
+    <line x1="400" y1="233" x2="510" y2="68" stroke="#d62728" stroke-width="4" marker-end="url(#axr)"/>
+    <line x1="400" y1="233" x2="590" y2="257" stroke="#2a9d2a" stroke-width="4" marker-end="url(#axg)"/>
+    <circle cx="400" cy="233" r="5" fill="#111"/>
+    <polyline points="532.7,122.8 530.4,127.7 527.6,132.3 524.3,136.4 520.4,140.0 516.1,143.1 511.4,145.6 506.4,147.5 501.1,148.7 495.6,149.3 490.1,149.2 484.5,148.4 478.9,147.0 473.5,145.0 468.3,142.3 463.3,139.0 458.7,135.3 454.5,131.0 450.8,126.4 447.6,121.4 444.9,116.1 442.9,110.6 441.4,104.9 440.6,99.2 440.5,93.6 441.0,88.0 442.2,82.6 444.0,77.5 446.4,72.7 449.4,68.3 453.0,64.3 457.0,60.9 461.4,58.0 466.2,55.7 471.4,54.0 476.7,53.0 482.2,52.7 487.8,53.0 493.4,54.0 498.9,55.6 504.3,57.9" fill="none" stroke="#c2410c" stroke-width="3" marker-end="url(#rot)"/>
+    <polyline points="557.0,281.5 559.9,274.9 562.6,268.0 565.1,260.9 567.3,253.6 569.3,246.3 571.0,239.0 572.3,231.8 573.4,224.9 574.1,218.4 574.4,212.3 574.3,206.7 573.9,201.7 573.1,197.4 572.0,193.8 570.6,191.0 568.8,189.1 566.7,187.9 564.4,187.6 561.9,188.2 559.2,189.7 556.3,191.9 553.3,195.0 550.2,198.9 547.1,203.4 544.0,208.6 540.9,214.4 538.0,220.7 535.2,227.3 532.6,234.3 530.2,241.5 528.0,248.8 526.1,256.2 524.5,263.4 523.3,270.5 522.4,277.3 521.8,283.7 521.6,289.6 521.8,295.0 522.3,299.8 523.2,303.9" fill="none" stroke="#c2410c" stroke-width="3" marker-end="url(#rot)"/>
+    <polyline points="441.1,316.5 445.0,319.0 448.2,322.0 450.9,325.3 452.8,329.0 453.9,333.1 454.4,337.4 454.0,341.9 453.0,346.6 451.1,351.3 448.6,356.0 445.4,360.7 441.6,365.3 437.2,369.6 432.3,373.8 426.9,377.6 421.2,381.1 415.2,384.1 408.9,386.8 402.6,388.9 396.2,390.5 389.8,391.6 383.6,392.2 377.6,392.2 372.0,391.6 366.7,390.5 361.9,388.9 357.6,386.7 353.9,384.1 350.8,381.0 348.4,377.5 346.8,373.6 345.8,369.5 345.7,365.1 346.2,360.6 347.6,355.9 349.6,351.1 352.4,346.4 355.8,341.8 359.8,337.3 364.4,333.0" fill="none" stroke="#c2410c" stroke-width="3" marker-end="url(#rot)"/>
+    <text x="440" y="48" font-size="20" font-weight="bold" fill="#c2410c">φ roll</text>
+    <text x="596" y="300" font-size="20" font-weight="bold" fill="#c2410c">θ pitch</text>
+    <text x="456" y="362" font-size="20" font-weight="bold" fill="#c2410c">ψ yaw</text>
+
+    <text x="518" y="62" font-size="22" font-weight="bold" fill="#d62728">x  forward</text>
+    <text x="596" y="262" font-size="22" font-weight="bold" fill="#2a9d2a">y  right</text>
+    <text x="412" y="412" font-size="22" font-weight="bold" fill="#1f6fb4">z  down</text>
+    <text x="140" y="372" font-size="14" fill="#555">sensor / vehicle (generic)</text>
+    <text x="80" y="110" font-size="14" fill="#555">Origin = body centre.</text>
+    <text x="80" y="130" font-size="14" fill="#555">Right-handed: x × y = z.</text>
+  </g>
+
+  <!-- ============ info box ============ -->
+  <rect x="650" y="64" width="330" height="410" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+  <g font-size="15" fill="#111">
+    <text x="666" y="92" font-weight="bold" font-size="17">Rules for all INSLIB inputs</text>
+    <text x="666" y="122"><tspan font-weight="bold" fill="#d62728">x</tspan> forward (nose)</text>
+    <text x="666" y="144"><tspan font-weight="bold" fill="#2a9d2a">y</tspan> right (right wing)</text>
+    <text x="666" y="166"><tspan font-weight="bold" fill="#1f6fb4">z</tspan> down (towards the ground)</text>
+
+    <text x="666" y="202" font-weight="bold">Positive rotation = right-hand rule</text>
+    <text x="666" y="224">roll  φ about x: right side goes down</text>
+    <text x="666" y="246">pitch θ about y: nose goes up</text>
+    <text x="666" y="268">yaw   ψ about z: nose turns right</text>
+
+    <text x="666" y="304" font-weight="bold">Gyroscope</text>
+    <text x="666" y="326">Rate about the body axes in rad/s.</text>
+
+    <text x="666" y="362" font-weight="bold">Accelerometer</text>
+    <text x="666" y="384">Specific force in m/s², not g. Level and</text>
+    <text x="666" y="406">at rest it reads (0, 0, <tspan font-weight="bold" fill="#b91c1c">-9.81</tspan>), not +9.81.</text>
+
+    <text x="666" y="442" font-weight="bold" fill="#b91c1c">Sensor mounted differently?</text>
+    <text x="666" y="464">Rotate into FRD first (e.g. FLU: y→-y, z→-z).</text>
+  </g>
+
+  <!-- ============ rotation panels ============ -->
+  <g font-size="14">
+    <!-- Roll: rear view, x into the page -->
+    <rect x="20" y="500" width="300" height="270" rx="10" fill="#fff" stroke="#cbd5e1" stroke-width="1.5"/>
+    <text x="170" y="526" text-anchor="middle" font-size="18" font-weight="bold">Roll φ about x</text>
+    <text x="170" y="545" text-anchor="middle" fill="#555">view from behind, x points into the page</text>
+    <g transform="translate(170,640)">
+      <use href="#planeRear" fill="#e5e7eb" stroke="#6b7280" stroke-width="1.5"/>
+      <g transform="rotate(24)"><use href="#planeRear" fill="none" stroke="#7c3aed" stroke-width="2" stroke-dasharray="6 4"/></g>
+      <line x1="0" y1="0" x2="125" y2="0" stroke="#2a9d2a" stroke-width="3.5" marker-end="url(#axg)"/>
+      <line x1="0" y1="0" x2="0" y2="85" stroke="#1f6fb4" stroke-width="3.5" marker-end="url(#axb)"/>
+      <circle r="9" fill="#fff" stroke="#d62728" stroke-width="3"/>
+      <path d="M-6,-6 L6,6 M6,-6 L-6,6" stroke="#d62728" stroke-width="3"/>
+      <path d="M62,0 A62,62 0 0 1 0,62" fill="none" stroke="#c2410c" stroke-width="4" marker-end="url(#rot)"/>
+      <text x="128" y="-8" font-weight="bold" fill="#2a9d2a">y</text>
+      <text x="8" y="100" font-weight="bold" fill="#1f6fb4">z</text>
+      <text x="-26" y="-14" font-weight="bold" fill="#d62728">x</text>
+    </g>
+    <text x="170" y="758" text-anchor="middle" fill="#c2410c" font-weight="bold">right wing down = positive</text>
+
+    <!-- Pitch: side view, y toward the viewer -->
+    <rect x="350" y="500" width="300" height="270" rx="10" fill="#fff" stroke="#cbd5e1" stroke-width="1.5"/>
+    <text x="500" y="526" text-anchor="middle" font-size="18" font-weight="bold">Pitch θ about y</text>
+    <text x="500" y="545" text-anchor="middle" fill="#555">view from the right, y points at you</text>
+    <g transform="translate(470,640)">
+      <use href="#planeSide" fill="#e5e7eb" stroke="#6b7280" stroke-width="1.5"/>
+      <g transform="rotate(-20)"><use href="#planeSide" fill="none" stroke="#7c3aed" stroke-width="2" stroke-dasharray="6 4"/></g>
+      <line x1="0" y1="0" x2="125" y2="0" stroke="#d62728" stroke-width="3.5" marker-end="url(#axr)"/>
+      <line x1="0" y1="0" x2="0" y2="85" stroke="#1f6fb4" stroke-width="3.5" marker-end="url(#axb)"/>
+      <circle r="9" fill="#fff" stroke="#2a9d2a" stroke-width="3"/>
+      <circle r="2.8" fill="#2a9d2a"/>
+      <path d="M0,62 A62,62 0 0 0 62,0" fill="none" stroke="#c2410c" stroke-width="4" marker-end="url(#rot)"/>
+      <text x="128" y="-8" font-weight="bold" fill="#d62728">x</text>
+      <text x="8" y="100" font-weight="bold" fill="#1f6fb4">z</text>
+      <text x="-26" y="-14" font-weight="bold" fill="#2a9d2a">y</text>
+    </g>
+    <text x="500" y="758" text-anchor="middle" fill="#c2410c" font-weight="bold">nose up = positive</text>
+
+    <!-- Yaw: top view, z into the page -->
+    <rect x="680" y="500" width="300" height="270" rx="10" fill="#fff" stroke="#cbd5e1" stroke-width="1.5"/>
+    <text x="830" y="526" text-anchor="middle" font-size="18" font-weight="bold">Yaw ψ about z</text>
+    <text x="830" y="545" text-anchor="middle" fill="#555">view from above, z points into the page</text>
+    <g transform="translate(830,645) scale(0.9)">
+      <use href="#planeTop" fill="#e5e7eb" stroke="#6b7280" stroke-width="1.5"/>
+      <g transform="rotate(24)"><use href="#planeTop" fill="none" stroke="#7c3aed" stroke-width="2" stroke-dasharray="6 4"/></g>
+      <line x1="0" y1="0" x2="0" y2="-92" stroke="#d62728" stroke-width="3.8" marker-end="url(#axr)"/>
+      <line x1="0" y1="0" x2="120" y2="0" stroke="#2a9d2a" stroke-width="3.8" marker-end="url(#axg)"/>
+      <circle r="9" fill="#fff" stroke="#1f6fb4" stroke-width="3.2"/>
+      <path d="M-6,-6 L6,6 M6,-6 L-6,6" stroke="#1f6fb4" stroke-width="3.2"/>
+      <path d="M0,-62 A62,62 0 0 1 62,0" fill="none" stroke="#c2410c" stroke-width="4.4" marker-end="url(#rot)"/>
+      <text x="8" y="-98" font-weight="bold" font-size="15" fill="#d62728">x</text>
+      <text x="124" y="-8" font-weight="bold" font-size="15" fill="#2a9d2a">y</text>
+      <text x="-26" y="-14" font-weight="bold" font-size="15" fill="#1f6fb4">z</text>
+    </g>
+    <text x="830" y="758" text-anchor="middle" fill="#c2410c" font-weight="bold">nose to the right = positive</text>
+  </g>
+</svg>

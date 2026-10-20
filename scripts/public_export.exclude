@@ -13,6 +13,7 @@
 /config.yaml
 /datasets/baroalt_mag01/
 /CLAUDE.md
+/.claude/
 
 # Local build artifacts: rsync doesn't read .gitignore, so these would
 # otherwise be copied verbatim from whatever state the private working
@@ -22,6 +23,9 @@
 /doc/doxygen/
 /python/.venv/
 /python/INSLIB.egg-info/
+/python/build/
+/python/dist/
+/wheelhouse/
 /python/__pycache__/
 __pycache__/
 *.gcda

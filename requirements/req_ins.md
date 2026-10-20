@@ -178,7 +178,7 @@ the body frame), each rate-limited to one fusion per Kalman period.
 
 - **Status:** verified
 - **Parent:** REQ-NAV-012
-- **Verification:** Test: tests/test_ins_core.c:scenario_auto_zupt; Test: tests/test_ins_core.c:scenario_static_variance_gate
+- **Verification:** Test: tests/test_ins_core.c:scenario_auto_zupt; Test: tests/test_ins_core.c:scenario_static_variance_gate; Test: tests/test_ins_core.c:scenario_auto_zupt_gnss_vel_while_moving
 
 The filter shall detect stillness autonomously and inject
 zero-velocity/zero-rotation updates without an external trigger,
@@ -188,9 +188,11 @@ be enabled by default and fully disableable. A public accessor
 considers the filter stationary, for diagnostics/telemetry and so
 nav_suite can propagate the (velocity-aware) trigger to the ARS/AHRS
 (REQ-SUITE-009), which cannot detect stillness on their own. That
-accessor shall apply every criterion the detector itself applies: it
-feeds filters that have no way to second-guess it, so reporting
-stillness the detector would refuse to act on is not admissible.
+accessor shall apply every criterion the detector itself applies,
+including the dwell time: it feeds filters that have no way to
+second-guess it, so reporting stillness the detector would refuse to
+act on is not admissible. Only the minimum interval is exempt, since it
+throttles the updates of a platform that is still all the same.
 
 The primary stillness criterion shall be the per-axis sample VARIANCE
 of the raw (not bias-corrected) gyro and accelerometer over a short
@@ -242,6 +244,13 @@ configurable accuracy requirement (auto_zupt_max_vel_stddev_mps,
 with a large uncertainty is not evidence of standstill, so it shall
 not be used for the gate even if otherwise usable for fusion (that is
 a separate, looser question answered by opt.gnss_max_*_vel_stddev_mps).
+Every GNSS velocity observation shall be recorded for the gate on the
+epoch it arrives, whatever the IMU criteria conclude on that epoch. A
+fix arriving while the IMU plainly shows motion is exactly the evidence
+that keeps a later, IMU-quiet stretch of the same motion (a steady
+turn, a constant climb) from being read as standstill. Recording it
+only on epochs the IMU already finds still would let the observation
+age out during motion and open the gate mid-flight.
 Without a GNSS velocity observation meeting both the recency
 (INS_AUTOZUPT_EXT_VEL_MAX_AGE_SEC) and the accuracy requirement, the
 velocity gate shall not be applied at all -- it shall pass
@@ -312,15 +321,12 @@ precedence over the leveling result.
 The filter shall tolerate timestamp anomalies of a *running* filter:
 epochs older than the last prediction shall be handled up to the
 history depth and dropped beyond it (a *sustained* run of such drops is
-a restarted time source, handled by REQ-NAV-070); forward jumps beyond the maximum
-prediction time shall force a defined reset -- unless
-allow_unlimited_deadreckoning is enabled, in which case the filter
-shall instead coast: the jump epoch is skipped (no strapdown, no
-predict, no fusion) but the filter re-baselines its internal
-time-jump reference to that epoch's timestamp, so that normal-rate
-epochs immediately following the gap are recognized and processed
-again rather than the filter remaining permanently stuck re-detecting
-the same stale jump; all cases shall be counted in the diagnostics.
+a restarted time source, handled by REQ-NAV-070); a forward jump beyond
+the maximum prediction time shall force a defined reset, handled as an
+IMU loss (REQ-NAV-089) with its bias carry, whether or not
+allow_unlimited_deadreckoning is set: a jump that long is a gap in the
+IMU stream as well, and coasting through it would integrate over
+motion nobody measured. All cases shall be counted in the diagnostics.
 Unless opt.auto_reacquire_disable is set, and provided auto_init, a forced
 time-jump reset shall additionally re-arm into the collecting state
 via the same autonomous-reacquisition mechanism as a health-check
@@ -584,7 +590,7 @@ defeatable for an uncalibrated magnetometer.
 
 - **Status:** verified
 - **Parent:** REQ-SYS-001
-- **Verification:** Test: tests/test_ins_core.c:scenario_mag_bias_estimation
+- **Verification:** Test: tests/test_ins_core.c:scenario_mag_bias_estimation; Test: tests/test_ins_core.c:scenario_mag_bias_circle_drive
 
 ins shall optionally (off by default, enabled per instance at init)
 extend its error state by a 3-state body-frame magnetometer hard-iron
@@ -1669,22 +1675,27 @@ that is correct for arbitrary finite inputs (ins_angle_diff).
 
 - **Status:** verified
 - **Parent:** REQ-NAV-052
-- **Verification:** Test: tests/test_ins_core.c:scenario_gnss_quality_exit_bias_carry
+- **Verification:** Test: tests/test_ins_core.c:scenario_gnss_quality_exit_bias_carry; Test: tests/test_ins_core.c:scenario_imu_loss_rearms_with_carry
 
-The re-arm of REQ-NAV-052, and only that re-arm, shall carry the
-accelerometer and gyroscope bias estimates plus their current 1-sigma into
-the next bootstrap, which shall seed the nominal biases from the carried
-values instead of the configured init.acc_bias_init_mps2 /
-init.gyr_bias_init_rps. The seeded 1-sigma shall be the 1-sigma at the exit
+The re-arm of REQ-NAV-052 and the re-arm after an IMU loss (REQ-NAV-089,
+including the forward time-jump reset of REQ-NAV-016), and only those,
+shall carry the
+accelerometer and gyroscope bias estimates, in 18-state mode also the
+magnetometer hard-iron bias, plus their current 1-sigma into the next
+bootstrap, which shall seed the nominal biases from the carried values
+instead of the configured init.acc_bias_init_mps2 / init.gyr_bias_init_rps
+(and the zero hard-iron start). The seeded 1-sigma shall be the 1-sigma at the exit
 epoch widened by a fixed inflation factor and then clamped to at most the
 corresponding cold-start prior (init.acc_bias_init_stddev_mps2,
-init.gyr_bias_init_stddev_rps): a carry shall never be seeded more
-confidently than a cold start.
+init.gyr_bias_init_stddev_rps, init.mag_bias_init_stddev_ut): a carry
+shall never be seeded more confidently than a cold start. The leveling
+window of the bootstrap shall be corrected with the carried biases.
 
-The other two mid-run "is_initialized = false" events shall not carry a
-bias: a health-check shutdown (REQ-NAV-042) has just declared the state
-untrustworthy, and a forced time-jump reset (REQ-NAV-016) says nothing
-about the sensors. The shared re-arm shall therefore clear any pending
+A health-check shutdown (REQ-NAV-042) shall not carry a bias: it has just
+declared the state untrustworthy. Neither shall a restarted time source
+(REQ-NAV-070). An IMU loss on the other hand says nothing against the
+biases: they cannot have moved in a gap of a fraction of a second, and
+the inflation covers an IMU that rebooted in the gap. The shared re-arm shall therefore clear any pending
 carry, so neither event can inherit one, and the carry shall be cleared
 again once consumed.
 
@@ -1745,6 +1756,12 @@ where pos_local[2] = 0 sits on the pressure scale, and a carried origin
 bootstraps at a nonzero pos_local[2] whenever the platform reappears at a
 different altitude. Left anchored at zero it would offset the entire height
 channel by that altitude difference.
+
+The one exception to the identity is the height under the barometric
+source: when the exiting instance carried a barometric datum, the bootstrap
+height comes from the barometer on that datum rather than from the fix
+(REQ-NAV-088), and the absolute height follows it. Latitude and longitude
+stay anchored to the fix.
 
 The carry shall be refused, and the bootstrap fix shall define a fresh
 origin as before, when
@@ -2897,3 +2914,164 @@ biases the filter with every turn. One shared function keeps the firmware
 glue and both replay harnesses on the same geometry. The horizontal
 projection floor bounds the error amplification: below it the azimuth of
 the baseline is dominated by antenna phase noise, not by the yaw.
+
+## REQ-NAV-088 — Barometric datum carried with the n-frame origin
+
+- **Status:** verified
+- **Parent:** REQ-NAV-062
+- **Verification:** Test: tests/test_ins_core.c:scenario_gnss_quality_exit_baro_datum_carry; Test: tests/test_baro.c:scenario_datum_survives_quality_exit; Test: tools/replay.c:main
+
+When the instance that leaves the 3D solution through the quality-loss
+re-arm of REQ-NAV-052 runs on the barometric height source
+(REQ-NAV-053), the re-arm shall carry its barometric datum anchor
+(the h0 of REQ-NAV-054) together with the n-frame origin of
+REQ-NAV-062. A bootstrap that keeps that origin and selects the
+barometric height source again shall set its initial vertical position
+from the barometer sample it anchors on, through the carried anchor and
+the same ISA conversion the fusion uses, instead of from the bootstrap
+fix's height. The new instance's anchor is then the carried one.
+
+The fix's height shall be used as before when
+
+- the carry is refused and a fresh origin is anchored (REQ-NAV-062),
+- the exiting instance did not run on the barometric source, or
+- the bootstrap does not select the barometric source (no sufficiently
+  fresh barometer sample, or barometric height disabled).
+
+Latitude and longitude stay anchored to the bootstrap fix. The absolute
+height follows the vertical position (origin height plus the local
+height), the same relation a running instance on the barometric source
+keeps.
+
+Rationale: under the barometric source the GNSS vertical row is never
+fused (REQ-NAV-055), so the only role the fix's height plays at a
+re-bootstrap is to decide where the height channel restarts, and the
+anchor of REQ-NAV-062 then bakes that decision in for the whole rest of
+the instance's life. Right after an outage this is exactly the fix to
+trust least: the quality loss that caused the re-arm typically comes
+from shading (indoors, urban canyon, under a bridge), and a fix that
+already passes the entry gate of REQ-NAV-051 can still be several metres
+off vertically. A drone that held its altitude on the barometer through
+the outage would see its reported height step by that error at the
+moment the 3D solution returns and its altitude controller would climb
+or sink to correct a height change that never happened. The barometer,
+on the datum the previous instance had and nav_suite's vertical channel
+still shares (REQ-SUITE-007), knows the height continuously across the
+outage, which is the same argument REQ-NAV-066 makes for the
+re-acquisition path. Drift of the barometric datum against the
+ellipsoid is not ins's to correct: nav_suite's offset filter observes
+and reports it (REQ-SUITE-008).
+
+## REQ-NAV-089 — IMU loss stops and re-arms the filter
+
+- **Status:** verified
+- **Parent:** REQ-NAV-016
+- **Verification:** Test: tests/test_ins_core.c:scenario_imu_loss_rearms_with_carry; Test: tests/test_ins_core.c:scenario_time_jump_unlimited_dr_recovery; Test: tests/test_ahrs.c:scenario_imu_outage_700ms
+
+A running filter shall check on every epoch, whether or not it carries
+an IMU sample, the time since the last accepted IMU sample (valid
+accelerometer and gyroscope). Once that time reaches
+opt.imu_loss_timeout_sec (0 selects the default of 0.2 s, shared with
+the ARS/AHRS and baro_alt), the IMU is lost. On that same epoch, before
+any strapdown, prediction or fusion, the filter shall:
+
+- latch the bias carry of REQ-NAV-061 and the n-frame origin carry of
+  REQ-NAV-062,
+- mark itself uninitialized and count the event (ins_diag_t.n_imu_loss),
+- unless opt.auto_reacquire_disable is set, and provided auto_init,
+  re-arm into the collecting state (REQ-NAV-042 mechanism).
+
+The re-bootstrap then follows the normal auto-init path: stream
+coherence (REQ-NAV-033), leveling under motion (REQ-NAV-047) and the
+attitude hint (REQ-NAV-048). No part of the state other than the carried
+biases and origin, and no uncertainty from before the loss, shall be
+reused. This applies regardless of allow_unlimited_deadreckoning and of
+max_prediction_time_sec. Without a usable position fix the filter stays
+in the collecting state, a GNSS outage on top of an IMU loss leaves
+nothing to re-anchor on.
+
+Rationale: barometer, GNSS or magnetometer epochs that keep arriving
+while the IMU stalls keep the covariance prediction running, so the gap
+does not show up as a time jump, yet the rotation and acceleration of
+the gap are lost. Fusing those epochs against an attitude that is
+already off, or bridging the gap with an assumed turn rate, only hides
+the loss behind a covariance nothing supports. Checking on every epoch
+stops the filter as soon as the loss is certain instead of when the IMU
+returns, so no stale solution is published and no measurement is fused
+against it in the meantime.
+
+## REQ-NAV-090 — chi2 gate holds under a swarm of gross GNSS faults
+
+- **Status:** verified
+- **Parent:** REQ-SYS-006
+- **Verification:** Test: tests/test_ins_core.c:scenario_chi2_outlier_swarm
+
+With the chi2 gate active (REQ-NAV-046), a stream of GNSS position fixes
+in which a substantial share is grossly wrong yet reported as accurate as
+the good ones shall leave the position solution at the metre level. The
+verification stream contains isolated faults of 100 to 500 m on every
+fifth fix and a burst of consecutive fixes with the same 100 m offset,
+with automatic zero-velocity updates off so the gate alone has to hold.
+With chi2_disable (REQ-NAV-035) the same stream shall pull the solution
+tens of metres off, which shows the bound is earned by the gate and not by
+the scenario.
+
+Rationale: the single-outlier case of REQ-NAV-035 does not show that the
+downweighting survives repeated or consecutive faults, where each fix
+could drag the state a little further before the next one arrives.
+
+## REQ-NAV-091 — Re-acquisition velocity without a velocity measurement
+
+- **Status:** verified
+- **Parent:** REQ-SYS-010
+- **Verification:** Test: tests/test_ins_core.c:scenario_reacquire_yaw_unknown; Test: tests/test_ins_core.c:scenario_reacquire_variants
+
+When the re-acquisition fix after an expired coasting window
+(REQ-NAV-023) carries no usable velocity (a GNSS fix without one, or a
+local position fix), the filter shall keep the frozen velocity as a
+value only and reset its variance to an unknown-velocity prior instead
+of the configured initial velocity stddev, so that the following
+position fixes determine the velocity.
+
+Rationale: the frozen velocity dates from the start of the outage and
+says nothing about the platform at its end. Seeded with the initial
+velocity stddev, on the KF-GINS car datasets with 60 s outages every
+300 s it claimed 0.05 m/s for a velocity 14 m/s off. The following
+position fixes could only explain the conflict through attitude and
+gyro bias: the gyro bias ran to over 100 deg/s and the yaw jumped
+between +180 and -180 deg for minutes with GNSS back. The heading
+after such a re-acquisition remains unknown without a hint or a GNSS
+velocity (REQ-NAV-059) and needs motion to converge, which is
+accepted.
+
+## REQ-NAV-092 — Exact time of validity of delayed position measurements
+
+- **Status:** verified
+- **Parent:** REQ-NAV-008
+- **Verification:** Test: tests/test_ins_core.c:scenario_subepoch_age; Test: tests/test_ins_core.c:scenario_tov_interpolation
+
+The measurement interface shall accept the age of a GNSS, local
+position, yaw and speed measurement in microseconds (gnss_delay_us,
+local_pos_delay_us, yaw_delay_us, speed_delay_us) in addition to the
+whole-millisecond delay, both parts adding up. For every delayed
+measurement (these four and ranges) the filter shall form the residual
+against the state at the time of validity, linearly interpolated between
+the two states around it: two history entries, or the newest history
+entry and the current state. Position, velocity and body rate are
+interpolated linearly, the attitude by normalized linear quaternion
+interpolation. Only when the time of validity is not bracketed by two
+states closer together than INS_TOV_MAX_SPAN_US does the nearer state
+stand in, a position then carried over the remaining time difference
+with that state's velocity (first order, the velocity entering the
+measurement Jacobian accordingly). With no age stated the residual is
+formed against the current state as before.
+
+Rationale: a fix is handed to the filter with the first IMU epoch at or
+after its time of validity, so it is between zero and one IMU period
+older than that epoch, and the history grid (INS_HISTORY_DT_MS) is far
+coarser than that. Fusing such a fix as current leaves a bias of speed
+times age along the track. On the KF-GINS car datasets (200 Hz IMU,
+1 Hz RTK, mean age 2.45 ms) this was 1 to 2 cm of horizontal RMS error,
+about half of the total, and a -2.5 ms offset in the time-shift test.
+Snapping to the nearest history entry instead of interpolating leaves up
+to half a grid step (10 ms) of the same error for any delay.

@@ -11,6 +11,10 @@ max_deadreckoning_sec: 60.0  # IMU-only coasting budget [s]; 0 -> default 10 s
 gyro_bias_window_sec: 0.0   # no parked phase in this trial (already flying at t=0)
 
 imu:
+  # Noise-free IMU: slow phases of the trajectory have zero sample variance
+  # and look like a standstill, so the auto-ZUPT/ZARU would pin the velocity
+  # and absorb the turn rate into the gyro bias.
+  auto_zupt_disable: 1
   rpy_pred_stddev_rad_sqrts: 1.745329252e-05    # rigid mount
   gyr_psd: 1.0e-07    # rad^2/s, gyro_noise_PSD
   acc_psd: 1.0e-07    # (m/s^2)^2/Hz, accel_noise_PSD
@@ -25,6 +29,26 @@ score:
   ahrs: 1
   warmup_sec: 5
   min_epochs: 100
+  # Regression guard-rails just above the known-good run. This scenario is
+  # noise-free, so a trip means a real filter fault (the auto-ZUPT/ZARU
+  # pinning a slow phase once cost ~19 deg of yaw and 4 m of position), not
+  # sensor noise. After an intentional change inspect, then retune. They are
+  # NOT accuracy claims.
+  lim_att_bias_deg: 0.016           # observed 0.012 (pitch)
+  lim_att_std_deg: 0.06             # observed 0.056 (pitch)
+  lim_yaw_bias_deg: 0.159           # observed 0.151
+  lim_yaw_std_deg: 0.207            # observed 0.197
+  lim_pos_rms_m: 0.038              # observed 0.034
+  lim_baro_rms_m: 0.666             # observed 0.634
+  lim_baro_bias_m: 0.522            # observed 0.496
+  lim_baro_max_m: 1.52              # observed 1.447
+  lim_ellipsoid_rms_m: 0.014        # observed 0.011
+  lim_ellipsoid_bias_m: 0.011       # observed 0.007
+  lim_ellipsoid_max_m: 0.035        # observed 0.031
+  lim_ars_att_bias_deg: 0.613       # observed 0.584 (pitch)
+  lim_ars_roll_std_deg: 0.257       # observed 0.244
+  lim_ars_pitch_std_deg: 0.534      # observed 0.509
+  lim_ars_yaw_drift_deg_min: 0.045  # observed 0.041
 
 mag:
   enable: 1

@@ -894,6 +894,242 @@ static void scenario_mag_bias_estimation(void)
     CHECK_TRUE(!ins_get_bias_mag(&f15, b_est), "accessor false in 15-state mode");
 }
 
+/* Deterministic Gaussian noise for the circle-drive scenario (xorshift32 +
+   Box-Muller), so the run is identical on every platform. */
+static uint32_t magc_rng_state = 0x2545F491u;
+static double   magc_uniform(void)
+{
+    magc_rng_state ^= magc_rng_state << 13;
+    magc_rng_state ^= magc_rng_state >> 17;
+    magc_rng_state ^= magc_rng_state << 5;
+    return ((double)magc_rng_state + 1.0) / 4294967297.0;
+}
+static float magc_gauss(double sigma)
+{
+    const double u1 = magc_uniform();
+    const double u2 = magc_uniform();
+    return (float)(sigma * sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2));
+}
+
+/* Truth of the circle drive: 10 s standstill, 5 s ramp to 5 m/s, then a circle
+   of 20 m radius (14.3 deg/s yaw rate), with a gentle roll/pitch rocking
+   throughout. Heading in closed form so the body rate can be differentiated. */
+/* Column-major 3x3 element. */
+#define MAGC_EL(A, r, c) ((A)[(c)*3 + (r)])
+#define MAGC_R_M         (20.0)
+#define MAGC_V_MPS       (5.0)
+#define MAGC_T_STILL     (10.0)
+#define MAGC_T_RAMP      (5.0)
+#define MAGC_YAW0        (30.0 * M_PI / 180.0)
+
+static void magc_speed_heading(double t, double* v, double* a_long, double* psi, double* psi_dot)
+{
+    const double t1 = MAGC_T_STILL, t2 = MAGC_T_STILL + MAGC_T_RAMP;
+    const double acc = MAGC_V_MPS / MAGC_T_RAMP;
+    if (t <= t1)
+    {
+        *v      = 0.0;
+        *a_long = 0.0;
+        *psi    = MAGC_YAW0;
+    }
+    else if (t <= t2)
+    {
+        *v      = acc * (t - t1);
+        *a_long = acc;
+        *psi    = MAGC_YAW0 + 0.5 * acc * (t - t1) * (t - t1) / MAGC_R_M;
+    }
+    else
+    {
+        *v      = MAGC_V_MPS;
+        *a_long = 0.0;
+        *psi    = MAGC_YAW0 + 0.5 * acc * MAGC_T_RAMP * MAGC_T_RAMP / MAGC_R_M +
+               MAGC_V_MPS * (t - t2) / MAGC_R_M;
+    }
+    *psi_dot = *v / MAGC_R_M;
+}
+
+static void magc_rpy(double t, float rpy[3])
+{
+    double v, a, psi, psi_dot;
+    magc_speed_heading(t, &v, &a, &psi, &psi_dot);
+    rpy[0] = (float)(2.0 * M_PI / 180.0 * sin(2.0 * M_PI * 0.15 * t));
+    rpy[1] = (float)(1.5 * M_PI / 180.0 * sin(2.0 * M_PI * 0.11 * t + 0.5));
+    rpy[2] = (float)psi;
+}
+
+static void magc_R(double t, float R[9])
+{
+    float rpy[3], q[4];
+    magc_rpy(t, rpy);
+    ins_quat_from_rpy(rpy[0], rpy[1], rpy[2], q);
+    ins_quat_to_rotmat(q, R);
+}
+
+/* 18-state hard-iron estimation on a realistic drive (REQ-NAV-029): a car
+   circling with GNSS, noisy IMU and magnetometer, gyro and accelerometer
+   biases and a known hard-iron offset. Twin filters on the same stream: the
+   18-state one must estimate the offset within its own claimed 1-sigma and
+   hold the heading, the 15-state one shows what the offset does when nothing
+   estimates it. */
+static void scenario_mag_bias_circle_drive(void)
+{
+    printf("\n=== Scenario 7d: hard-iron estimation on a circle drive (REQ-NAV-029) ===\n");
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    init.rpy_init_rad[2]          = (float)MAGC_YAW0;
+    init.gyr_bias_init_stddev_rps = (float)(0.05 * M_PI / 180.0);
+    ins_options_t opt;
+    fill_default_opt(&opt);
+    opt.allow_unlimited_deadreckoning = false;
+
+    static ins_t f18, f15;
+    memset(&f18, 0, sizeof(f18));
+    memset(&f15, 0, sizeof(f15));
+    opt.estimate_mag_bias = true;
+    CHECK_TRUE(ins_init(&f18, &init, &opt) == 0, "init 18-state");
+    opt.estimate_mag_bias = false;
+    CHECK_TRUE(ins_init(&f15, &init, &opt) == 0, "init 15-state");
+    CHECK_TRUE(f18.n == 18 && f15.n == 15, "state sizes");
+
+    const float   dt = 0.01f;
+    ins_time_us_t t  = 0;
+    ins_time_us_t t5 = 0;
+    start_manual_filter(&f18, &t, dt, init_ecef(&init));
+    start_manual_filter(&f15, &t5, dt, init_ecef(&init));
+
+    /* Sensor errors and noise. */
+    const float  b_mag[3] = {4.0f, -3.0f, 2.0f}; /* hard iron [uT] */
+    const double d2r      = M_PI / 180.0;
+    const float  b_gyr[3] = {(float)(0.02 * d2r), (float)(-0.03 * d2r), (float)(0.015 * d2r)};
+    const float  b_acc[3] = {0.02f, -0.015f, 0.03f};
+    const double gyr_arw  = 0.01 * d2r; /* [rad/s/sqrt(Hz)] */
+    const double acc_vrw  = 0.002;      /* [m/s^2/sqrt(Hz)] */
+    const double mag_sd   = 0.3;        /* [uT] */
+    const double pos_sd = 0.3, vel_sd = 0.05;
+
+    /* Earth model for the truth. */
+    const double lat0 = init.llh[0], lon0 = init.llh[1], h0 = init.llh[2];
+    const double a_e = 6378137.0, e2 = 6.69437999014e-3, sl = sin(lat0);
+    const double Rn      = a_e / sqrt(1.0 - e2 * sl * sl);
+    const double Rm      = a_e * (1.0 - e2) / pow(1.0 - e2 * sl * sl, 1.5);
+    const double we      = 7.292115e-5;
+    const double w_ie[3] = {we * cos(lat0), 0.0, -we * sin(lat0)};
+    float        g_vec[3];
+    ins_gravity_ned((float)lat0, (float)h0, g_vec);
+
+    double    pn = 0.0, pe = 0.0; /* truth position [m] */
+    double    sum_y18 = 0.0, sum_y15 = 0.0;
+    int       n_y     = 0, step, i;
+    const int n_steps = (int)(130.0 / dt);
+    for (step = 1; step <= n_steps; ++step)
+    {
+        t += us_from_sec(dt);
+        const double tt = (double)step * dt;
+        double       v, a_long, psi, psi_dot;
+        magc_speed_heading(tt, &v, &a_long, &psi, &psi_dot);
+        const double vn[3] = {v * cos(psi), v * sin(psi), 0.0};
+        pn += vn[0] * dt;
+        pe += vn[1] * dt;
+        const double an[3] = {a_long * cos(psi) - v * psi_dot * sin(psi),
+                              a_long * sin(psi) + v * psi_dot * cos(psi), 0.0};
+
+        float R[9], R1[9], R2[9];
+        magc_R(tt, R);
+        magc_R(tt - 1e-3, R1);
+        magc_R(tt + 1e-3, R2);
+
+        /* Specific force f_n = a + 2 w_ie x v - g, into the body. */
+        const double cor[3] = {2.0 * (w_ie[1] * vn[2] - w_ie[2] * vn[1]),
+                               2.0 * (w_ie[2] * vn[0] - w_ie[0] * vn[2]),
+                               2.0 * (w_ie[0] * vn[1] - w_ie[1] * vn[0])};
+        const double fn[3]  = {an[0] + cor[0], an[1] + cor[1], an[2] + cor[2] - g_vec[2]};
+        /* Body rate: skew part of R(t-h)' R(t+h), plus the earth rate. */
+        float W[9];
+        int   r, c, k;
+        for (r = 0; r < 3; ++r)
+        {
+            for (c = 0; c < 3; ++c)
+            {
+                float sum = 0.0f;
+                for (k = 0; k < 3; ++k) { sum += MAGC_EL(R1, k, r) * MAGC_EL(R2, k, c); }
+                MAGC_EL(W, r, c) = sum;
+            }
+        }
+        const double w_nb[3] = {(MAGC_EL(W, 2, 1) - MAGC_EL(W, 1, 2)) / 4e-3,
+                                (MAGC_EL(W, 0, 2) - MAGC_EL(W, 2, 0)) / 4e-3,
+                                (MAGC_EL(W, 1, 0) - MAGC_EL(W, 0, 1)) / 4e-3};
+
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        m.timestamp        = t;
+        m.strapdown_dt_sec = dt;
+        for (i = 0; i < 3; ++i)
+        {
+            double fb = 0.0, wie_b = 0.0, mb = 0.0;
+            for (k = 0; k < 3; ++k)
+            {
+                fb += MAGC_EL(R, k, i) * fn[k];
+                wie_b += MAGC_EL(R, k, i) * w_ie[k];
+                mb += MAGC_EL(R, k, i) * init.magnetic_n[k];
+            }
+            m.acc.data[i] = (float)fb + b_acc[i] + magc_gauss(acc_vrw / sqrt(dt));
+            m.gyr.data[i] = (float)(w_nb[i] + wie_b) + b_gyr[i] + magc_gauss(gyr_arw / sqrt(dt));
+            m.mag.data[i] = (float)mb + b_mag[i] + magc_gauss(mag_sd);
+            m.acc.Qll_diag[i] = (float)(acc_vrw * acc_vrw);
+            m.gyr.Qll_diag[i] = (float)(gyr_arw * gyr_arw);
+            m.mag.Qll_diag[i] = (float)(mag_sd * mag_sd);
+        }
+        m.acc.is_valid = m.gyr.is_valid = m.mag.is_valid = true;
+
+        if (step % 20 == 0) /* GNSS 5 Hz */
+        {
+            m.gnss_pos.llh[0]     = lat0 + (pn + magc_gauss(pos_sd)) / (Rm + h0);
+            m.gnss_pos.llh[1]     = lon0 + (pe + magc_gauss(pos_sd)) / ((Rn + h0) * cos(lat0));
+            m.gnss_pos.llh[2]     = h0 + magc_gauss(2.0 * pos_sd);
+            m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = (float)(pos_sd * pos_sd);
+            m.gnss_pos.Qll_ned[8]                         = (float)(4.0 * pos_sd * pos_sd);
+            m.gnss_pos.is_valid                           = true;
+            for (i = 0; i < 3; ++i) { m.gnss_vel.vel_ned[i] = (float)vn[i] + magc_gauss(vel_sd); }
+            m.gnss_vel.Qll_ned[0] = m.gnss_vel.Qll_ned[4] = m.gnss_vel.Qll_ned[8] =
+                (float)(vel_sd * vel_sd);
+            m.gnss_vel.is_valid = true;
+        }
+        ins_update(&f18, &m);
+        ins_update(&f15, &m);
+
+        if (tt >= 70.0)
+        {
+            float rr, pp, y18, y15;
+            ins_get_rpy(&f18, &rr, &pp, &y18);
+            ins_get_rpy(&f15, &rr, &pp, &y15);
+            const double e18 = RAD2DEG(ins_angle_diff(y18, (float)psi));
+            const double e15 = RAD2DEG(ins_angle_diff(y15, (float)psi));
+            sum_y18 += e18 * e18;
+            sum_y15 += e15 * e15;
+            ++n_y;
+        }
+    }
+
+    CHECK_TRUE(f18.is_initialized && f15.is_initialized, "both filters running at the end");
+    float b_est[3];
+    CHECK_TRUE(ins_get_bias_mag(&f18, b_est), "mag bias available");
+    for (i = 0; i < 3; ++i)
+    {
+        const double err = (double)b_est[i] - (double)b_mag[i];
+        const double sd  = sqrt((double)test_state_variance(&f18, INS_IDX_MAG + i));
+        printf("   hard iron %c: est %6.2f true %6.2f uT (1-sigma %.2f)\n", "xyz"[i],
+               (double)b_est[i], (double)b_mag[i], sd);
+        CHECK_TRUE(fabs(err) < 0.5, "hard iron estimated within 0.5 uT");
+        CHECK_TRUE(fabs(err) <= 3.0 * sd, "hard-iron error within 3 sigma (consistent)");
+    }
+    const double rms18 = sqrt(sum_y18 / (double)n_y);
+    const double rms15 = sqrt(sum_y15 / (double)n_y);
+    printf("   yaw error RMS (last 60 s): 18-state %.2f deg, 15-state %.2f deg\n", rms18, rms15);
+    CHECK_TRUE(rms18 < 1.0, "18-state: heading RMS below 1 deg");
+    CHECK_TRUE(rms15 > 3.0 && rms15 > 5.0 * rms18,
+               "15-state: the unestimated hard iron pulls the heading off");
+}
+
 static void scenario_zero_rotation_bias(void)
 {
     printf("\n=== Scenario 8: zero-rotation update estimates gyro bias ===\n");
@@ -1078,6 +1314,261 @@ static void scenario_gnss_moving_delayed(void)
     CHECK_NEAR(v[0], vn_truth[0], 0.1, "moving delayed-gnss vN");
     CHECK_NEAR(v[1], 0.0f, 0.1, "moving delayed-gnss vE");
     CHECK_NEAR(v[2], 0.0f, 0.1, "moving delayed-gnss vD");
+}
+
+/* One run of scenario_subepoch_age: constant 20 m/s north, perfect IMU at
+   100 Hz, 1 cm position fixes at 5 Hz whose time of validity lies
+   true_age_us before the epoch they are handed over with. The filter is told
+   delay_ms + delay_us. Returns the final along-track position error [m]. */
+static double subepoch_age_run(bool local, int delay_ms, int32_t delay_us, int64_t true_age_us)
+{
+    ins_t f;
+    memset(&f, 0, sizeof(f));
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    init.vel_init_stddev_mps = 0.1f;
+    ins_options_t opt;
+    fill_default_opt(&opt);
+    opt.auto_zupt_disable = true; /* noiseless constant velocity, see Scenario 9 */
+
+    const float vn       = 20.0f;
+    init.vel_ned[0]      = vn;
+    const double llh0[3] = {init.llh[0], init.llh[1], init.llh[2]};
+    if (ins_init(&f, &init, &opt) != 0) { return 1e9; }
+
+    const float   dt = 0.01f;
+    ins_time_us_t t  = 0;
+    int           step;
+    for (step = 1; step <= 1000; ++step) /* 10 s */
+    {
+        /* Truth at the start of this IMU interval, for the IMU readings. */
+        double      dllh[3];
+        const float dn_now[3] = {vn * (float)t * 1e-6f, 0.0f, 0.0f};
+        ins_dned_to_dlatlonh(dn_now, llh0[0], llh0[2], dllh);
+        const double lat = llh0[0] + dllh[0];
+        const double h   = llh0[2] + dllh[2];
+        float        g_vec[3];
+        ins_gravity_ned((float)lat, (float)h, g_vec);
+        const float v_truth[3] = {vn, 0.0f, 0.0f};
+        float       w_in[3], w_ie[3], w_en[3];
+        ins_calc_omega_n_in(lat, h, v_truth, w_in, w_ie, w_en);
+        const float two_wie_plus_wen[3] = {2.0f * w_ie[0] + w_en[0], 2.0f * w_ie[1] + w_en[1],
+                                           2.0f * w_ie[2] + w_en[2]};
+        float       cross_v[3];
+        ins_cross(two_wie_plus_wen, v_truth, cross_v);
+        const float acc_body[3] = {-g_vec[0] + cross_v[0], -g_vec[1] + cross_v[1],
+                                   -g_vec[2] + cross_v[2]};
+
+        t += us_from_sec(dt);
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        m.timestamp = t;
+        set_imu(&m, acc_body, w_in, dt);
+
+        if (step % 20 == 0)
+        {
+            const double t_tov_sec = (double)(t - true_age_us) * 1e-6;
+            const float  dn_tov[3] = {(float)(vn * t_tov_sec), 0.0f, 0.0f};
+            if (local)
+            {
+                memcpy(m.local_pos.pos_ned, dn_tov, sizeof(dn_tov));
+                m.local_pos.Qll_ned[0] = m.local_pos.Qll_ned[4] = m.local_pos.Qll_ned[8] = 1e-4f;
+                m.local_pos.is_valid                                                     = true;
+                m.local_pos_delay_ms                                                     = delay_ms;
+                m.local_pos_delay_us                                                     = delay_us;
+            }
+            else
+            {
+                double dllh_tov[3];
+                ins_dned_to_dlatlonh(dn_tov, llh0[0], llh0[2], dllh_tov);
+                m.gnss_pos.llh[0]     = llh0[0] + dllh_tov[0];
+                m.gnss_pos.llh[1]     = llh0[1] + dllh_tov[1];
+                m.gnss_pos.llh[2]     = llh0[2] + dllh_tov[2];
+                m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = m.gnss_pos.Qll_ned[8] = 1e-4f;
+                m.gnss_pos.is_valid                                                   = true;
+                m.gnss_delay_ms                                                       = delay_ms;
+                m.gnss_delay_us                                                       = delay_us;
+            }
+        }
+        ins_update(&f, &m);
+    }
+
+    const double t_end_sec = (double)t * 1e-6;
+    if (local)
+    {
+        float p[3];
+        ins_get_position_local(&f, p);
+        return (double)p[0] - vn * t_end_sec;
+    }
+    double pe[3], lat, lon, hh;
+    ins_get_position_ecef(&f, pe);
+    ins_ecef_to_latlonh(pe, &lat, &lon, &hh);
+    const double dllh_est[3] = {lat - llh0[0], lon - llh0[1], hh - llh0[2]};
+    float        dn_est[3];
+    ins_dlatlonh_to_dned(dllh_est, llh0[0], llh0[2], dn_est);
+    return (double)dn_est[0] - vn * t_end_sec;
+}
+
+/* REQ-NAV-092: a position fix older than its epoch by less than the history
+   grid (or by an arbitrary amount beyond a grid point) is anchored at its
+   exact time of validity, not at the nearest stored state. At 20 m/s a 4 ms
+   age that is dropped pulls the solution 8 cm behind the truth. */
+static void scenario_subepoch_age(void)
+{
+    printf("\n=== Scenario: sub-epoch measurement age (REQ-NAV-092) ===\n");
+    const double tol = 0.005;
+
+    /* Age stated in us only: the current state is the anchor. */
+    double e = subepoch_age_run(false, 0, 4000, 4000);
+    printf("  gnss, age 4 ms stated:          %+.4f m\n", e);
+    CHECK_NEAR(e, 0.0, tol, "gnss sub-epoch age compensated");
+
+    /* Same age not stated: the discriminating reference, v * age behind. */
+    e = subepoch_age_run(false, 0, 0, 4000);
+    printf("  gnss, age 4 ms not stated:      %+.4f m\n", e);
+    CHECK_TRUE(fabs(e) > 0.05, "gnss unstated age leaves the v*age bias");
+
+    /* Whole-ms delay off the 20 ms history grid: residual age to the anchor. */
+    e = subepoch_age_run(false, 37, 0, 37000);
+    printf("  gnss, 37 ms delay:              %+.4f m\n", e);
+    CHECK_NEAR(e, 0.0, tol, "gnss off-grid delay compensated");
+
+    /* ms and us parts add up. */
+    e = subepoch_age_run(false, 100, 2500, 102500);
+    printf("  gnss, 100 ms + 2.5 ms:          %+.4f m\n", e);
+    CHECK_NEAR(e, 0.0, tol, "gnss ms + us delay compensated");
+
+    /* Local position, same contract. */
+    e = subepoch_age_run(true, 0, 4000, 4000);
+    printf("  local, age 4 ms stated:         %+.4f m\n", e);
+    CHECK_NEAR(e, 0.0, tol, "local sub-epoch age compensated");
+
+    e = subepoch_age_run(true, 0, 0, 4000);
+    printf("  local, age 4 ms not stated:     %+.4f m\n", e);
+    CHECK_TRUE(fabs(e) > 0.05, "local unstated age leaves the v*age bias");
+
+    e = subepoch_age_run(true, 20, 3000, 23000);
+    printf("  local, 20 ms + 3 ms:            %+.4f m\n", e);
+    CHECK_NEAR(e, 0.0, tol, "local ms + us delay compensated");
+}
+
+/* One run of scenario_tov_interpolation: perfect IMU at 100 Hz, level.
+   speed_case 0: standing still, turning at 30 deg/s about down, yaw fixes.
+   speed_case 1: heading north, accelerating at 2 m/s^2 from 5 m/s, speed
+   fixes. Fixes at 10 Hz, valid true_age_us before their epoch, stated as
+   delay_ms + delay_us. Returns the final yaw error [rad] or speed error
+   [m/s]. */
+static double tov_interp_run(int speed_case, int delay_ms, int32_t delay_us, int64_t true_age_us)
+{
+    ins_t f;
+    memset(&f, 0, sizeof(f));
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    ins_options_t opt;
+    fill_default_opt(&opt);
+    opt.auto_zupt_disable = true;
+
+    const float rate = (float)(30.0 * M_PI / 180.0);
+    const float acc  = 2.0f;
+    const float v0   = speed_case ? 5.0f : 0.0f;
+    init.vel_ned[0]  = v0;
+    if (ins_init(&f, &init, &opt) != 0) { return 1e9; }
+
+    float g_vec[3];
+    ins_gravity_ned((float)init.llh[0], (float)init.llh[2], g_vec);
+
+    const float   dt = 0.01f;
+    ins_time_us_t t  = 0;
+    int           step;
+    for (step = 1; step <= 1000; ++step) /* 10 s */
+    {
+        /* Truth at the start of this IMU interval. */
+        const float t_sec    = (float)t * 1e-6f;
+        const float v_now[3] = {v0 + (speed_case ? acc * t_sec : 0.0f), 0.0f, 0.0f};
+        const float yaw_now  = speed_case ? 0.0f : rate * t_sec;
+        float       w_in[3], w_ie[3], w_en[3];
+        ins_calc_omega_n_in(init.llh[0], init.llh[2], v_now, w_in, w_ie, w_en);
+
+        /* Specific force in n: a - g + (2 w_ie + w_en) x v. Body rotated by
+           yaw about down, so n -> b is a rotation by -yaw. */
+        const float two_wie_plus_wen[3] = {2.0f * w_ie[0] + w_en[0], 2.0f * w_ie[1] + w_en[1],
+                                           2.0f * w_ie[2] + w_en[2]};
+        float       cross_v[3];
+        ins_cross(two_wie_plus_wen, v_now, cross_v);
+        const float f_n[3] = {(speed_case ? acc : 0.0f) - g_vec[0] + cross_v[0],
+                              -g_vec[1] + cross_v[1], -g_vec[2] + cross_v[2]};
+        const float c = cosf(yaw_now), s = sinf(yaw_now);
+        const float acc_body[3] = {c * f_n[0] + s * f_n[1], -s * f_n[0] + c * f_n[1], f_n[2]};
+        const float gyr_body[3] = {c * w_in[0] + s * w_in[1], -s * w_in[0] + c * w_in[1],
+                                   w_in[2] + (speed_case ? 0.0f : rate)};
+
+        t += us_from_sec(dt);
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        m.timestamp = t;
+        set_imu(&m, acc_body, gyr_body, dt);
+
+        if (step % 10 == 0)
+        {
+            const float t_tov = (float)(t - true_age_us) * 1e-6f;
+            if (speed_case)
+            {
+                m.speed.speed_mps  = v0 + acc * t_tov;
+                m.speed.stddev_mps = 0.001f;
+                m.speed.is_valid   = true;
+                m.speed_delay_ms   = delay_ms;
+                m.speed_delay_us   = delay_us;
+            }
+            else
+            {
+                m.yaw.yaw_rad    = rate * t_tov;
+                m.yaw.stddev_rad = (float)(0.01 * M_PI / 180.0);
+                m.yaw.is_valid   = true;
+                m.yaw_delay_ms   = delay_ms;
+                m.yaw_delay_us   = delay_us;
+            }
+        }
+        ins_update(&f, &m);
+    }
+
+    const double t_end = (double)t * 1e-6;
+    if (speed_case)
+    {
+        float v[3];
+        ins_get_velocity_ned(&f, v);
+        return (double)v[0] - (v0 + acc * t_end);
+    }
+    float roll, pitch, yaw;
+    ins_get_rpy(&f, &roll, &pitch, &yaw);
+    return atan2(sin((double)yaw - rate * t_end), cos((double)yaw - rate * t_end));
+}
+
+/* REQ-NAV-092: the state at a time of validity between two history entries
+   is interpolated, not snapped to the nearer one. 24 ms is 4 ms past the
+   20 ms history grid: snapped, the turn leaves 30 deg/s * 4 ms = 0.12 deg of
+   yaw bias and the acceleration 2 m/s^2 * 4 ms = 8 mm/s of speed bias. */
+static void scenario_tov_interpolation(void)
+{
+    printf("\n=== Scenario: time-of-validity interpolation (REQ-NAV-092) ===\n");
+    double e = tov_interp_run(0, 24, 0, 24000);
+    printf("  yaw, 24 ms:          %+.4f deg\n", e * 180.0 / M_PI);
+    CHECK_NEAR(e * 180.0 / M_PI, 0.0, 0.02, "yaw interpolated between history entries");
+
+    e = tov_interp_run(0, 24, 1500, 25500);
+    printf("  yaw, 24 ms + 1.5 ms: %+.4f deg\n", e * 180.0 / M_PI);
+    CHECK_NEAR(e * 180.0 / M_PI, 0.0, 0.02, "yaw ms + us delay");
+
+    e = tov_interp_run(0, 0, 0, 6000);
+    printf("  yaw, 6 ms unstated:  %+.4f deg\n", e * 180.0 / M_PI);
+    CHECK_TRUE(fabs(e * 180.0 / M_PI) > 0.1, "unstated yaw age leaves rate*age bias");
+
+    e = tov_interp_run(1, 24, 0, 24000);
+    printf("  speed, 24 ms:        %+.5f m/s\n", e);
+    CHECK_NEAR(e, 0.0, 0.002, "speed interpolated between history entries");
+
+    e = tov_interp_run(1, 0, 6000, 6000);
+    printf("  speed, 6 ms in us:   %+.5f m/s\n", e);
+    CHECK_NEAR(e, 0.0, 0.002, "speed sub-epoch age compensated");
 }
 
 static void scenario_gnss_velocity_leverarm(void)
@@ -3428,6 +3919,126 @@ static void scenario_gnss_quality_exit_origin_carry(void)
 #undef ORIGIN_SETUP
 #undef ORIGIN_STEP_BARO
 #undef ORIGIN_STEP
+}
+
+/* The barometric datum travels with the carried origin (REQ-NAV-088): a
+   re-bootstrap on a fix that is several metres off vertically, while the
+   barometer knows the platform's true height, must restart the height channel
+   on the barometer. That is the drone holding its altitude through a GNSS
+   outage, which must neither climb nor sink when the 3D solution returns. The
+   second part covers the fallback: no barometer at the re-bootstrap, so the
+   GNSS source is selected and the fix decides the height after all. */
+static void scenario_gnss_quality_exit_baro_datum_carry(void)
+{
+    printf("\n=== Scenario: barometric datum carried with the n-frame origin "
+           "(REQ-NAV-088) ===\n");
+
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    double llh0[3];
+    ins_ecef_to_latlonh(init_ecef(&init), &llh0[0], &llh0[1], &llh0[2]);
+    float g_vec[3];
+    ins_gravity_ned((float)llh0[0], (float)llh0[2], g_vec);
+
+    const float acc_body[3] = {0.0f, 0.0f, -g_vec[2]};
+    const float gyr_body[3] = {0.0f, 0.0f, 0.0f};
+    const float dt          = 0.01f;
+
+    /* The platform reappears 50 m north / 20 m east and 2 m up, which the
+       barometer reports. The fix claims 10 m up, an 8 m vertical error its
+       own reported accuracy does not reveal. */
+    const float true_h_m    = 2.0f;
+    const float dned_fix[3] = {50.0f, 20.0f, -10.0f};
+    double      fix_reappear[3];
+    test_ecef_offset_ned(llh0, dned_fix, fix_reappear);
+
+    /* One IMU epoch, a 5 Hz fix at FIX_ECEF with velocity 1-sigma VEL_STD,
+       and a barometer sample for BARO_ALT unless that is NAN. */
+#define DATUM_STEP(F, T, FIX_ECEF, VEL_STD, BARO_ALT)                                     \
+    do {                                                                                  \
+        (T) += us_from_sec(dt);                                                           \
+        ins_measurements_t m;                                                             \
+        memset(&m, 0, sizeof(m));                                                         \
+        m.timestamp = (T);                                                                \
+        set_imu(&m, acc_body, gyr_body, dt);                                              \
+        if (isfinite(BARO_ALT)) { set_baro(&m, pressure_from_altitude(BARO_ALT), 1.0f); } \
+        if ((long)((T) % 200000) < (long)(dt * 1e6f))                                     \
+        {                                                                                 \
+            ins_ecef_to_latlonh((FIX_ECEF), &m.gnss_pos.llh[0], &m.gnss_pos.llh[1],       \
+                                &m.gnss_pos.llh[2]);                                      \
+            m.gnss_pos.Qll_ned[0] = 1.0f;                                                 \
+            m.gnss_pos.Qll_ned[4] = 1.0f;                                                 \
+            m.gnss_pos.Qll_ned[8] = 1.0f;                                                 \
+            m.gnss_pos.is_valid   = true;                                                 \
+            m.gnss_vel.Qll_ned[0] = (VEL_STD) * (VEL_STD);                                \
+            m.gnss_vel.Qll_ned[4] = (VEL_STD) * (VEL_STD);                                \
+            m.gnss_vel.Qll_ned[8] = (VEL_STD) * (VEL_STD);                                \
+            m.gnss_vel.is_valid   = true;                                                 \
+        }                                                                                 \
+        ins_update(&(F), &m);                                                             \
+    } while (0)
+
+    int part;
+    for (part = 0; part < 2; ++part)
+    {
+        const bool    baro_at_reentry = (part == 0);
+        ins_t         f;
+        ins_options_t opt;
+        ins_time_us_t t = 0;
+
+        memset(&f, 0, sizeof(f));
+        fill_default_opt(&opt);
+        opt.auto_init               = true;
+        opt.gnss_init_dwell_disable = true;
+        opt.gnss_stop_dwell_sec     = 5.0f;
+        CHECK_TRUE(ins_init(&f, &init, &opt) == 0, "init ok");
+
+        while (t < (ins_time_us_t)(10e6)) { DATUM_STEP(f, t, init_ecef(&init), 0.1f, 0.0f); }
+        CHECK_TRUE(ins_is_ready(&f) && f.height_from_baro, "3D ready on barometric height");
+        const float h0_before = f.baro_h0_m;
+
+        while (f.is_initialized && t < (ins_time_us_t)(20e6))
+        {
+            DATUM_STEP(f, t, init_ecef(&init), 0.6f, 0.0f);
+        }
+        CHECK_TRUE(f.origin_carry.valid && f.origin_carry.baro_h0_valid,
+                   "the origin carry holds the barometric datum");
+        CHECK_NEAR(f.origin_carry.baro_h0_m, h0_before, 1e-6,
+                   "the carried anchor is the exiting instance's");
+
+        while (!f.is_initialized && t < (ins_time_us_t)(35e6))
+        {
+            DATUM_STEP(f, t, fix_reappear, 0.1f, baro_at_reentry ? true_h_m : NAN);
+        }
+        CHECK_TRUE(f.is_initialized, "re-bootstrapped on good fixes");
+        CHECK_NEAR(f.origin_llh[2], llh0[2], 1e-6, "origin kept across the re-arm");
+
+        float pos[3];
+        CHECK_TRUE(ins_get_position_local(&f, pos), "position available");
+        CHECK_NEAR(pos[0], dned_fix[0], 0.5, "north still taken from the fix");
+
+        if (baro_at_reentry)
+        {
+            CHECK_TRUE(f.height_from_baro, "barometric source selected again");
+            CHECK_NEAR(pos[2], -true_h_m, 0.3,
+                       "bootstrap height from the barometer, not the fix's +10 m");
+            CHECK_NEAR(f.baro_h0_m, h0_before, 1e-3, "the new instance runs on the carried anchor");
+            CHECK_NEAR(f.latlonh[2], llh0[2] + true_h_m, 0.3,
+                       "absolute height follows the barometric height");
+
+            /* Ten more seconds of the same wrong fixes: the height stays where
+               the barometer has it, nothing pulls it towards the fix. */
+            while (t < (ins_time_us_t)(45e6)) { DATUM_STEP(f, t, fix_reappear, 0.1f, true_h_m); }
+            CHECK_TRUE(ins_get_position_local(&f, pos), "position still available");
+            CHECK_NEAR(pos[2], -true_h_m, 0.3, "height held on the barometer");
+        }
+        else
+        {
+            CHECK_TRUE(!f.height_from_baro, "no barometer at the re-entry, GNSS source");
+            CHECK_NEAR(pos[2], dned_fix[2], 0.5, "without a barometer the fix sets the height");
+        }
+    }
+#undef DATUM_STEP
 }
 
 /* Shared bootstrap helper for the barometric-height scenarios below: a few
@@ -6099,8 +6710,9 @@ static void scenario_time_jump_handling(void)
     }
     else { printf("  ok    old measurement dropped, diag counters incremented\n"); }
 
-    /* A large forward jump (well beyond max_prediction_time_sec) without
-       allow_unlimited_deadreckoning must force a reset. */
+    /* A large forward jump (well beyond max_prediction_time_sec) must force
+       a reset: the IMU sample before it is older than imu_loss_timeout_sec,
+       so the reset is the IMU loss of REQ-NAV-089. */
     ins_measurements_t m_jump;
     memset(&m_jump, 0, sizeof(m_jump));
     m_jump.timestamp = t + 2000000; /* +2 s, max_prediction_time_sec = 0.5 s */
@@ -6113,9 +6725,9 @@ static void scenario_time_jump_handling(void)
         printf("  FAIL  filter did not reset on a large forward time jump\n");
         fails++;
     }
-    else if (diag->n_time_jump_reset < 1)
+    else if (diag->n_imu_loss < 1)
     {
-        printf("  FAIL  n_time_jump_reset not incremented\n");
+        printf("  FAIL  n_imu_loss not incremented\n");
         fails++;
     }
     else { printf("  ok    large forward time jump forces a reset\n"); }
@@ -6123,23 +6735,16 @@ static void scenario_time_jump_handling(void)
 
 static void scenario_time_jump_unlimited_dr_recovery(void)
 {
-    printf("\n=== Scenario: forward time jump with unlimited dead reckoning recovers "
-           "(REQ-NAV-016) ===\n");
+    printf("\n=== Scenario: forward time jump stops the filter also with unlimited dead "
+           "reckoning (REQ-NAV-016, REQ-NAV-089) ===\n");
     ins_t f;
     memset(&f, 0, sizeof(f));
     ins_init_t init;
     fill_default_init(&init, 0);
     ins_options_t opt;
     fill_default_opt(&opt);
-    opt.allow_unlimited_deadreckoning = true; /* forward jumps must coast, not reset */
-
-    int rc = ins_init(&f, &init, &opt);
-    if (rc != 0)
-    {
-        printf("init failed\n");
-        fails++;
-        return;
-    }
+    opt.allow_unlimited_deadreckoning = true;
+    CHECK_TRUE(ins_init(&f, &init, &opt) == 0, "init ok");
 
     const float   dt = 0.01f;
     ins_time_us_t t  = 0;
@@ -6160,38 +6765,137 @@ static void scenario_time_jump_unlimited_dr_recovery(void)
         set_imu(&m, acc_body, gyr_body, dt);
         ins_update(&f, &m);
     }
-    const unsigned n_predict_before_gap = ins_get_diag(&f)->n_predict;
+    CHECK_TRUE(f.is_initialized, "running before the gap");
 
-    /* A stalled IMU link: one sample arrives 2 s late, well beyond
-       max_prediction_time_sec (0.5 s). With unlimited DR this must not
-       reset the filter, and -- the actual regression -- must not
-       permanently latch time_jump either: normal small-dt epochs
-       resumed right after must be processed again, not skipped forever. */
-    t += 2000000; /* +2 s gap */
+    /* A stalled IMU link: the next sample arrives 2 s late. Coasting through
+       it would integrate over motion nobody measured. */
+    t += 2000000;
     ins_measurements_t m_jump;
     memset(&m_jump, 0, sizeof(m_jump));
     m_jump.timestamp = t;
     set_imu(&m_jump, acc_body, gyr_body, dt);
     ins_update(&f, &m_jump);
-    CHECK_TRUE(f.is_initialized, "unlimited-DR forward jump does not reset the filter");
+    CHECK_TRUE(!f.is_initialized, "unlimited-DR forward jump stops the filter");
+    CHECK_TRUE(ins_get_diag(&f)->n_imu_loss == 1, "counted as an IMU loss");
+    /* Manual init: nothing to re-bootstrap from, the filter stays down. */
+    CHECK_TRUE(!f.is_collecting, "manual init stays down after the IMU loss");
+}
 
-    for (step = 1; step <= 20; ++step) /* resume normal-rate IMU right after the gap */
+static void feed_autoinit_bootstrap(ins_t* f, const double x_ecef[3], ins_time_us_t* t,
+                                    const float acc_body[3], const float gyr_body[3], float dt);
+
+/* One IMU(+GNSS) epoch of the IMU-loss scenario. */
+static void imuloss_epoch(ins_t* f, ins_time_us_t t, bool imu, bool gnss, const double* ecef,
+                          const float acc[3], const float gyr[3], float dt)
+{
+    ins_measurements_t m;
+    memset(&m, 0, sizeof(m));
+    m.timestamp = t;
+    if (imu)
+    {
+        set_imu(&m, acc, gyr, dt);
+        m.mag.data[0]  = 20.0f;
+        m.mag.data[2]  = 45.0f;
+        m.mag.is_valid = true;
+    }
+    if (gnss)
+    {
+        ins_ecef_to_latlonh(ecef, &m.gnss_pos.llh[0], &m.gnss_pos.llh[1], &m.gnss_pos.llh[2]);
+        m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = m.gnss_pos.Qll_ned[8] = 1.0f;
+        m.gnss_pos.is_valid                                                   = true;
+        m.gnss_vel.Qll_ned[0] = m.gnss_vel.Qll_ned[4] = m.gnss_vel.Qll_ned[8] = 0.01f;
+        m.gnss_vel.is_valid                                                   = true;
+    }
+    ins_update(f, &m);
+}
+
+/* IMU loss stops and re-arms the filter (REQ-NAV-089) with its biases carried
+   (REQ-NAV-061). GNSS keeps arriving in the IMU gap: the filter has to stop on
+   the first epoch that finds the IMU stale, not when the IMU returns. */
+static void scenario_imu_loss_rearms_with_carry(void)
+{
+    printf("\n=== Scenario: IMU loss stops and re-arms ins with its biases (REQ-NAV-089, "
+           "REQ-NAV-061) ===\n");
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    ins_options_t opt;
+    fill_default_opt(&opt);
+    opt.auto_init                     = true;
+    opt.allow_unlimited_deadreckoning = false;
+    opt.estimate_mag_bias             = true;
+    static ins_t f;
+    memset(&f, 0, sizeof(f));
+    CHECK_TRUE(ins_init(&f, &init, &opt) == 0, "init ok");
+    CHECK_NEAR(f.opt.imu_loss_timeout_sec, 0.2, 1e-6, "0 selects the 0.2 s default");
+
+    const double* ecef = init_ecef(&init);
+    float         g_vec[3];
+    {
+        double lat, lon, h;
+        ins_ecef_to_latlonh(ecef, &lat, &lon, &h);
+        ins_gravity_ned((float)lat, (float)h, g_vec);
+    }
+    const float   acc[3] = {0.0f, 0.0f, -g_vec[2]};
+    const float   gyr[3] = {0.0f, 0.0f, 0.0f};
+    const float   dt     = 0.01f;
+    ins_time_us_t t      = 0;
+    feed_autoinit_bootstrap(&f, ecef, &t, acc, gyr, dt);
+    CHECK_TRUE(f.is_initialized, "bootstrapped");
+
+    int k;
+    for (k = 1; k <= 300; ++k)
     {
         t += us_from_sec(dt);
-        ins_measurements_t m;
-        memset(&m, 0, sizeof(m));
-        m.timestamp = t;
-        set_imu(&m, acc_body, gyr_body, dt);
-        ins_update(&f, &m);
+        imuloss_epoch(&f, t, true, (k % 20) == 0, ecef, acc, gyr, dt);
     }
+    /* Distinct bias values to recognize in the carry. */
+    const float ab[3] = {0.03f, -0.02f, 0.05f};
+    const float gb[3] = {1e-3f, -2e-3f, 5e-4f};
+    const float mb[3] = {1.5f, -0.5f, 0.8f};
+    vec3_assign(f.state.acc_bias, ab);
+    vec3_assign(f.state.gyr_bias, gb);
+    vec3_assign(f.state.mag_bias, mb);
 
-    const unsigned n_predict_after = ins_get_diag(&f)->n_predict;
-    CHECK_TRUE(f.is_initialized, "filter still initialized after resuming post-gap");
-    /* Before the fix, t_last_kalman_predict was never re-baselined on the
-       skipped gap epoch, so dt_ms kept growing with every following epoch,
-       time_jump latched permanently true and n_predict never moved again. */
-    CHECK_TRUE(n_predict_after > n_predict_before_gap,
-               "filter resumes predicting after the gap instead of staying stuck");
+    /* 0.15 s without IMU: ordinary jitter. */
+    t += us_from_sec(0.15f);
+    imuloss_epoch(&f, t, true, false, ecef, acc, gyr, 0.15f);
+    CHECK_TRUE(f.is_initialized && ins_get_diag(&f)->n_imu_loss == 0,
+               "0.15 s without IMU is not a loss");
+    vec3_assign(f.state.acc_bias, ab);
+    vec3_assign(f.state.gyr_bias, gb);
+    vec3_assign(f.state.mag_bias, mb);
+
+    /* GNSS every 100 ms, no IMU. */
+    const ins_time_us_t t_imu          = t;
+    int                 n_gnss_running = 0;
+    for (k = 1; k <= 7; ++k)
+    {
+        t = t_imu + (ins_time_us_t)k * 100000;
+        imuloss_epoch(&f, t, false, true, ecef, acc, gyr, dt);
+        if (f.is_initialized) { ++n_gnss_running; }
+    }
+    CHECK_TRUE(n_gnss_running == 1, "stopped on the first GNSS epoch that finds the IMU 0.2 s old");
+    CHECK_TRUE(!f.is_initialized && f.is_collecting, "re-armed into collecting");
+    CHECK_TRUE(ins_get_diag(&f)->n_imu_loss == 1, "IMU loss counted once");
+    CHECK_TRUE(f.bias_carry.valid, "biases carried");
+    for (k = 0; k < 3; ++k)
+    {
+        CHECK_NEAR(f.bias_carry.acc_bias[k], ab[k], 1e-4, "acc bias carried");
+        CHECK_NEAR(f.bias_carry.gyr_bias[k], gb[k], 1e-6, "gyr bias carried");
+        CHECK_NEAR(f.bias_carry.mag_bias[k], mb[k], 1e-3, "mag bias carried");
+    }
+    CHECK_TRUE(f.bias_carry.acc_bias_stddev_mps2 <= init.acc_bias_init_stddev_mps2 &&
+                   f.bias_carry.mag_bias_stddev_ut <= f.init.mag_bias_init_stddev_ut,
+               "carried 1-sigma clamped to the cold-start prior");
+
+    /* The IMU returns: the re-bootstrap seeds the carried biases. */
+    feed_autoinit_bootstrap(&f, ecef, &t, acc, gyr, dt);
+    CHECK_TRUE(f.is_initialized, "re-bootstrapped after the IMU returned");
+    for (k = 0; k < 3; ++k)
+    {
+        CHECK_NEAR(f.state.acc_bias[k], ab[k], 0.01, "acc bias seeded from the carry");
+        CHECK_NEAR(f.state.mag_bias[k], mb[k], 0.1, "mag bias seeded from the carry");
+    }
 }
 
 /* @satisfies REQ-NAV-033 */
@@ -6878,10 +7582,10 @@ static void scenario_autoinit_buffer_wraparound(void)
         fails++;
         return;
     }
-    if (f.autoinit_count != INS_AUTOINIT_SAMPLES_MAX)
+    if (f.autoinit_win.count != INS_AUTOINIT_SAMPLES_MAX)
     {
         printf("  FAIL  autoinit buffer did not fill/wrap to its cap (%d != %d)\n",
-               f.autoinit_count, INS_AUTOINIT_SAMPLES_MAX);
+               f.autoinit_win.count, INS_AUTOINIT_SAMPLES_MAX);
         fails++;
     }
     else { printf("  ok    autoinit buffer filled and wrapped at its cap\n"); }
@@ -7478,6 +8182,63 @@ static void scenario_auto_zupt(void)
         }
     }
 
+    /* (A2) ins_auto_zupt_active applies the dwell time like the detector:
+       with a long dwell it must stay false through the dwell, then turn
+       true in the very epoch of the first trigger, not before it. */
+    {
+        ins_t f;
+        memset(&f, 0, sizeof(f));
+        ins_init_t init;
+        fill_default_init(&init, 0);
+        ins_options_t opt;
+        fill_default_opt(&opt);
+        opt.auto_zupt_dwell_sec = 2.0f;
+
+        if (ins_init(&f, &init, &opt) != 0)
+        {
+            printf("init failed\n");
+            fails++;
+            return;
+        }
+
+        float g_vec[3];
+        ins_gravity_ned((float)f.latlonh[0], (float)f.latlonh[2], g_vec);
+        const float acc_body[3] = {0.0f, 0.0f, -g_vec[2]};
+        const float gyr_body[3] = {0.0f, 0.0f, 0.0f};
+
+        const float   dt           = 0.01f;
+        ins_time_us_t t            = 0;
+        int           first_active = -1, first_trigger = -1;
+        int           step;
+        for (step = 1; step <= 500; ++step) /* 5 s */
+        {
+            t += us_from_sec(dt);
+            ins_measurements_t m;
+            memset(&m, 0, sizeof(m));
+            m.timestamp = t;
+            set_imu(&m, acc_body, gyr_body, dt);
+            ins_update(&f, &m);
+            if (first_active < 0 && ins_auto_zupt_active(&f)) { first_active = step; }
+            if (first_trigger < 0 && ins_get_diag(&f)->n_auto_zupt > 0) { first_trigger = step; }
+        }
+
+        /* The variance window needs its first verdict before the dwell can
+           start, so the first trigger lands after the dwell time. */
+        if (first_trigger > (int)(2.0f / dt) && first_active == first_trigger)
+        {
+            printf("  ok    ins_auto_zupt_active waits for the dwell (first true at step %d,"
+                   " first trigger at step %d)\n",
+                   first_active, first_trigger);
+        }
+        else
+        {
+            printf("  FAIL  ins_auto_zupt_active ignores the dwell: first true at step %d,"
+                   " first trigger at step %d\n",
+                   first_active, first_trigger);
+            fails++;
+        }
+    }
+
     /* (B) Explicitly disabled: same stationary run, detector must never
        fire. */
     {
@@ -7989,6 +8750,91 @@ static void scenario_auto_zupt(void)
             printf("  ok    ins_set_auto_zupt_disable suppresses the detector and "
                    "requires a fresh dwell on re-enable\n");
         }
+    }
+}
+
+/* Runs a straight 2 m/s north cruise (the velocity-blind spot of the IMU
+ * criteria, REQ-NAV-013): 1 s spinning about the vertical axis faster than
+ * the gyro magnitude gate, then IMU-quiet until t_end_sec. With with_gnss
+ * set, an accurate GNSS velocity of the cruise arrives at 2 Hz during the
+ * spin only, i.e. exclusively on epochs the IMU criteria reject. Returns
+ * the detector trigger count, *active_seen reports whether
+ * ins_auto_zupt_active ever went true. */
+static uint32_t auto_zupt_cruise_run(bool with_gnss, float t_end_sec, bool* active_seen)
+{
+    ins_t f;
+    memset(&f, 0, sizeof(f));
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    init.vel_ned[0] = 2.0f;
+    ins_options_t opt;
+    fill_default_opt(&opt);
+    *active_seen = false;
+    if (ins_init(&f, &init, &opt) != 0) { return UINT32_MAX; }
+
+    float g_vec[3];
+    ins_gravity_ned((float)f.latlonh[0], (float)f.latlonh[2], g_vec);
+    const float acc_body[3]  = {0.0f, 0.0f, -g_vec[2]};
+    const float gyr_spin[3]  = {0.0f, 0.0f, (float)(20.0 * M_PI / 180.0)};
+    const float gyr_quiet[3] = {0.0f, 0.0f, 0.0f};
+
+    const float   dt      = 0.01f;
+    const int     n_steps = (int)(t_end_sec / dt + 0.5f);
+    ins_time_us_t t       = 0;
+    int           step;
+    for (step = 1; step <= n_steps; ++step)
+    {
+        t += us_from_sec(dt);
+        const bool         spinning = (step <= 100);
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        m.timestamp = t;
+        set_imu(&m, acc_body, spinning ? gyr_spin : gyr_quiet, dt);
+        if (with_gnss && spinning && (step % 50) == 0)
+        {
+            m.gnss_vel.is_valid   = true;
+            m.gnss_vel.vel_ned[0] = 2.0f;
+            m.gnss_vel.Qll_ned[0] = 0.01f;
+            m.gnss_vel.Qll_ned[4] = 0.01f;
+            m.gnss_vel.Qll_ned[8] = 0.01f;
+        }
+        ins_update(&f, &m);
+        if (ins_auto_zupt_active(&f)) { *active_seen = true; }
+    }
+    return ins_get_diag(&f)->n_auto_zupt;
+}
+
+/* The GNSS velocity seen by the auto-ZUPT velocity gate must be recorded on
+ * every epoch it arrives, including epochs the IMU criteria already reject
+ * (REQ-NAV-013). Otherwise the observation ages out while the platform moves
+ * and the gate opens on the first IMU-quiet stretch of the same motion. */
+static void scenario_auto_zupt_gnss_vel_while_moving(void)
+{
+    printf("\n=== Scenario: auto-ZUPT velocity gate records GNSS during motion ===\n");
+
+    /* Control: without GNSS the IMU-quiet cruise is the accepted blind spot
+       and has to arm the detector, otherwise the case below proves nothing. */
+    bool           active = false;
+    const uint32_t n_ctrl = auto_zupt_cruise_run(false, 2.9f, &active);
+    if (n_ctrl > 0 && n_ctrl != UINT32_MAX && active)
+    {
+        printf("  ok    without GNSS the quiet cruise arms the detector (%u)\n", n_ctrl);
+    }
+    else
+    {
+        printf("  FAIL  control run did not arm the detector (%u)\n", n_ctrl);
+        fails++;
+    }
+
+    /* The last fix (t = 1 s) is still within INS_AUTOZUPT_EXT_VEL_MAX_AGE_SEC
+       at t = 2.9 s and reports 2 m/s, above auto_zupt_max_vel_mps. */
+    const uint32_t n = auto_zupt_cruise_run(true, 2.9f, &active);
+    if (n == 0 && !active) { printf("  ok    a fix taken during motion keeps the gate closed\n"); }
+    else
+    {
+        printf("  FAIL  detector armed despite a recent 2 m/s fix (%u, active %d)\n", n,
+               (int)active);
+        fails++;
     }
 }
 
@@ -9698,6 +10544,10 @@ static void scenario_reacquire_yaw_unknown(void)
         CHECK_TRUE(ins_get_diag(&f)->n_reacquire == 1, "re-acquisition ran (no hint)");
         CHECK_NEAR(test_state_variance(&f, INS_IDX_RPY + 2), unknown_var, 1e-3,
                    "no hint at all: yaw variance reset to the unknown-heading prior");
+        /* REQ-NAV-091: the fix carried no velocity, the frozen one is kept
+           as a value only. */
+        CHECK_NEAR(test_state_variance(&f, INS_IDX_VEL + 0), 900.0, 1e-2,
+                   "no velocity measured: velocity variance is the unknown prior");
     }
 
     /* --- (c) hint WITH an absolute yaw (magnetometer AHRS, dual-antenna
@@ -10285,6 +11135,8 @@ static void scenario_reacquire_variants(void)
         float p[3];
         ins_get_position_local(&f, p);
         CHECK_NEAR(p[0], 12.0f, 0.5, "local-pos re-anchored position [m]");
+        CHECK_NEAR(test_state_variance(&f, INS_IDX_VEL + 0), 900.0, 1e-2,
+                   "local-pos carries no velocity: velocity variance is the unknown prior");
     }
 }
 
@@ -10769,7 +11621,8 @@ static void scenario_time_jump_reset_reacquires(void)
 
         CHECK_TRUE(!f.is_initialized, "time-jump reset tripped");
         CHECK_TRUE(f.is_collecting, "re-armed into collecting, not left dead");
-        CHECK_TRUE(ins_get_diag(&f)->n_time_jump_reset == 1, "n_time_jump_reset counted the reset");
+        CHECK_TRUE(ins_get_diag(&f)->n_imu_loss == 1, "counted as an IMU loss (REQ-NAV-089)");
+        CHECK_TRUE(f.bias_carry.valid, "biases carried across the reset (REQ-NAV-061)");
         CHECK_TRUE(ins_get_diag(&f)->n_health_reset == 0,
                    "n_health_reset stays untouched by a time-jump reset");
 
@@ -12865,6 +13718,110 @@ static void scenario_chi2_reject_alpha(void)
     CHECK_TRUE(dw_strict == 1, "strict alpha downweights the same outlier");
 }
 
+/* Stationary run with a stream of 5 Hz GNSS position fixes: Gaussian noise
+   (1 m reported and true) plus gross faults reported as equally accurate.
+   Two fault classes: isolated fixes (every 5th fix 100 to 500 m off in a
+   varying direction) and, from 40 s on, one burst of 8 consecutive fixes
+   100 m north. Returns the worst and the RMS horizontal error over the last
+   half of the run via the out parameters. Used by
+   scenario_chi2_outlier_swarm (REQ-NAV-090). */
+static void run_gnss_swarm(bool chi2_disable, float* max_err_m, float* rms_err_m,
+                           uint32_t* n_downweighted)
+{
+    ins_t f;
+    memset(&f, 0, sizeof(f));
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    ins_options_t opt;
+    fill_default_opt(&opt);
+    opt.chi2_disable      = chi2_disable;
+    opt.auto_zupt_disable = true; /* the gate alone must hold, not stillness */
+    CHECK_TRUE(ins_init(&f, &init, &opt) == 0, "swarm init");
+
+    float g_vec[3];
+    ins_gravity_ned((float)f.latlonh[0], (float)f.latlonh[2], g_vec);
+    const float acc_body[3] = {0.0f, 0.0f, -g_vec[2]};
+    const float gyr_body[3] = {0.0f, 0.0f, 0.0f};
+
+    magc_rng_state        = 0x1B873593u; /* same fault pattern for both runs */
+    const float   dt      = 0.01f;
+    const int     n_steps = 6000; /* 60 s */
+    ins_time_us_t t       = 0;
+    int           step;
+    int           fix_no = 0;
+    double        sum_sq = 0.0;
+    int           n_eval = 0;
+    float         worst  = 0.0f;
+    float         R_n_to_e[9];
+    for (step = 1; step <= n_steps; ++step)
+    {
+        t += us_from_sec(dt);
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        m.timestamp = t;
+        set_imu(&m, acc_body, gyr_body, dt);
+        if (step % 20 == 0) /* 5 Hz fixes */
+        {
+            ++fix_no;
+            float off_n = magc_gauss(1.0);
+            float off_e = magc_gauss(1.0);
+            if (fix_no >= 200 && fix_no < 208) /* burst, 40 s on */ { off_n += 100.0f; }
+            else if (fix_no % 5 == 0) /* isolated gross fault */
+            {
+                const float mag = 100.0f + 400.0f * (float)magc_uniform();
+                const float ang = 2.0f * (float)M_PI * (float)magc_uniform();
+                off_n += mag * cosf(ang);
+                off_e += mag * sinf(ang);
+            }
+            ins_rotmat_n_to_e(f.latlonh[0], f.latlonh[1], R_n_to_e);
+            double fix_ecef[3];
+            int    k;
+            for (k = 0; k < 3; ++k)
+            {
+                fix_ecef[k] = init_ecef(&init)[k] + (double)R_n_to_e[k] * (double)off_n +
+                              (double)R_n_to_e[3 + k] * (double)off_e;
+            }
+            ins_ecef_to_latlonh(fix_ecef, &m.gnss_pos.llh[0], &m.gnss_pos.llh[1],
+                                &m.gnss_pos.llh[2]);
+            m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = m.gnss_pos.Qll_ned[8] = 1.0f;
+            m.gnss_pos.is_valid                                                   = true;
+        }
+        ins_update(&f, &m);
+        if (step > n_steps / 2)
+        {
+            float pl[3];
+            if (ins_get_position_local(&f, pl))
+            {
+                const float e = sqrtf(pl[0] * pl[0] + pl[1] * pl[1]);
+                if (e > worst) worst = e;
+                sum_sq += (double)e * (double)e;
+                ++n_eval;
+            }
+        }
+    }
+    *max_err_m      = worst;
+    *rms_err_m      = n_eval > 0 ? (float)sqrt(sum_sq / (double)n_eval) : 1e9f;
+    *n_downweighted = f.diag.n_downweighted;
+}
+
+/* REQ-NAV-090: many gross GNSS faults, not just one. */
+static void scenario_chi2_outlier_swarm(void)
+{
+    printf("\n=== Scenario: chi2 gate under a swarm of gross GNSS faults ===\n");
+    float    max_on, rms_on, max_off, rms_off;
+    uint32_t dw_on, dw_off;
+    run_gnss_swarm(false, &max_on, &rms_on, &dw_on);
+    run_gnss_swarm(true, &max_off, &rms_off, &dw_off);
+    printf("  gate on : max %.2f m, rms %.2f m, downweights %u\n", max_on, rms_on, dw_on);
+    printf("  gate off: max %.2f m, rms %.2f m, downweights %u\n", max_off, rms_off, dw_off);
+    CHECK_TRUE(dw_on > 40, "gate trips on the faulty fixes");
+    CHECK_TRUE(dw_off == 0, "chi2_disable: nothing downweighted");
+    CHECK_TRUE(max_on < 3.0f, "gate on: worst error stays at the metre level");
+    CHECK_TRUE(rms_on < 1.5f, "gate on: rms error stays at the metre level");
+    CHECK_TRUE(max_off > 30.0f, "gate off: faults drag the solution tens of metres");
+    CHECK_TRUE(rms_off > 10.0f * rms_on, "gate cuts the rms error by more than 10x");
+}
+
 /* ins_update() must be exactly ins_predict_step() followed by
    ins_correct_step() (REQ-NAV-069): drive two identical filters through
    the same epoch stream, one via ins_update(), the other manually split,
@@ -13894,8 +14851,11 @@ int main(void)
     scenario_mag_yaw();
     scenario_magnetic_model_from_position();
     scenario_mag_bias_estimation();
+    scenario_mag_bias_circle_drive();
     scenario_zero_rotation_bias();
     scenario_gnss_moving_delayed();
+    scenario_subepoch_age();
+    scenario_tov_interpolation();
     scenario_gnss_velocity_leverarm();
     scenario_gnss_leverarm_yaw_from_position();
     scenario_gnss_leverarm_yaw_from_velocity();
@@ -13915,6 +14875,7 @@ int main(void)
     scenario_gnss_mode_hysteresis();
     scenario_gnss_quality_exit_bias_carry();
     scenario_gnss_quality_exit_origin_carry();
+    scenario_gnss_quality_exit_baro_datum_carry();
     scenario_baro_height_source_selection();
     scenario_baro_height_fusion();
     scenario_baro_height_survives_reacquire();
@@ -13939,6 +14900,7 @@ int main(void)
     scenario_accessors_and_lifecycle();
     scenario_time_jump_handling();
     scenario_time_jump_unlimited_dr_recovery();
+    scenario_imu_loss_rearms_with_carry();
     scenario_startup_alignment_gate();
     scenario_automotive_gnss_yaw();
     scenario_gravity_override();
@@ -13949,6 +14911,7 @@ int main(void)
     scenario_beginner_option_defaults();
     scenario_beginner_init_defaults();
     scenario_auto_zupt();
+    scenario_auto_zupt_gnss_vel_while_moving();
     scenario_auto_zaru_vibration();
     scenario_static_variance_gate();
     scenario_bias_prior_check();
@@ -13992,6 +14955,7 @@ int main(void)
     scenario_overconfidence_watchdog();
     scenario_chi2_disable();
     scenario_chi2_reject_alpha();
+    scenario_chi2_outlier_swarm();
     scenario_mag_disturbance_diagnostics();
     scenario_nhc_lateral();
     scenario_gnss_pos_llh_input();

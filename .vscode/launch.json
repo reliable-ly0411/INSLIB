@@ -13,8 +13,8 @@
             // 127.0.0.1:9870. It does NOT open the serial port -- start a
             // sender alongside it, in a terminal:
             //
-            //   python tools/inslib_hub.py COM4          (live hardware)
-            //   python tools/inslib_replay_udp.py cap.ubx  (recorded session)
+            //   python inslib_hub.py COM4          (live hardware)
+            //   python inslib_replay_udp.py cap.ubx  (recorded session)
             //
             // Without one it simply sits idle on the socket, which is a
             // fine place to put a breakpoint and wait.

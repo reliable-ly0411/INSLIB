@@ -1,0 +1,218 @@
+name: Release Python package (PyPI)
+
+# Builds the INSLIB wheels (python/, one py3-none wheel per platform via
+# cibuildwheel, configured in python/pyproject.toml) and uploads them
+# through Trusted Publishing (OIDC, no API token stored anywhere). The API
+# reference is generated from the docstrings of the installed wheel (pdoc)
+# and published to GitHub Pages.
+#
+#   version tag v*      -> build, upload to pypi.org, publish the API docs
+#   run by hand         -> build only, wheels and docs kept as artifacts
+#   run by hand with "Upload to TestPyPI" and a dev number N
+#                       -> build version x.y.z.devN, upload to test.pypi.org
+#   run by hand with "Publish the API docs"
+#                       -> also deploy the docs of this build to Pages
+#
+# The dev number exists because an index never accepts the same version
+# twice (not even after deleting it), so every test upload needs a fresh
+# one. It only changes the version inside this run, nothing is committed.
+#
+# The repository check keeps this from running in the private development
+# repository, which carries the same file and tags its releases too.
+#
+# One-time setup, separately on pypi.org and on test.pypi.org (separate
+# accounts): Publishing, add a (pending) trusted publisher with owner jnz,
+# repository INSLIB, workflow release-pypi.yml and environment pypi
+# respectively testpypi. In the GitHub repository settings create both
+# environments, pypi with a required reviewer, so every real upload waits
+# for a manual approval. For the docs set Settings, Pages, Source to
+# "GitHub Actions" once. GitHub then creates the github-pages environment,
+# which by default only deploys from main: add the tag rule v* to its
+# deployment branches and tags, or the deploy from a release tag is
+# refused.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      testpypi:
+        description: 'Upload to TestPyPI (test.pypi.org)'
+        type: boolean
+        default: false
+      dev:
+        description: 'Dev number N for the TestPyPI version x.y.z.devN (new one per upload)'
+        type: string
+        default: ''
+      docs:
+        description: 'Publish the API docs of this build to GitHub Pages'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Check version
+    if: github.repository == 'jnz/INSLIB'
+    runs-on: ubuntu-24.04
+    outputs:
+      dev: ${{ steps.check.outputs.dev }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: check
+        shell: bash
+        env:
+          TESTPYPI: ${{ inputs.testpypi }}
+          DEV: ${{ inputs.dev }}
+        run: |
+          pkg=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' python/INSLIB/__init__.py)
+          echo "package version $pkg"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            test "v$pkg" = "$GITHUB_REF_NAME" || {
+              echo "::error::tag $GITHUB_REF_NAME does not match __version__ $pkg"; exit 1; }
+          elif [[ "$TESTPYPI" == "true" ]]; then
+            [[ "$DEV" =~ ^[0-9]+$ ]] || {
+              echo "::error::TestPyPI upload needs a dev number (digits only)"; exit 1; }
+            echo "dev=$DEV" >> "$GITHUB_OUTPUT"
+            echo "TestPyPI version $pkg.dev$DEV"
+          fi
+
+  wheels:
+    name: Wheel ${{ matrix.archs }} (${{ matrix.os }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux wheels come as manylinux and musllinux each.
+          - { os: ubuntu-24.04, archs: x86_64 }
+          - { os: ubuntu-24.04-arm, archs: aarch64 }
+          # 32-bit Raspberry Pi OS (Pi 2 and newer). QEMU runs the armv7l
+          # container in case the runner CPU has no 32-bit mode.
+          - { os: ubuntu-24.04-arm, archs: armv7l, qemu: true }
+          # x64 with the runner image's MinGW-w64 gcc, ARM64 with MSVC
+          # (see python/setup.py).
+          - { os: windows-latest, archs: AMD64 }
+          - { os: windows-11-arm, archs: ARM64 }
+          - { os: macos-15-intel, archs: x86_64 }
+          - { os: macos-14, archs: arm64 }
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: QEMU
+        if: matrix.qemu
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Dev version for TestPyPI
+        if: needs.version.outputs.dev != ''
+        shell: bash
+        run: |
+          sed -i.bak 's/^__version__ = "\(.*\)"$/__version__ = "\1.dev${{ needs.version.outputs.dev }}"/' python/INSLIB/__init__.py
+          grep '^__version__' python/INSLIB/__init__.py
+
+      - name: Build and smoke test
+        uses: pypa/cibuildwheel@v3.2.1
+        env:
+          CIBW_ARCHS: ${{ matrix.archs }}
+        with:
+          package-dir: python
+          output-dir: wheelhouse
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.archs }}
+          path: wheelhouse/*.whl
+
+  publish:
+    name: Upload to PyPI
+    needs: wheels
+    if: github.repository == 'jnz/INSLIB' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/project/inslib/
+    permissions:
+      id-token: write    # Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-test:
+    name: Upload to TestPyPI
+    needs: [version, wheels]
+    if: needs.version.outputs.dev != ''
+    runs-on: ubuntu-24.04
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/inslib/
+    permissions:
+      id-token: write    # Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  docs:
+    name: API docs (pdoc)
+    needs: wheels
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: wheels-ubuntu-24.04-x86_64
+          path: dist
+
+      # From the installed wheel, not from a checkout: the reference shows
+      # exactly the package users get, and importing it needs the compiled
+      # library anyway.
+      # The logo is the one the PyPI page shows too, served from main.
+      - name: Generate
+        shell: bash
+        env:
+          LOGO: https://raw.githubusercontent.com/jnz/INSLIB/main/doc/figures/inslib_logo_transparent_small.png
+        run: |
+          python -m pip install pdoc==16.0.0
+          python -m pip install --pre --no-index --find-links dist inslib
+          python -m pdoc INSLIB --docformat restructuredtext -o site \
+            --logo "$LOGO" --logo-link https://github.com/jnz/INSLIB --favicon "$LOGO"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  docs-deploy:
+    name: Publish API docs (GitHub Pages)
+    needs: docs
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.docs
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

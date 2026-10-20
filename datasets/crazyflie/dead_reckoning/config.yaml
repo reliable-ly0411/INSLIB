@@ -28,7 +28,10 @@ gnss:
   # Lighthouse reports a pose per frame, not a velocity measurement
   vel_noise_acc_scale_hor: -1
   vel_noise_acc_scale_ver: -1
-  delay_ms: 50
+  # Counted from the fix timestamp (REQ-NAV-092). The fixes sit 9 ms before
+  # the IMU sample they are attached to, so this is the 50 ms this dataset
+  # used while the delay was counted from that IMU sample.
+  delay_ms: 41
   pos_cov_scale: 0.3
 
 baro:
@@ -47,11 +50,11 @@ score:
   min_epochs: 600
   # Regression guard-rails vs. Lighthouse ground truth: observed + margin,
   # NOT accuracy claims. Trip means inspect and retune.
-  lim_att_bias_deg: 0.40   # observed 0.266
-  lim_att_std_deg: 0.45    # observed 0.345
-  lim_yaw_bias_deg: 0.25   # observed 0.119
-  lim_yaw_std_deg: 0.95    # observed 0.722
-  lim_pos_rms_m: 0.28      # observed 0.185
+  lim_att_bias_deg: 0.254  # observed 0.241 (roll)
+  lim_att_std_deg: 0.313   # observed 0.298 (roll)
+  lim_yaw_bias_deg: 0.057  # observed 0.054 (AHRS on true north, REQ-SUITE-029)
+  lim_yaw_std_deg: 0.595   # observed 0.567
+  lim_pos_rms_m: 0.212     # observed 0.202
   leverarm_frd: [0, 0, 0]  # lighthouse deck is basically next to the CF IMU
 
 origin:

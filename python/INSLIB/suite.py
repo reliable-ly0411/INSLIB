@@ -241,6 +241,15 @@ class Navigator(_Base):
         contract as set_ahrs_gyr_noise()."""
         self._c("set_ahrs_gyr_bias_rw")(self._h, float(density_rps2_sqrthz))
 
+    def set_ahrs_rpy_pred_stddev(self, stddev_rad_sqrts):
+        """Set the ARS's/AHRS's SHARED extra attitude process noise
+        [rad/sqrt(s)] (<=0 -> none), added on top of the gyro noise for
+        model errors the sensor figure does not cover, the same split as
+        ins's rpy_pred_stddev_rad_sqrts. Needed once the gyro noise is a
+        good sensor's own figure, the generic default carries the margin
+        itself; same timing contract as set_ahrs_gyr_noise()."""
+        self._c("set_ahrs_rpy_pred_stddev")(self._h, float(stddev_rad_sqrts))
+
     def set_init_att_hint(self, roll_rad=0.0, pitch_rad=0.0,
                           stddev_roll_pitch_rad=0.0, yaw_rad=0.0,
                           stddev_yaw_rad=0.0):
@@ -263,6 +272,25 @@ class Navigator(_Base):
         coupling if left at the (generous) default. Same timing contract
         as set_ahrs_gyr_noise()."""
         self._c("set_ahrs_gyr_bias_init_stddev")(self._h, float(stddev_rps))
+
+    def set_ahrs_tuning(self, acc_freq_hz=0.0, acc_cutoff_freq_hz=0.0,
+                        gravity_diff_penalty=0.0, acc_reject_gravity_mps2=0.0,
+                        chi2_threshold=0.0, kalman_update_dt_sec=0.0,
+                        mag_yaw_stddev_rad=0.0, mag_freq_hz=0.0,
+                        mag_chi2_threshold=0.0):
+        """Set the ARS's/AHRS's SHARED accelerometer-leveling and
+        magnetometer tuning, the ahrs_config_t fields of the same names (see
+        ahrs.h for units and meaning); both sub-filters' templates at once.
+        0 leaves a field at ahrs's own default. gravity_diff_penalty and
+        acc_reject_gravity_mps2 also take a negative value through (penalty
+        -> 0, reject -> disabled), all others ignore <= 0. Same timing
+        contract as set_ahrs_gyr_noise()."""
+        self._c("set_ahrs_tuning")(
+            self._h, float(acc_freq_hz), float(acc_cutoff_freq_hz),
+            float(gravity_diff_penalty), float(acc_reject_gravity_mps2),
+            float(chi2_threshold), float(kalman_update_dt_sec),
+            float(mag_yaw_stddev_rad), float(mag_freq_hz),
+            float(mag_chi2_threshold))
 
     def zaru_active(self):
         """True if a zero-rotation update was applied to the ARS/AHRS on

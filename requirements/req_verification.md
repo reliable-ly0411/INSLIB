@@ -22,10 +22,10 @@ exit code and human-readable output.
 
 - **Status:** implemented
 - **Parent:** REQ-VER-002
-- **Verification:** Inspection: datasets/replay_format.py defines the shared config.yaml + imu/ref/gnss/mag/baro/speed/heading.csv contract (schema documented in doc/INSLIB_manual.tex section "config.yaml", dataset specifics confined to the convert_*.py converters)
+- **Verification:** Inspection: datasets/replay_format.py defines the shared config.yaml + imu/ref/gnss/mag/baro/speed/heading/ranges/timesync.csv contract (schema documented in doc/INSLIB_manual.tex section "config.yaml", dataset specifics confined to the convert_*.py converters)
 
 A single replay harness (one binary, `tools/replay.c`; mirrored by
-`python/replay.py`) shall consume a dataset-neutral input format: a
+`tools/replay.py`) shall consume a dataset-neutral input format: a
 generated per-dataset `config.yaml` (aiding/init mode, IMU noise
 model, lever arms, warmup, regression limits, GNSS covariance
 fallbacks) plus CSVs — imu.csv (FRD body-frame IMU, optionally
@@ -34,12 +34,19 @@ which both harnesses ignore: they read the first seven fields, so a
 dataset written without it stays valid), ref.csv
 (position, attitude, NED velocity), optionally gnss.csv (real GNSS
 measurements with the full NED position and velocity covariance;
-unknown entries zero), mag.csv (calibrated body-frame field [uT]),
+unknown entries zero; optionally followed by the fix quality in RTKLIB's
+numbering, the receiver's GPS week and time of week, the satellites
+used and the receiver's jamming, spoofing and authentication states,
+REQ-VER-045, which the filter does not read, so a gnss.csv without them
+stays valid), timesync.csv (the recording's t_us against GPS time, read by
+tools/replay.py only, REQ-VER-044), mag.csv (calibrated body-frame field [uT]),
 baro.csv (static pressure [Pa]) and speed.csv (scalar ground speed
 [m/s], REQ-NAV-068 -- its per-sample uncertainty and delay come from
 config.yaml as constants, not from further columns) and heading.csv
 (dual-antenna baseline azimuth [deg] with its per-row 1-sigma [deg] and
-carrier-phase solution, REQ-VER-035). Dataset specifics (axis conventions,
+carrier-phase solution, REQ-VER-035) and ranges.csv (ranges to anchors
+at known positions with a per-row 1-sigma, REQ-VER-038). Dataset
+specifics (axis conventions,
 units, lever arms, sensor calibration, noise, gates) shall be confined
 to the per-dataset converters, so new datasets only add a converter
 and a Makefile sub-target.
@@ -135,9 +142,9 @@ the value can also be found empirically from the data rather than guessed).
 
 - **Status:** deleted
 - **Parent:** REQ-VER-008
-- **Verification:** Inspection: obsolete -- python/replay.py analysis tooling (--estimate-gnss-delay) is not tracked as a requirement (the DB covers the src/ C library and the C regression harness only).
+- **Verification:** Inspection: obsolete -- tools/replay.py analysis tooling (--estimate-gnss-delay) is not tracked as a requirement (the DB covers the src/ C library and the C regression harness only).
 
-(Deleted, kept for ID stability.) Previously required python/replay.py to
+(Deleted, kept for ID stability.) Previously required tools/replay.py to
 cross-correlate the baro/accel vertical
 filter's down-velocity (assumed near-zero latency) against the held
 GNSS fix's down-velocity, over the --plot-hz recorder's uniformly
@@ -180,7 +187,7 @@ rpy_init_stddev_rad_deg, yaw_init_stddev_rad_deg (0 -> falls back to
 rpy_init_stddev_rad_deg, like ins's own rpy_init_stddev_rad[0..1]/[2]),
 acc_bias_init_stddev_mps2, gyr_bias_init_stddev_rps_deg -- each 0/omitted
 -> the harness's built-in default; the same YAML vocabulary is shared
-verbatim by python/replay.py, which reads the same config.yaml files.
+verbatim by tools/replay.py, which reads the same config.yaml files.
 Rationale: the built-in defaults
 assume a well-characterized initial state (e.g. a surveyed stationary
 start); a dataset whose "known" state is itself only a GNSS-derived
@@ -218,9 +225,9 @@ outlier-heavy replay is visible without instrumenting the source.
 
 - **Status:** deleted
 - **Parent:** REQ-VER-012
-- **Verification:** Inspection: obsolete -- python/replay.py `--plot` visualization is not tracked as a requirement (python-tool feature).
+- **Verification:** Inspection: obsolete -- tools/replay.py `--plot` visualization is not tracked as a requirement (python-tool feature).
 
-(Deleted, kept for ID stability.) Previously required python/replay.py's
+(Deleted, kept for ID stability.) Previously required tools/replay.py's
 `--plot` output to include a page plotting the
 cumulative chi2-downweight counters (REQ-VER-012: INSLIB/full3d, ars,
 ahrs, baro_alt, local_gnss offset) over time, one line per sub-filter,
@@ -234,9 +241,9 @@ multipath patch, a ZUPT-shaded stop).
 
 - **Status:** deleted
 - **Parent:** REQ-VER-002
-- **Verification:** Inspection: obsolete -- python/replay.py `--plot` visualization is not tracked as a requirement (python-tool feature).
+- **Verification:** Inspection: obsolete -- tools/replay.py `--plot` visualization is not tracked as a requirement (python-tool feature).
 
-(Deleted, kept for ID stability.) Previously required python/replay.py's
+(Deleted, kept for ID stability.) Previously required tools/replay.py's
 `--plot` output to include a page plotting each
 input stream's (IMU, and GNSS/mag/baro when present) sampling rate
 [Hz] over time, bucketed into fixed-width (`--plot-rate-bucket-sec`,
@@ -249,13 +256,13 @@ large to hold in memory as a raw timestamp list, shall be bucketed in
 the single existing streaming pass (`_imu_prepass`) rather than a
 separate one.
 
-## REQ-VER-015 — Magnetometer hard-iron bias (18-state) support in python/replay.py
+## REQ-VER-015 — Magnetometer hard-iron bias (18-state) support in tools/replay.py
 
 - **Status:** deleted
 - **Parent:** REQ-NAV-029
-- **Verification:** Inspection: obsolete -- python/replay.py config forwarding + `--plot` visualization is not tracked as a requirement (the underlying C-library 18-state mag hard-iron bias support is REQ-NAV-029).
+- **Verification:** Inspection: obsolete -- tools/replay.py config forwarding + `--plot` visualization is not tracked as a requirement (the underlying C-library 18-state mag hard-iron bias support is REQ-NAV-029).
 
-(Deleted, kept for ID stability.) Previously required python/replay.py to
+(Deleted, kept for ID stability.) Previously required tools/replay.py to
 accept a `mag: estimate_bias` (0/1, default 0)
 config key and forward it to `Config.estimate_mag_bias`, so a real
 dataset can be replayed in ins's 18-state magnetometer hard-iron
@@ -286,21 +293,38 @@ the ARS/AHRS sub-filters against the true reference; the Python harness
 binding AND additionally requires ins's position RMS to stay within a
 configured factor (`score: lim_groves_pos_rms_factor`) of the Groves
 textbook filter's own position RMS vs. truth. That harness drives the
-analysis tool `python/replay.py` (via its `--summary-json` output) and
+analysis tool `tools/replay.py` (via its `--summary-json` output) and
 owns the pass/fail gates itself, so `replay.py` stays gate-free. This
 exercises the whole navigation stack on a known-truth signal end to end
 and pins agreement with an independent textbook filter.
 
 `make simulated` shall additionally gate the C harness alone on
-`datasets/simulated/B_drone/config_coasting.yaml`, a second config over
-the committed B_drone flight that sets the coasting window shorter than
-that flight's GNSS outage. The dataset's own config.yaml keeps the whole
-outage inside the window on purpose, so only this one drives the filter
+`datasets/simulated/A_ideal`, a noise-free flight whose config opts out of
+the auto-ZUPT/ZARU (its slow phases have zero sample variance and would
+otherwise read as a standstill, pinning the velocity and absorbing the turn
+rate into the gyro bias) and carries tight `score:` limits on ins attitude
+and position, the height channels and the ARS, so such a fault fails the
+run instead of passing unnoticed, and on both configs of
+`datasets/simulated/B_drone`, a UAV flight with a GNSS outage. Its own
+config.yaml keeps the whole outage inside the coasting window on purpose,
+starts from the reference and carries `score:` limits on ins attitude,
+position, the height channels and the ARS/AHRS sub-filters.
+`datasets/simulated/B_drone/config_coasting.yaml` is a second config over
+the same flight that sets the coasting window shorter than the outage, so
+only this one drives the filter
 across the boundary: inert while the window is expired (REQ-NAV-064),
 re-anchored on the first fix afterwards with the carried states inflated
 (REQ-NAV-065) and the height taken from the barometer (REQ-NAV-066). The
 Python harness is not run on it: its benchmark is the Groves filter,
 which the two profile datasets are built for and this flight is not.
+
+The C harness shall likewise gate `datasets/simulated/E_gnss_delay`, a
+drone climb/circle/descent whose 2 Hz GNSS fixes arrive 500 ms after their
+time of validity, so the history-anchored delayed fusion is scored against
+truth. Its config opts out of the auto-ZUPT/ZARU for the same reason as
+A_ideal (the vibration-free IMU of the initial steady climb reads as a
+standstill before the first fix arrives) and carries `score:` limits on ins
+attitude, position, the ellipsoid height and the ARS.
 
 ## REQ-VER-017 — Configurable auto-init leveling window
 
@@ -332,7 +356,7 @@ phase, else ahrs.c's built-in default) and, when set, apply it to all
 3 axes of both `ars_cfg.gyr_bias_init_stddev_rps` and
 `ahrs_cfg.gyr_bias_init_stddev_rps` (nav_suite.h), independent of
 whether `gyro_bias_window_sec` found a parked phase to seed the mean
-from. python/replay.py shall accept the same `ahrs:
+from. tools/replay.py shall accept the same `ahrs:
 gyr_bias_init_stddev_rps_deg` key (schema shared with the C harness)
 and apply it via `Navigator.set_ahrs_gyr_bias_init_stddev()`
 (python/csrc's `ins_suite_set_ahrs_gyr_bias_init_stddev()`, which
@@ -356,7 +380,7 @@ instead of a permanent bias/yaw drift.
 - **Parent:** REQ-VER-002
 - **Verification:** Test: tools/replay.c:main; Test: tests/test_ahrs.c:scenario_suite_stillness_propagation
 
-Both replay harnesses (tools/replay.c and python/replay.py, schema
+Both replay harnesses (tools/replay.c and tools/replay.py, schema
 shared) shall accept the whole stillness parameter set under `imu:` as
 one block and forward it to ins_options_t / ins_init_t before
 nav_suite_init(), from where REQ-SUITE-020 distributes it to the
@@ -494,7 +518,7 @@ instead of leaving the destination at whatever it held.
 
 This is REQ-VER-025's rule applied to the value rather than the key. A
 dataset directory is read by both `tools/replay.c` (this reader) and
-`python/replay.py` (PyYAML), and PyYAML accepts both forms. A form only
+`tools/replay.py` (PyYAML), and PyYAML accepts both forms. A form only
 one of them understands therefore does not produce an error anywhere: it
 produces two harnesses that disagree about the same file, each convinced
 it applied the operator's configuration. `datasets/tunnel/config.yaml` was
@@ -521,7 +545,8 @@ The replay harness shall, for every gap in the position-aiding stream longer
 than `score: coast_gap_min_sec`, report the filter's position error at the
 first IMU epoch at or after the end of that gap, scored against the
 reference epoch nearest to that IMU epoch, together with the gap's duration
-and the straight-line distance across it, and shall gate that error on
+and the straight-line distance across it, followed by the mean and maximum
+of that error over all gaps that have one, and shall gate that error on
 `score: lim_coast_exit_err_m` when one is configured. A reference epoch
 further than half a second, or half the gap, from that IMU epoch shall not
 be used, and the gap then counts as having no reference epoch.
@@ -810,10 +835,10 @@ tightly would only add noise from the initial leveling accuracy to a
 dataset about drift.
 
 The limits are set on a single deterministic run (`build/replay.exe`) at
-roughly 15 to 25% above the observed round-trip error: `lim_pos_rms_m: 0.09`
-(observed 0.072 m) and `lim_yaw_bias_deg: 0.25` (observed 0.205 deg), so a
-change that costs the free-inertial solution a few centimetres or a
-fraction of a degree fails this. Retighten after an intentional
+roughly 5% above the observed round-trip error: `lim_pos_rms_m: 0.076`
+(observed 0.072 m) and `lim_yaw_bias_deg: 0.216` (observed 0.205 deg), so a
+change that costs the free-inertial solution half a centimetre or a
+hundredth of a degree fails this. Retighten after an intentional
 improvement, the same rule as every other `lim_*` in this database.
 
 The committed rate (100 Hz) was picked by re-scoring the same capture
@@ -832,21 +857,16 @@ the rate goes up.
 
 - **Status:** verified
 - **Parent:** REQ-VER-003
-- **Verification:** Test: python/tests/test_heading_stream.py:test_heading_row_shares_t_us_with_its_gnss_fix; Test: python/tests/test_heading_stream.py:test_trailing_heading_is_placed_by_its_itow; Test: python/tests/test_heading_stream.py:test_unusable_relposned_epochs_are_dropped_and_counted; Test: python/tests/test_heading_stream.py:test_generated_config_section_is_accepted_by_the_replay; Test: python/tests/test_heading_stream.py:test_heading_measurement_gates_and_noise; Test: python/tests/test_heading_stream.py:test_heading_measurement_undoes_a_tilted_cross_baseline; Demonstration: tools/replay.c, python/replay.py and python/inspostgui.py --batch report identical heading counts and yaw error on profile_3_aircraft with heading.csv synthesized from ref.csv for a baseline along x and one across the vehicle
+- **Verification:** Test: python/tests/test_heading_stream.py:test_heading_config_section_and_csv_are_accepted_by_the_replay; Test: python/tests/test_heading_stream.py:test_heading_measurement_gates_and_noise; Test: python/tests/test_heading_stream.py:test_heading_measurement_undoes_a_tilted_cross_baseline; Demonstration: tools/replay.c, tools/replay.py and tools/inspostgui.py --batch report identical heading counts and yaw error on profile_3_aircraft with heading.csv synthesized from ref.csv for a baseline along x and one across the vehicle
 
-**Conversion.** tools/inslib_convert_ubx_to_csv.py shall write heading.csv
-from u-blox NAV-RELPOSNED, keeping only epochs with gnssFixOK, relPosValid,
-relPosHeadingValid, a positive accHeading and isMoving set (a heading
-against a static RTK base is the direction to that base, not an attitude),
-and count every dropped epoch by reason. A row shall carry the t_us of the
-NAV-PVT with the same iTOW, and the latest NAV-PVT's t_us plus the iTOW
-difference when the message belongs to a neighbouring epoch (at most one
-second apart, else dropped), so the heading row and the gnss.csv fix of one
-epoch carry the identical t_us regardless of which IMU sample either
-message arrived after. heading.csv, and `heading: enable: 1` in a generated
-config.yaml, shall only exist when at least one epoch was kept.
+**Input.** heading.csv holds one row per usable epoch (datasets/replay_format.py,
+HEADING_HEADER): t_us, the baseline azimuth, its 1-sigma, the carrier-phase
+solution and the producer's own record. A producer shall give a row the t_us
+of the GNSS fix of the same epoch, so that the heading and gnss.csv agree on
+the time of one epoch regardless of which IMU sample either message arrived
+after. `heading: enable: 1` in a config.yaml turns the stream on.
 
-**Replay.** tools/replay.c, python/replay.py and python/inspostgui.py shall
+**Replay.** tools/replay.c, tools/replay.py and tools/inspostgui.py shall
 accept a `heading:` config section (enable, baseline_frd, require_fixed,
 stddev_scale, stddev_min_deg, delay_ms) and an `inputs: heading` filename
 override, and turn the newest heading.csv row of each IMU interval into an
@@ -870,9 +890,9 @@ pair must not need a reconversion.
 
 - **Status:** verified
 - **Parent:** REQ-VER-003
-- **Verification:** Test: tests/test_yaml.c:scenario_imu_mount; Test: python/tests/test_mount_rotation.py:test_mount_composes_all_three_sensors; Test: python/tests/test_mount_rotation.py:test_zero_mount_is_a_noop; Test: python/tests/test_mount_rotation.py:test_mount_survives_a_config_roundtrip; Demonstration: with the imu.csv of datasets/kfgins rotated into a board mounted at roll 2, pitch -3, yaw -9 deg and imu: mount_rpy_deg: [2, -3, -9] in its config.yaml, tools/replay.c and python/replay.py reproduce the unrotated dataset's attitude and position scores exactly, while the same rotated data without the key misses the attitude gates by about the mounting angles
+- **Verification:** Test: tests/test_yaml.c:scenario_imu_mount; Test: python/tests/test_mount_rotation.py:test_mount_composes_all_three_sensors; Test: python/tests/test_mount_rotation.py:test_zero_mount_is_a_noop; Test: python/tests/test_mount_rotation.py:test_mount_survives_a_config_roundtrip; Demonstration: with the imu.csv of datasets/kfgins rotated into a board mounted at roll 2, pitch -3, yaw -9 deg and imu: mount_rpy_deg: [2, -3, -9] in its config.yaml, tools/replay.c and tools/replay.py reproduce the unrotated dataset's attitude and position scores exactly, while the same rotated data without the key misses the attitude gates by about the mounting angles
 
-tools/replay.c, tools/insrcv.c, python/replay.py and python/inspostgui.py
+tools/replay.c, tools/insrcv.c, tools/replay.py and tools/inspostgui.py
 shall accept `imu: mount_rpy_deg: [roll, pitch, yaw]` [deg], the attitude
 of the sensor board's axes in the vehicle body frame (ZYX, FRD), and
 compose it onto the accelerometer, gyroscope and magnetometer calibration
@@ -904,7 +924,7 @@ the board's own per-axis calibration.
 
 - **Status:** verified
 - **Parent:** REQ-VER-002
-- **Verification:** Test: python/tests/test_score_leverarm.py:test_height_projection_matches_rotated_lever_arm; Test: python/tests/test_score_leverarm.py:test_zero_lever_arm_is_a_noop; Demonstration: with ref.csv of datasets/kfgins moved to a point 2.0 m behind, 0.1 m right and 1.3 m above the IMU and score: leverarm_frd set to that point, tools/replay.c and python/replay.py report the unmoved dataset's position and ellipsoid height errors, and the state history, North-East and altitude pages of python/replay.py --plot overlay estimate and reference without the 1.3 m height offset
+- **Verification:** Test: python/tests/test_score_leverarm.py:test_height_projection_matches_rotated_lever_arm; Test: python/tests/test_score_leverarm.py:test_zero_lever_arm_is_a_noop; Demonstration: with ref.csv of datasets/kfgins moved to a point 2.0 m behind, 0.1 m right and 1.3 m above the IMU and score: leverarm_frd set to that point, tools/replay.c and tools/replay.py report the unmoved dataset's position and ellipsoid height errors, and the state history, North-East and altitude pages of tools/replay.py --plot overlay estimate and reference without the 1.3 m height offset
 
 `score: leverarm_frd` names the point on the vehicle the reference refers
 to (a GNSS antenna when ref.csv is the receiver's own solution). Every
@@ -914,12 +934,13 @@ suite's current attitude, not the IMU position:
 
 - the position error (as before),
 - the ellipsoid height error of nav_suite_get_height_ellipsoid() in
-  tools/replay.c and python/replay.py, using the down component of the
+  tools/replay.c and tools/replay.py, using the down component of the
   rotated lever arm with the suite's best available roll and pitch
   (nav_suite_get_rpy, level while the suite holds no attitude), because
   the accessor also answers while ins is coasting or not ready,
 - the estimate drawn on the --plot state history (position), North-East
-  and altitude pages of python/replay.py and python/inspostgui.py.
+  and altitude pages of tools/replay.py and tools/inspostgui.py (the
+  ins_plots pages, the GUI's own replay views follow REQ-VER-039).
 
 A zero lever arm shall change nothing.
 
@@ -929,3 +950,378 @@ score that was not an error of the filter, while the position error next
 to it already projected the lever arm and showed none. Two numbers for the
 same run that disagree by the lever arm make the plot unusable for
 judging the vertical channel.
+
+## REQ-VER-038 — Ranges to anchors in the replay tooling
+
+- **Status:** verified
+- **Parent:** REQ-VER-003
+- **Verification:** Test: python/tests/test_range_stream.py:test_range_row_and_loader_round_trip; Test: python/tests/test_range_stream.py:test_loader_drops_unusable_rows; Test: python/tests/test_range_stream.py:test_binding_takes_ranges_up_to_the_epoch_limit; Test: python/tests/test_range_stream.py:test_ranges_carry_the_replay_after_the_gnss_stops; Test: python/tests/test_replay_core.py:test_gui_worker_and_replay_py_agree
+
+**Format.** ranges.csv shall hold one calibrated range per row: t_us (the
+time the range refers to, the IMU's timebase), anchor id, anchor position
+in ECEF [m], range [m] and its 1-sigma [m], trailing columns being the
+producer's own record (datasets/replay_format.py range_row()). A row with a
+non-positive 1-sigma, a negative range or an id beyond 16 bit shall be
+dropped on loading.
+
+**Replay.** tools/replay.c, tools/replay.py and tools/inspostgui.py shall
+accept a `ranges:` config section (enable, leverarm_frd, stddev_scale,
+stddev_min_m, height_with_baro, aiding_max_hpos_stddev_m) and an
+`inputs: ranges` filename override, and hand every ranges.csv row up to each IMU epoch to
+the filter as a range measurement (REQ-NAV-082), with the row's age at that
+epoch as its delay, the 1-sigma multiplied by stddev_scale (0 -> 1) and
+floored at stddev_min_m (0 -> no floor), and the lever arm as the ranging
+antenna's. Rows beyond INS_RANGE_MAX in one epoch shall move on to the next
+epoch rather than be dropped. All three shall report the rows offered,
+fused, rejected, skipped and the epochs counted as position aiding
+(REQ-NAV-085), and agree on these counts for the same dataset.
+
+**Binding.** The Python binding shall expose the range measurement
+(Navigator.range(), refusing an entry beyond INS_RANGE_MAX in one epoch),
+the ranging lever arm and the range diagnostics, and the two ins_options_t
+range keys in its Config.
+
+Rationale: the rows keep their own time and age, since a range refers to
+the midpoint of its burst, not to the epoch that happens to fuse it.
+
+
+## REQ-VER-039 — Lever arm compensated reference and fixes in inspostgui
+
+- **Status:** verified
+- **Parent:** REQ-VER-037
+- **Verification:** Test: python/tests/test_score_leverarm.py:test_leverarm_relation_classifies_gnss_vs_score; Test: python/tests/test_score_leverarm.py:test_gui_records_rotated_lever_arms_for_ref_and_fix; Demonstration: with gnss: leverarm_frd and score: leverarm_frd set to the same antenna point, the Replay tab of tools/inspostgui.py draws the reference line and the GNSS fixes on the estimate's trail while "Lever arm compensated" is checked and offset by the lever arm while it is not, in the 3D view, the altitude profile and the Plots tab's North-East map and altitude profile
+
+tools/inspostgui.py shall offer a "Lever arm compensated" checkbox
+(remembered across sessions) for its own replay views: the 3D view and the
+altitude profile of the Replay tab, and the North-East map and altitude
+profile of the Plots tab. Checked, the reference shall be drawn at the IMU
+point, its position minus R_b_to_n * score.leverarm_frd, and every GNSS fix
+minus R_b_to_n * gnss.leverarm_frd, both rotated with the suite's best
+available attitude (as in REQ-VER-037) of the epoch the reference sample
+or the fix arrived and held with it until the next one, so a reference
+slower than the plot rate is not bent into an arc per sample while the
+vehicle turns. Unchecked, both
+shall be drawn where they were taken. Switching shall redraw what is
+already on screen. The position error and the score are not affected.
+
+Next to the checkbox the GUI shall classify the lever arms of the config on
+screen, before any run: both zero, equal within 1 cm per axis, only the
+GNSS arm set (a warning: a reference that is the receiver's own solution
+then carries the whole lever arm as error), only the scoring arm set, or
+both set but different (a warning: correct for a reference taken at
+another point, a typo otherwise). The insdoctor findings of tools/replay.py
+and tools/inspostgui.py shall report the last case as info, next to the
+existing warning for the GNSS arm set without a scoring arm.
+
+Rationale: the estimate is the IMU's position while the fixes are taken at
+the antenna and the reference at its own point, so with a lever arm of a
+metre the three lines in the 3D view never meet even when the solution is
+right. A mismatch between the two lever arms is the usual cause of a
+constant position error floor.
+
+## REQ-VER-040 — Replay without a reference file
+
+- **Status:** verified
+- **Verification:** Test: python/tests/test_replay_core.py:test_replay_without_reference_csv
+
+tools/replay.py and tools/inspostgui.py shall run a dataset that has no
+ref.csv. Nothing is scored then (zero scored epochs, the reference traces
+stay empty) and the GUI shall not report the missing file as a config
+error. aiding: ref and init: ref take their state from the reference and
+shall be refused with a message naming the missing file.
+
+Rationale: a recording from the field has no ground truth, and the filter
+output is still worth looking at.
+
+## REQ-VER-041 — Estimate drawn in one local frame across an ins restart
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: python/tests/test_replay_core.py:test_estimate_stays_in_the_replay_frame_after_an_origin_reset; Demonstration: a field recording with a 0.7 s gap in its data, after which ins restarts with a new local origin 33 m from the first, drawn by tools/inspostgui.py with the reference on top: the estimate stays on the reference after the restart
+
+tools/replay.py and tools/inspostgui.py shall draw the estimate's local
+position in the local frame the replay latched once (its origin_ecef),
+the frame the reference and the GNSS fixes are converted into: when ins
+reports another origin than that one, its position_local() shall be moved
+by the offset of its origin in the latched frame, formed with the
+mapping the reference gets (ref_to_local_ned). This covers the state
+history, the North-East track and the GUI's live position.
+
+Rationale: ins sets a new origin when it restarts, after a time jump for
+example (REQ-NAV-016), and position_local() starts again near zero. The
+replay keeps its frame on purpose, a frame moving mid-plot would be
+worse, so the estimate drawn as it came out of the filter sat shifted
+by the distance between the two origins for the rest of the run, while
+the error figures, formed in ECEF, showed it on the reference.
+
+## REQ-VER-042 — Tutorial code builds and runs
+
+- **Status:** verified
+- **Parent:** REQ-VER-001
+- **Verification:** Test: python/tests/test_tutorials.py:test_c_tutorial_first_program; Test: python/tests/test_tutorials.py:test_c_tutorial_lighthouse_snippet; Test: python/tests/test_tutorials.py:test_attitude_tutorial_program; Test: python/tests/test_tutorials.py:test_python_tutorial_first_script; Test: python/tests/test_tutorials.py:test_python_tutorial_tilt_script; Test: python/tests/test_tutorials.py:test_python_tutorial_baro_script; Test: python/tests/test_tutorials.py:test_python_tutorial_compass_script; Test: python/tests/test_tutorials.py:test_python_snippets_use_existing_names; Test: python/tests/test_tutorials.py:test_c_names_in_tutorials_exist
+
+The programs and scripts printed in tutorial/*.md shall build with the
+command line the tutorial gives (without warnings), run to completion and
+print what the tutorial shows as their output. The Python snippets shall
+use only names the binding offers, and the functions and options the
+text names shall exist in src/. `make test` runs this check.
+
+Rationale: a tutorial is the first code a new user runs. A change to the
+start-up gates, a renamed function or a new source file the build line
+does not list breaks it without any other test noticing.
+
+## REQ-VER-043 — Offline RTS smoother in the replay tooling
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: python/tests/test_ins_rts.py:test_state_minus_inverts_the_correction; Test: python/tests/test_ins_rts.py:test_backward_pass_matches_the_textbook_rts; Test: python/tests/test_ins_rts.py:test_a_bias_only_correction_is_a_knot; Test: python/tests/test_ins_rts.py:test_a_growing_variance_cuts_the_chain; Test: python/tests/test_ins_rts.py:test_smoother_beats_the_filter_through_an_outage; Test: python/tests/test_ins_rts.py:test_replay_py_smooth_keeps_the_filter_numbers; Test: python/tests/test_ins_rts.py:test_kml_track_is_the_smoothed_solution; Test: python/tests/test_ins_rts.py:test_gui_worker_smooths_and_the_window_shows_it; Demonstration: datasets/kfgins with tools/replay.py --smooth: position RMS 26 mm -> 17 mm, maximum 271 mm -> 69 mm, velocity RMS 9.8 -> 4.9 mm/s, the filter's own numbers unchanged, and with a 60 s GNSS outage (--gnss-outage 1200:60) the filter's 11.0 m maximum position error inside the outage drops to 0.07 m
+
+tools/replay.py --smooth and the RTS smoother of tools/inspostgui.py
+shall run a Rauch-Tung-Striebel smoother (tools/ins_rts.py) over a
+forward pass of the unchanged library: every epoch split into
+predict() and correct(), recording Phi, P(k|k-1), P(k|k) and the nominal
+state, then the backward pass in the filter's error convention (dx =
+nominal - truth, attitude through the full rotation), with the smoothed
+solution at the full IMU rate. The smoother's forward pass shall be a
+second replay with allow_unlimited_deadreckoning, so an outage the
+real-time filter gives up on is bridged. The chain shall be cut where
+the filter is no plain Kalman filter: ins not ready, a new local origin,
+a changed state count, or a correction that grows a variance by more
+than 5 %. The filter's own run and every number it reports shall stay
+the same with the smoother on. Its accuracy shall be reported next to
+the filter's at the same scored epochs (position, velocity, attitude),
+in the summary JSON, in pages of the --plot PDF, as a KML path, and in
+the GUI as a 3D trail, a Map tab track, plot series and in the Last run
+panel.
+
+Rationale: the library is a real-time filter, post-processing gains from
+using the measurements after an epoch as well. Running it on the
+existing C API keeps one filter implementation. The second forward
+pass is needed because a filter that stopped dead reckoning leaves no
+trajectory to smooth across the outage, which is where smoothing gains
+most.
+
+## REQ-VER-044 — Solution files
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: python/tests/test_ins_solution.py:test_gps_clock_fits_offset_and_rate; Test: python/tests/test_ins_solution.py:test_gps_clock_utc_grid_suspect_and_single_pair; Test: python/tests/test_ins_solution.py:test_gps_clock_refit_bad_rows_and_restart_segments; Test: python/tests/test_ins_solution.py:test_guessed_clock_is_the_system_time; Test: python/tests/test_ins_solution.py:test_gpst_strings; Test: python/tests/test_ins_solution.py:test_pos_layout; Test: python/tests/test_ins_solution.py:test_csv_is_a_ref_csv; Test: python/tests/test_ins_solution.py:test_replay_py_dump_solution; Test: python/tests/test_ins_solution.py:test_gui_exports_the_solution
+
+tools/replay.py --dump-solution and inspostgui.py's Export solution
+shall write the filter's solution, and with the RTS smoother on the
+smoothed one next to it as <name>_rts, in the format the file extension
+picks (tools/ins_solution.py): .pos the RTKLIB solution format (GPST,
+geodetic position, Q, the ENU position 1-sigma and signed covariance
+roots, age, the demo5 velocity columns), anything else a CSV in the
+ref.csv layout plus the position, velocity and attitude 1-sigma, which
+both harnesses accept as a ref.csv. In the .pos, Q shall be the quality
+of the last GNSS fix while the position is aided (1 where unknown) and
+5 while dead reckoning, ns its satellite count while aided (0 where
+unknown and while dead reckoning), age the seconds since the last absolute
+position aiding. The time shall be GPS time from the dataset's
+timesync.csv: offset and rate of the recording clock fitted to its
+pulse pairs (the offset alone from one pair), TP_SUSPECT pairs left
+out, a pair a whole second off the line dropped by a refit, a pair on
+the receiver's UTC grid named in the file header but not corrected, a
+row whose flags do not parse skipped, and of several clock segments
+(recorder restarts, the mcu_restarts column) only the one with the most
+pairs fitted, named in the header.
+Without timesync.csv the first epoch shall be put at the system clock
+of the export and the header shall say the time is guessed, one guess
+for the filter's and the smoother's file.
+
+Rationale: a solution has to leave the tool to be compared with other
+estimators (RTKPLOT reads .pos) or reused as a reference, and a
+comparison needs a common time base. The recording's microsecond timer
+is only that once mapped onto GPS time, which the recorder's
+pulse-per-second pairs do, rate included (a crystal is tens of ppm
+off).
+
+## REQ-VER-045 — GNSS fix quality, latency and receiver integrity in the evaluation
+
+- **Status:** verified
+- **Parent:** REQ-VER-003
+- **Verification:** Test: python/tests/test_gnss_quality_latency.py:test_quality_and_latency_stats; Test: python/tests/test_gnss_quality_latency.py:test_integrity_stats_and_short_rows; Test: python/tests/test_gnss_quality_latency.py:test_replay_reports_quality_and_latency; Test: python/tests/test_gnss_quality_latency.py:test_delay_below_latency_and_implausible_latency_are_findings; Test: python/tests/test_gnss_quality_latency.py:test_pdf_page_and_gui_plots
+
+gnss.csv shall optionally carry the fix quality (RTKLIB solution status
+numbering: 1 RTK fixed, 2 RTK float, 3 SBAS, 4 DGNSS, 5 single point,
+6 PPP, 0 unknown), the receiver's GPS week and time of week of the
+fix, the satellites used, the receiver's jamming and spoofing
+indications (1 none, 2 warning/indicated, 3 critical/confirmed) and
+whether the signals and the navigation message were authenticated
+(1 no, 2 yes, 3 failed) as trailing columns, 0 unknown, the first 20
+columns unchanged and a row that stops early read as unknown for the
+rest. The replay evaluation shall report the share of each quality,
+the satellite count (median, minimum), the share of each known
+jamming, spoofing and authentication state and, with a
+timesync.csv, the transport latency of the fixes (the row's t_us minus
+the recorder's t_us of the fix's own GPS time; median, 5 and 95
+percentile) in the data quality summary, as Dr. INS findings, on a page
+of the --plot PDF and on the GUI's Plots tab. A configured gnss:
+delay_ms more than 20 ms below the measured median latency shall be a
+warning, a median outside -50 ms .. 2 s a warning that the two clocks
+do not belong together. Any jamming or spoofing indication and any
+failed authentication shall be a warning.
+
+Rationale: the fix type decides how far a fix can be trusted and is
+what a later filter-side use of it needs recorded. Signal and
+navigation message authentication and the receiver's interference
+monitor decide whether a fix can be trusted at all: the columns are
+there before every producer fills them, so a later recording carries
+them without another format change. The configured GNSS
+delay was an assumption: the measured transport latency is the lower
+bound it cannot go below (the receiver's own filter lag adds to it),
+and an implausible latency exposes a timesync.csv that does not belong
+to the recording.
+
+## REQ-VER-046 — Configurable ARS/AHRS leveling and magnetometer tuning
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: tools/replay.c:main; Test: python/tests/test_ahrs_tuning.py:test_zero_leaves_defaults; Test: python/tests/test_ahrs_tuning.py:test_acc_freq_reaches_both_filters
+
+The replay harnesses (tools/replay.c and tools/replay.py, schema shared)
+shall accept the `ahrs:` keys `acc_freq_hz`, `acc_cutoff_freq_hz`,
+`gravity_diff_penalty`, `acc_reject_gravity_mps2`, `chi2_threshold`,
+`kalman_update_dt_sec`, `mag_yaw_stddev_deg`, `mag_freq_hz` and
+`mag_chi2_threshold`, the fields of the same names in `ahrs_config_t`
+(ahrs.h, `mag_yaw_stddev_deg` in degrees), and apply each to both
+`ars_cfg` and `ahrs_cfg`. A key left at 0 shall leave the field at ahrs's
+own default, `gravity_diff_penalty` and `acc_reject_gravity_mps2` also
+accept a negative value (penalty off, rejection disabled). The Python
+binding shall expose them as `Navigator.set_ahrs_tuning()`
+(python/csrc's `ins_suite_set_ahrs_tuning()`).
+
+Rationale: the leveling path (accelerometer rate and low-pass, the
+gravity-norm gating and the chi2 gate) decides how well the ARS holds
+roll and pitch through accelerations. It could only be tuned by editing
+the library defaults, which is not workable when several recordings with
+a true attitude reference have to be compared run by run.
+
+## REQ-VER-047 — Reference rows scored at the estimate's epoch
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: tools/replay.c:main; Test: python/tests/test_replay_core.py:test_reference_attitude_is_interpolated_to_the_estimate_epoch
+
+The replay harnesses (tools/replay.c, tools/replay.py) shall carry the
+position estimate back to the timestamp of the reference row it is
+scored against with the filter's own velocity (not every ref.csv
+carries one) before forming the position error, shall score the
+attitude against the reference attitude interpolated to the estimate's
+epoch between that row and the next one (not across rows further apart
+than 1 s), and the C harness shall
+hand each GNSS or reference-derived fix to the filter with its age
+relative to the IMU epoch it is attached to (gnss_delay_us,
+REQ-NAV-092), tools/insrcv.c likewise relative to the newest IMU sample
+before the fix arrived.
+
+Rationale: rows are attached to the first IMU epoch at or after their
+timestamp, so both a fix and a reference row are up to one IMU period
+older than that epoch. Before REQ-NAV-092 the filter fused the fix as
+current and lagged the truth by that age; scoring the lagging estimate
+against an equally old reference row hid the lag whenever the two
+shared timestamps (the Crazyflie captures). Compensating only the
+filter would then read as a regression of speed times age. The same age
+turns into an attitude error of rotation rate times age: on a 200 Hz
+car trial whose IMU samples trail the reference rows by 4.4 ms it made
+up most of the scored yaw scatter, so a gate on it measured the
+timestamps rather than the filter.
+
+## REQ-VER-048 — ARS/AHRS tuning in the live receiver
+
+- **Status:** verified
+- **Parent:** REQ-VER-046
+- **Verification:** Inspection: tools/insrcv.c:config_set reads every `ahrs:` key of the shared schema, tools/insrcv.c:suite_apply_ahrs_cfg writes them into both `ars_cfg` and `ahrs_cfg` between nav_suite_init and the first update with the same fallbacks as tools/replay.c:main
+
+The live receiver (tools/insrcv.c) shall accept the whole `ahrs:`
+config section of the shared schema (`gyr_noise_psd`, `gyr_bias_rw`,
+`acc_noise_mps2`, `rpy_pred_stddev_rad_sqrts`,
+`gyr_bias_init_stddev_rps_deg` and the REQ-VER-046 tuning keys) and
+apply it to both `ars_cfg` and `ahrs_cfg` the way tools/replay.c does:
+`gyr_noise_psd` and `gyr_bias_rw` left at 0 are derived from `imu:`
+(`sqrt(gyr_psd)`, `gyr_bias_rw`), `gyr_bias_init_stddev_rps_deg` at 0
+leaves the initial bias uncertainty unchanged, every other key at 0
+leaves the field at ahrs's own default, and `gravity_diff_penalty` and
+`acc_reject_gravity_mps2` pass a negative value through.
+
+Rationale: config.yaml is shared between the live receiver and the
+replay harnesses so that a tuning found offline is the tuning that runs
+live. The receiver named the `ahrs:` keys as unused and ran its ARS/AHRS
+on ahrs's built-in defaults, so the attitude filters behaved differently
+live than in the replay that had tuned them.
+
+## REQ-VER-049 — Configurable ins covariance-prediction period
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: python/tests/test_kalman_cadence.py:test_key_reaches_ins_options; Test: python/tests/test_kalman_cadence.py:test_imu_rate_prediction_grows_covariance_sooner; Test: tools/replay.c:main; Inspection: tools/insrcv.c:config_set reads the top-level key and tools/insrcv.c:suite_bootstrap hands it to ins_options_t.kalman_update_dt_sec
+
+The replay harnesses (tools/replay.py and tools/replay.c, schema shared),
+the live receiver (tools/insrcv.c) and the config editor of
+tools/inspostgui.py shall accept the top-level config key
+`kalman_update_dt_sec` [s] and pass it to
+`ins_options_t.kalman_update_dt_sec`. A value of 0 shall leave ins's own
+covariance-prediction default in force.
+
+Rationale: ins propagates the covariance at a fixed period below the IMU
+rate to save CPU time on a microcontroller, while the strapdown itself
+runs at the full IMU rate. On the KF-GINS datasets (200 Hz IMU, car with
+1 Hz RTK) predicting at the IMU rate lowered the yaw error on the
+ICM20602 from 0.233 to 0.179 deg rms and on the ADIS16465 from 0.119 to
+0.106 deg rms. The option already existed in the library and the Python
+binding, but none of the front ends could set it, so a comparison against
+an estimator that predicts at the IMU rate had to run with a handicap
+nobody had chosen.
+
+## REQ-VER-050 — GNSS fault and single point replays of the KF-GINS trial
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: tools/replay.c:main; Test: python/tests/test_gnss_faults.py:test_committed_files_reproduce; Test: python/tests/test_gnss_faults.py:test_event_counts_and_spacing; Test: python/tests/test_gnss_faults.py:test_step_is_its_own_correct_answer; Test: python/tests/test_gnss_faults.py:test_spp_accuracy_is_reported; Test: python/tests/test_gnss_faults.py:test_faults_add_to_the_spp_error
+
+The suite shall carry, next to `datasets/kfgins/gnss_vel.csv`, GNSS files
+of the same Leador A15 trial with synthetic faults and with L1 single
+point (SPP) accuracy, a `config_fault_<type>.yaml`, `config_spp.yaml` or
+`config_spp_<type>.yaml` replay of each with ins's chi2 outlier gate on,
+and shall gate each against `ref.csv` in `make datasets` and `make test`.
+
+The files shall be written by `tools/gnss_faults.py` from `gnss_vel.csv`
+and `ref.csv` alone, with fixed seeds, so that the committed files are
+exactly what the script writes (`--check`). Its fault model:
+
+- `spike`: 3 single fixes, 3 s apart, offset U(5, 50) m, the reported
+  accuracy kept
+- `wrong_fix`: U(5, 30) s of fixes with one offset U(0.5, 3) m, the
+  reported accuracy kept (a wrong RTK ambiguity fix)
+- `multipath`: U(5, 30) s of fixes with one offset U(3, 15) m, reported at
+  1 m horizontal, 2 m vertical
+- `degraded`: 30 s of white noise of 1 m horizontal, 2 m vertical,
+  reported exactly so
+- `vel_spike`: 3 single velocities, 3 s apart, U(1, 5) m/s off
+- `step`: 150 s of fixes with one offset U(0.5, 2) m, the reported
+  accuracy kept (a change of the RTK base or the datum, a receiver reset)
+- `big_step`: as `step`, U(5, 10) m
+- `gross`: 3 times U(0, 30) s, the fix at or after each 500 m off (2
+  fixes when two times fall on the same one)
+
+Horizontal offsets point in a uniformly random direction, the vertical
+one is the horizontal magnitude times U(-1, 1). The events start 120 s
+after the platform first moves and follow every 90 s (every 300 s for the
+steps) until 90 s before the end of the truth. The SPP error is a
+first-order Gauss-Markov process per axis, 1.5 m horizontal and 3 m
+vertical (1 sigma), correlation time 30 s, reported with that accuracy.
+`spp_<type>` adds the faults of `spike`, `multipath`, `vel_spike`, `step`
+or `gross` on top, keeping the SPP accuracy as reported.
+
+Rationale: the chi2 gate (REQ-NAV-090) was only exercised on synthetic
+scenarios in `tests/` and on real data without faults. A change to the
+gate, to the GNSS noise floors or to the fusion order that lets a blunder
+through, or that keeps the filter from following a fix that stays off,
+shows here on real IMU data as a position RMS far above its gate. With the
+gate off (`chi2_disable: 1`) the 500 m blunders alone cost 76 m position
+RMS over the run with RTK (gate 0.015 m) and 18.6 m with SPP (gate
+3.111 m). The SPP files keep users without RTK in the regression: with
+metre accuracy reported the gate has to stay out of the way of the normal
+error and still remove the blunders. The gates are observed + max(5 %,
+0.003), rounded up, as for the other `datasets/kfgins` replays.

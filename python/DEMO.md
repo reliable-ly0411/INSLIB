@@ -50,9 +50,9 @@ Optional: `pip install pymavlink` if you also want the MAVLink output.
 ## 3. Run the replay (real time)
 
 ```sh
-python3 python/replay.py datasets/fog --realtime            # wall-clock paced
+python3 tools/replay.py datasets/fog --realtime            # wall-clock paced
 # or faster, to not wait the full ~16 min:
-python3 python/replay.py datasets/fog --realtime --speed 10
+python3 tools/replay.py datasets/fog --realtime --speed 10
 ```
 
 Leave `--realtime` off to run as fast as possible (useful for a quick
@@ -113,7 +113,7 @@ arrangement once and reload it for the next run.
 ## 6. MAVLink (optional)
 
 ```sh
-python3 python/replay.py datasets/fog --realtime --mavlink   # udp:14550
+python3 tools/replay.py datasets/fog --realtime --mavlink   # udp:14550
 ```
 
 Point any MAVLink GCS (QGroundControl, MAVProxy, a pymavlink script) at
@@ -124,7 +124,7 @@ Point any MAVLink GCS (QGroundControl, MAVProxy, a pymavlink script) at
 Record a flight log alongside the live stream:
 
 ```sh
-python3 python/replay.py datasets/fog --realtime --flight-log /tmp/ins_flight.json
+python3 tools/replay.py datasets/fog --realtime --flight-log /tmp/ins_flight.json
 ```
 
 That writes newline-delimited JSON (one record per telemetry tick,

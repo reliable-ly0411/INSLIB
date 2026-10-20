@@ -53,6 +53,28 @@
 /** Gyro bias random walk [rad/s/sqrt(s)]. */
 #define INS_DEFAULT_GYR_BIAS_RW_RPS_SQRTS (2e-6f)
 
+/** ARS/AHRS gyro noise density [rad/s/sqrt(Hz)] and extra attitude process
+ *  noise [rad/sqrt(s)] when the caller leaves them at 0. Split like ins
+ *  (sensor noise plus a model-error term), but sized smaller: the filter
+ *  fuses the accelerometer as a leveling correction and degrades with more
+ *  attitude noise under sustained accelerations (coordinated turns). The
+ *  root-sum-square of the two is the 0.02 deg/s/sqrt(Hz) the filter was
+ *  tuned with. */
+#define AHRS_DEFAULT_GYR_NOISE_PSD_RPS_SQRTHZ (2.0e-4f)
+/** ARS/AHRS extra attitude process noise [rad/sqrt(s)], see above. */
+#define AHRS_DEFAULT_RPY_PRED_STDDEV_RPS_SQRTS (2.86e-4f)
+
+/** IMU loss timeout [s]: once the last IMU sample is this old, ins, the
+ *  ARS/AHRS and baro_alt stop and restart (REQ-NAV-089, REQ-AHRS-029,
+ *  REQ-BARO-027). All of them run against the same physical IMU. */
+#define INS_DEFAULT_IMU_LOSS_TIMEOUT_SEC (0.2f)
+
+/** Widening of a bias 1-sigma carried across a restart (REQ-NAV-061,
+ *  REQ-AHRS-029, REQ-BARO-027), before the clamp to the cold-start prior.
+ *  Covers a sensor that rebooted and came back with a different turn-on
+ *  bias. */
+#define INS_DEFAULT_BIAS_CARRY_STDDEV_INFLATION (3.0f)
+
 /** Stillness gate for ins.c's auto-init leveling window: the magnitude of the
  *  gyro must stay below this for the window to count as quasi-static. The
  *  auto-ZUPT/ZARU magnitude bound below currently aliases this value, but the
@@ -183,7 +205,7 @@
  *  Here for the same reason as INS_DEFAULT_BARO_STDDEV_M above: "how much do I
  *  trust one magnetometer sample" is a property of the sensor and its magnetic
  *  environment. Keeping it here also stops every caller (tools/insrcv.c,
- *  tools/replay.c, python/replay.py) from carrying its own copy.
+ *  tools/replay.c, tools/replay.py) from carrying its own copy.
  *
  *  Deliberately of the same order as the horizontal field itself (~20 uT at
  *  mid-latitudes). ins.c fuses the magnetometer for yaw only, so a per-axis

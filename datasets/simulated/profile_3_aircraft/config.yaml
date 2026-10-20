@@ -37,6 +37,14 @@ imu:
 # injected but NOT estimated by ins, so the estimate lands close to these
 # numbers, not exactly on them.
 
+
+# The ARS/AHRS extra attitude noise defaults to a margin sized for a
+# consumer MEMS gyro. Here the gyro is far better than that and the
+# limits below were measured without the margin, so pin it to a negligible
+# value (a value <= 0 would select the default).
+ahrs:
+  rpy_pred_stddev_rad_sqrts: 1.0e-9
+
 gnss:
   leverarm_frd: [0.0, 0.0, 0.0]    # IMU and GNSS colocated (Groves)
   vel_stddev_fallback_mps: 0.1
@@ -60,27 +68,27 @@ score:
   ahrs: 1
   warmup_sec: 10
   min_epochs: 100
-  # Regression guard-rails, deliberately TIGHT (retuned 2026-07-12 after
-  # the KFCore kalman_udu_predict r>n fix): position rms only ~2.5 cm
-  # above the known-good run, attitude ~40-70% above it (the C and Python
-  # harnesses already differ by ~20% on these sub-0.05-deg numbers), so
-  # even small regressions trip a gate immediately. A trip after an
-  # intentional change (or a toolchain/FMA switch shifting float32
-  # results) means: inspect, then retune to the new known-good values --
-  # they are NOT accuracy claims. Known-good (max of replay.c/replay.py,
-  # in the per-line comments) for reference. The ARS roll stays loose:
-  # it is a pure accelerometer-leveling fallback and sustained
-  # coordinated turns break the leveling on this aircraft profile.
-  lim_att_bias_deg: 0.05    # observed 0.028 (roll)
-  lim_att_std_deg: 0.05    # observed 0.027 (roll)
-  lim_yaw_bias_deg: 0.05    # observed 0.026
-  lim_yaw_std_deg: 0.08    # observed 0.072
-  lim_pos_rms_m: 1.42    # observed 1.394 (replay.py; replay.c 1.352)
-  lim_ars_att_bias_deg: 2.8    # observed 2.232 (roll)
-  lim_ars_roll_std_deg: 9.0    # observed 7.399 (leveling breaks in turns)
-  lim_ars_pitch_std_deg: 0.85    # observed 0.627
-  lim_ars_yaw_drift_deg_min: 2.5    # observed 1.964
+  # Regression guard-rails, deliberately TIGHT: observed + ~5% (or a few
+  # millidegrees on the near-zero attitude numbers), so even small
+  # regressions trip a gate immediately. The C and Python harnesses
+  # differ by up to ~20% on these sub-0.05-deg numbers, so the ins limits
+  # sit above the max of replay.c and replay.py (the per-line comments
+  # show that max). A trip after an intentional change (or a toolchain/FMA
+  # switch shifting float32 results) means: inspect, then retune to the
+  # new known-good values -- they are NOT accuracy claims. The ARS roll
+  # is a pure accelerometer-leveling fallback and sustained coordinated
+  # turns break the leveling on this aircraft profile, so its figures
+  # move with every change to the leveling.
+  lim_att_bias_deg: 0.007           # observed 0.004 (roll)
+  lim_att_std_deg: 0.035            # observed 0.031 (pitch)
+  lim_yaw_bias_deg: 0.029           # observed 0.026
+  lim_yaw_std_deg: 0.08             # observed 0.079
+  lim_pos_rms_m: 1.42               # observed 1.392
+  lim_ars_att_bias_deg: 0.169       # observed 0.161 (roll)
+  lim_ars_roll_std_deg: 1.65        # observed 1.565 (leveling breaks in turns)
+  lim_ars_pitch_std_deg: 0.278      # observed 0.264
+  lim_ars_yaw_drift_deg_min: 0.014  # observed 0.010
   # ins must stay within this factor of the Groves textbook LC filter's
   # own position RMS vs truth (REQ-VER-016; check_simulated.py only).
   # 1.0 = the hard requirement "never worse than the textbook filter".
-  lim_groves_pos_rms_factor: 1.0    # observed 0.95 (1.394 m vs 1.466 m)
+  lim_groves_pos_rms_factor: 0.98   # observed 0.950 (1.392 m vs 1.466 m)
