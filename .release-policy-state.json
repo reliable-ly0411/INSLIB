@@ -1,0 +1,41 @@
+{
+  "releases": {
+    "392502463": {
+      "published_at": "2026-09-20T16:52:27Z",
+      "status": "baseline",
+      "tag": "v1.1.0",
+      "upstream_sha": "28fd0a06db5705defe03c39c0132137a813387e6"
+    },
+    "397865322": {
+      "published_at": "2026-09-28T00:08:12Z",
+      "status": "baseline",
+      "tag": "v1.1.1",
+      "upstream_sha": "4d13debbf49c72a7016c306ee75e5e4f4e197ecd"
+    },
+    "402743269": {
+      "published_at": "2026-10-04T00:11:53Z",
+      "status": "baseline",
+      "tag": "v1.2.0",
+      "upstream_sha": "aa12bc4814d42d874ac8d41dcd006666946050e5"
+    },
+    "406843658": {
+      "published_at": "2026-10-08T13:14:00Z",
+      "status": "baseline",
+      "tag": "v1.2.1",
+      "upstream_sha": "7297745c75ded7e3d073160823e52615183d4077"
+    },
+    "412728710": {
+      "published_at": "2026-10-14T13:11:43Z",
+      "status": "baseline",
+      "tag": "v1.3.0",
+      "upstream_sha": "dcd7fe6de20e3b6eb192a566edf9d16529a6ed6b"
+    },
+    "416637705": {
+      "published_at": "2026-10-18T18:59:47Z",
+      "status": "baseline",
+      "tag": "v1.4.0",
+      "upstream_sha": "d61a57dd8d7456cd92cd653e0aef7611af02fe7c"
+    }
+  },
+  "schema": 1
+}
