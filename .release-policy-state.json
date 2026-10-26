@@ -58,7 +58,7 @@
       "published_at": "2026-10-24T15:08:23Z",
       "result": "failure",
       "run_id": "40305656767",
-      "status": "building",
+      "status": "failed",
       "tag": "v1.4.1",
       "upstream_sha": "e07dd0cc24782ecbb95e34b0faebe3faea4e2f6d"
     }
