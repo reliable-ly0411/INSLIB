@@ -19,7 +19,7 @@ In action, fusing IMU measurements with Galileo HAS-corrected GPS/GNSS inputs:
 
 | Metric | Coverage |
 |---|---|
-| C0 (Line) | 99.4% (4413/4439) |
+| C0 (Line) | 99.4% (4415/4441) |
 | C1 (Branch) | 92.1% (2935/3187) |
 | MC/DC | 92.0% (2908/3162) |
 <!-- COVERAGE:END -->
@@ -286,6 +286,8 @@ Error RMS vs. ground truth, horizontal [m] / yaw [°], smaller is better:
 | i300 | 0.016m / 0.068° | 0.017m / 0.070° | 0.067m / 0.232° |
 | Leador A15 (FOG) | 0.009m / 0.016° | 0.012m / 0.018° | 0.060m / 0.148° |
 
+![GNSS/IMU fusion accuracy: horizontal and yaw RMS error vs. ground truth for INSLIB, KF-GINS and ArduPilot EKF3](doc/figures/1_plausibility.png)
+
 Roll / pitch error RMS [°] of the same runs (smaller is better):
 
 | IMU | INSLIB | KF-GINS | ArduPilot EKF3 |
@@ -327,6 +329,8 @@ the error stays below 0.3 m again (smaller is better):
 | `multipath`: 3 to 15 m for 5 to 30 s, 1 m reported | 1.94m / 7.0s | 4.81m / 9.0s | 6.79m / 1.0s | 11.0m / 21.1s |
 | `degraded`: 1 m noise for 30 s, honestly reported | 0.688m / 4.0s | 0.688m / 4.0s | 0.940m / 1.0s | 1.67m / 3.7s |
 | `gross`: 2 or 3 single fixes 500 m off within 30 s | 0.071m / 0.0s | 534m / > 30s | 493m / > 30s | 9.48m / 0.0s |
+
+![GNSS outlier handling: mean position error for single fixes 5 to 50 m off and for 2 to 3 fixes 500 m off, INSLIB vs. KF-GINS and ArduPilot EKF3](doc/figures/2_gnss_outliers.png)
 
 ## Setup
 
@@ -503,6 +507,10 @@ filtering, etc.) has to line up properly. A list of common mistakes:
   during dynamic motion, see [GNSS Latency Estimation](#gnss-latency-estimation).
   Even with a correct timestamp the GNSS solution is typically lagging
   behind due to internal filtering.
+* **Expecting arbitrarily old measurements to be compensated**: delay
+  compensation is a good approximation for sensor latency
+  in the 50-500 ms range, not for data that arrives minutes late.
+  Measurements older than `INS_MAX_DELAY_MS` are dropped.
 * **GNSS antenna lever arm not set**: the offset between IMU and GNSS antenna
   (`gnss: leverarm_frd`) has an impact on position and attitude,
   especially during dynamic turns.
