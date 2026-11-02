@@ -63,7 +63,7 @@
       "upstream_sha": "e07dd0cc24782ecbb95e34b0faebe3faea4e2f6d"
     },
     "430767221": {
-      "attempts": 1,
+      "attempts": 2,
       "family": "stable",
       "manifest": {
         "dependencies": {},
@@ -83,8 +83,8 @@
       "publication": "blocked: no verified downstream publication recipe; existing owner, credential and human gates remain required",
       "published_at": "2026-11-01T18:36:15Z",
       "result": "failure",
-      "run_id": "41445522006",
-      "status": "failed",
+      "run_id": "41546281804",
+      "status": "building",
       "tag": "v1.4.2",
       "upstream_sha": "9b69e5fea77f11fbfe6c9b55292442f621d50e1b"
     }
