@@ -82,9 +82,9 @@
       },
       "publication": "blocked: no verified downstream publication recipe; existing owner, credential and human gates remain required",
       "published_at": "2026-11-01T18:36:15Z",
-      "result": "failure",
+      "result": "success",
       "run_id": "41546281804",
-      "status": "building",
+      "status": "built",
       "tag": "v1.4.2",
       "upstream_sha": "9b69e5fea77f11fbfe6c9b55292442f621d50e1b"
     }
