@@ -61,6 +61,30 @@
       "status": "failed",
       "tag": "v1.4.1",
       "upstream_sha": "e07dd0cc24782ecbb95e34b0faebe3faea4e2f6d"
+    },
+    "430767221": {
+      "attempts": 1,
+      "family": "stable",
+      "manifest": {
+        "dependencies": {},
+        "downstream_sha": "d396c8d82bec9afc4417db918fe16f5e6653c3cd",
+        "family": "stable",
+        "patch_base": "9b69e5fea77f11fbfe6c9b55292442f621d50e1b",
+        "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "publication": "blocked: no verified downstream publication recipe; existing owner, credential and human gates remain required",
+        "published_at": "2026-11-01T18:36:15Z",
+        "release_id": "430767221",
+        "schema": 1,
+        "source_sha": "aed647ed7bcbf8ecf8390a9dff95ff50405904c0",
+        "tag": "v1.4.2",
+        "upstream": "jnz/INSLIB",
+        "upstream_sha": "9b69e5fea77f11fbfe6c9b55292442f621d50e1b"
+      },
+      "published_at": "2026-11-01T18:36:15Z",
+      "run_id": "41445522006",
+      "status": "building",
+      "tag": "v1.4.2",
+      "upstream_sha": "9b69e5fea77f11fbfe6c9b55292442f621d50e1b"
     }
   },
   "schema": 1
