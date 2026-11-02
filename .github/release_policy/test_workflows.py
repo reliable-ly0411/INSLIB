@@ -26,6 +26,17 @@ class WorkflowPolicyTests(unittest.TestCase):
             self.assertIn('python3 .github/release_policy/policy.py materialize', text)
             self.assertIn('ref: ${{ inputs.source_ref || github.sha }}', text)
 
+    def test_ci_installs_and_reports_the_source_pinned_formatter(self):
+        text = (ROOT / 'workflows/ci.yml').read_text()
+        materialize = text.index('python3 .github/release_policy/policy.py materialize')
+        install = text.index('          scripts/fetch_ci_clang_format.sh\n')
+        report = text.index('          .tools/clang-format/clang_format/data/bin/clang-format --version')
+        check = text.index('        run: make check-all')
+        self.assertLess(materialize, install)
+        self.assertLess(install, report)
+        self.assertLess(report, check)
+        self.assertNotRegex(text, r'build-essential[^\n]*\bclang-format\b')
+
     def test_build_is_conditional_and_manual_sync_defaults_to_sync_only(self):
         text = (ROOT / 'workflows/sync-upstream.yml').read_text()
         self.assertIn("if: needs.sync.outputs.build == 'true'", text)
